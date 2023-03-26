@@ -1,0 +1,27 @@
+# General Python files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+*.egg
+*.so
+*.log
+*.pot
+
+.venv/
+.venv.postactivate
+.venv.predeactivate
+.venv.hooks
+
+# VS Code
+.vscode/
+
+# Docker files
+.dockerignore
+.docker/
+
+# Environment files
+*.env
+
