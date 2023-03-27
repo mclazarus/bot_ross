@@ -1,3 +1,5 @@
+import asyncio
+import aiohttp
 import discord
 import os
 import json
@@ -5,6 +7,14 @@ from datetime import datetime
 from discord.ext import commands
 import openai
 import random
+import logging
+import coloredlogs
+import base64
+import io
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("bot_ross")
+coloredlogs.install(level='INFO', logger=logger, milliseconds=True)
 
 # Load OpenAI API key and Discord bot token from environment variables
 openai.api_key = os.environ['OPENAI_API_KEY']
@@ -36,7 +46,7 @@ def get_current_month():
 
 @bot.event
 async def on_ready():
-    print(f'{bot.user.name} has connected to Discord!')
+    logger.info(f'{bot.user.name} has connected to Discord!')
 
 @bot.command(name='ping', help='Check for bot liveness and latency. (ms)')
 async def ping(ctx):
@@ -44,7 +54,7 @@ async def ping(ctx):
 
 @bot.command(name='paint', help='Paint a picture based on a prompt. monthly limit')
 async def paint(ctx, *, prompt):
-    print(f"Received request from {ctx.author.name} to paint: {prompt}")
+    logger.info(f"Received request from {ctx.author.name} to paint: {prompt}")
     current_month = get_current_month()
     data = load_data()
     if current_month not in data:
@@ -55,14 +65,54 @@ async def paint(ctx, *, prompt):
 
     quote = get_random_bob_ross_quote()
     await ctx.send(f"{quote}")
-    response = openai.Image.create(prompt=prompt, n=1, size="1024x1024", user="bot_ross")
-    image_url = response['data'][0]['url']
+    
+    try:
+        image_b64 = await fetch_image(prompt)
+        image_data = base64.b64decode(image_b64)
+        image_file = io.BytesIO(image_data)       
+        await ctx.send(file=discord.File(image_file, "happy_robot_trees.png", description=f"{prompt}"))
+        data[current_month] += 1
+        save_data(data)
+        await ctx.send(f"Current Monthly requests: {data[current_month]}")
+    except Exception as e:
+        await ctx.send(f"No painting for: {prompt}, exception for this request: {e}")
 
-    await ctx.send(image_url)
 
-    data[current_month] += 1
-    save_data(data)
-    await ctx.send(f"Current Monthly requests: {data[current_month]}")
+async def fetch_image(prompt):
+    async with aiohttp.ClientSession() as session:
+        for _ in range(2): 
+            async with session.post(
+                "https://api.openai.com/v1/images/generations",
+                headers={
+                    "Authorization": f"Bearer {openai.api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "prompt": prompt,
+                    "n": 1,
+                    "size": "1024x1024",
+                    "user": "bot_ross",
+                    "response_format": "b64_json"
+                },
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    logger.info(f"Request: {prompt} Success")
+                    return data["data"][0]["b64_json"]
+                else:
+                    error_json = await response.json()
+                    if "error" in error_json:
+                        error_message = error_json["error"]["message"]
+                    else:
+                        error_message = await response.text()
+                    if response.status in [429, 500, 503]:
+                        logger.error(f"Request: {prompt} Trying again. Error: {response.status} {error_message}")
+                        await asyncio.sleep(5)
+                    else:
+                        logger.error(f"Request: {prompt} Error: {response.status}: {error_message}")
+                        
+        raise Exception(f"response: {response.status}: {error_message}")
+                    
 
 @bot.command(name='stats', help='Check monthly stats. (limit, requests)')
 async def stats(ctx):
