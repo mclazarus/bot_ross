@@ -13,6 +13,7 @@ import coloredlogs
 import base64
 import io
 import string
+import re
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bot_ross")
@@ -164,10 +165,8 @@ async def fetch_image(prompt, style="vivid"):
         raise Exception(f"response: {response.status}: {error_message}")
                     
 async def generate_file_name(prompt):
-    # replace all spaces with underscores
-    file_name = file_name.replace(" ", "_")
-    # replace all special characters with nothing
-    file_name = "".join(e for e in prompt if e.isalnum())
+    # replace all special characters with _
+    file_name = re.sub(r'[^0-9a-zA-Z]', '_', prompt)
     # limit size of string to 50 characters
     file_name = file_name[:50]
     # tack on a random bit of data to the end of the file name to avoid collisions
