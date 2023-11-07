@@ -1,3 +1,4 @@
+import datetime
 import asyncio
 import aiohttp
 import discord
@@ -30,6 +31,8 @@ intents.messages = True
 intents.presences = True
 intents.message_content = True
 bot = commands.Bot(command_prefix='&', intents=intents)
+
+start_time = datetime.now()
 
 def load_data():
     if os.path.exists(DATA_FILE):
@@ -71,6 +74,10 @@ async def paint(ctx, *, prompt):
         image_data = base64.b64decode(image_b64)
         image_file = io.BytesIO(image_data)       
         await ctx.send(file=discord.File(image_file, "happy_robot_trees.png", description=f"{prompt}"))
+        # reload the data for the increment since we are async
+        data = load_data()
+        if current_month not in data:
+            data[current_month] = 0
         data[current_month] += 1
         save_data(data)
         await ctx.send(f"Current Monthly requests: {data[current_month]}")
@@ -108,6 +115,13 @@ async def fetch_image(prompt):
                     if response.status in [429, 500, 503]:
                         logger.error(f"Request: {prompt} Trying again. Error: {response.status} {error_message}")
                         await asyncio.sleep(5)
+                    elif response.status == 400:
+                        logger.info(f"Request: {prompt} Safety Violation.")
+                        data = load_data()
+                        if 'safety_trips' not in data:
+                            data['safety_trips'] = 0
+                        data['safety_trips'] += 1
+                        save_data(data)
                     else:
                         logger.error(f"Request: {prompt} Error: {response.status}: {error_message}")
                         
@@ -120,8 +134,10 @@ async def stats(ctx):
     data = load_data()
     if current_month not in data:
         data[current_month] = 0
-    await ctx.send(f"Monthly limit: {LIMIT}")
-    await ctx.send(f"Monthly requests: {data[current_month]}")
+    if 'safety_trips' not in data:
+        data['safety_trips'] = 0
+    uptime_in_hours = (datetime.now() - start_time).total_seconds() / 3600
+    await ctx.send(f"Uptime: {uptime_in_hours:.2f} hours\nMonthly limit: {LIMIT}\nMonthly requests: {data[current_month]}\nSafety Violations: {data['safety_trips']}")
 
 def get_random_bob_ross_quote():
     quotes = [
