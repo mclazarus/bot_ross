@@ -12,6 +12,7 @@ import logging
 import coloredlogs
 import base64
 import io
+import string
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bot_ross")
@@ -55,6 +56,36 @@ async def on_ready():
 async def ping(ctx):
     await ctx.send(f'Pong! {round(bot.latency * 1000)}ms')
 
+@bot.command(name='natpaint', help='Paint a picture based on a prompt. Using the natural style. monthly limit')
+async def natpaint(ctx, *, prompt):
+    logger.info(f"Received request from {ctx.author.name} to paint: {prompt} with natural style")
+    current_month = get_current_month()
+    data = load_data()
+    if current_month not in data:
+        data[current_month] = 0
+    if data[current_month] >= LIMIT:
+        await ctx.send("Monthly limit reached. Please wait until next month to make more paint requests.")
+        return
+    
+    quote = get_random_bob_ross_quote()
+    await ctx.send(f"{quote}")
+    
+    file_name = await generate_file_name(prompt)
+    
+    try: 
+        image_b64 = await fetch_image(prompt, "natural")
+        image_data = base64.b64decode(image_b64)
+        image_file = io.BytesIO(image_data)       
+        await ctx.send(file=discord.File(image_file, file_name, description=f"{prompt}"))
+        data = load_data()
+        if current_month not in data:
+            data[current_month] = 0
+        data[current_month] += 1
+        save_data(data)
+        await ctx.send(f"Current Monthly requests: {data[current_month]}")
+    except Exception as e:
+        await ctx.send(f"No painting for: {prompt}, exception for this request: {e}")
+
 @bot.command(name='paint', help='Paint a picture based on a prompt. monthly limit')
 async def paint(ctx, *, prompt):
     logger.info(f"Received request from {ctx.author.name} to paint: {prompt}")
@@ -69,11 +100,13 @@ async def paint(ctx, *, prompt):
     quote = get_random_bob_ross_quote()
     await ctx.send(f"{quote}")
     
+    file_name = await generate_file_name(prompt)
+    
     try:
         image_b64 = await fetch_image(prompt)
         image_data = base64.b64decode(image_b64)
         image_file = io.BytesIO(image_data)       
-        await ctx.send(file=discord.File(image_file, "happy_robot_trees.png", description=f"{prompt}"))
+        await ctx.send(file=discord.File(image_file, file_name, description=f"{prompt}"))
         # reload the data for the increment since we are async
         data = load_data()
         if current_month not in data:
@@ -85,7 +118,7 @@ async def paint(ctx, *, prompt):
         await ctx.send(f"No painting for: {prompt}, exception for this request: {e}")
 
 
-async def fetch_image(prompt):
+async def fetch_image(prompt, style="vivid"):
     async with aiohttp.ClientSession() as session:
         for _ in range(2): 
             async with session.post(
@@ -95,11 +128,14 @@ async def fetch_image(prompt):
                     "Content-Type": "application/json"
                 },
                 json={
+                    "model": "dall-e-3",
                     "prompt": prompt,
                     "n": 1,
                     "size": "1024x1024",
+                    "quality": "hd",
+                    "style": style,
                     "user": "bot_ross",
-                    "response_format": "b64_json"
+                    "response_format": "b64_json",
                 },
             ) as response:
                 if response.status == 200:
@@ -127,6 +163,20 @@ async def fetch_image(prompt):
                         
         raise Exception(f"response: {response.status}: {error_message}")
                     
+async def generate_file_name(prompt):
+    # replace all spaces with underscores
+    file_name = file_name.replace(" ", "_")
+    # replace all special characters with nothing
+    file_name = "".join(e for e in prompt if e.isalnum())
+    # limit size of string to 50 characters
+    file_name = file_name[:50]
+    # tack on a random bit of data to the end of the file name to avoid collisions
+    # Define the characters that can be used in the string
+    characters = string.ascii_letters + string.digits
+    # Generate a random 6-character string
+    random_string = ''.join(random.choice(characters) for i in range(6))
+    file_name = f"{file_name}_{random_string}.png"
+    return file_name
 
 @bot.command(name='stats', help='Check monthly stats. (limit, requests)')
 async def stats(ctx):
