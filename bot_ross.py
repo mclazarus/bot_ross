@@ -36,56 +36,32 @@ bot = commands.Bot(command_prefix='&', intents=intents)
 
 start_time = datetime.now()
 
+
 def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, 'r') as f:
             return json.load(f)
     return {}
 
+
 def save_data(data):
     with open(DATA_FILE, 'w') as f:
         json.dump(data, f)
 
+
 def get_current_month():
     return datetime.now().strftime("%Y-%m")
+
 
 @bot.event
 async def on_ready():
     logger.info(f'{bot.user.name} has connected to Discord!')
 
+
 @bot.command(name='ping', help='Check for bot liveness and latency. (ms)')
 async def ping(ctx):
     await ctx.send(f'Pong! {round(bot.latency * 1000)}ms')
 
-@bot.command(name='natpaint', help='Paint a picture based on a prompt. Using the natural style. monthly limit')
-async def natpaint(ctx, *, prompt):
-    logger.info(f"Received request from {ctx.author.name} to paint: {prompt} with natural style")
-    current_month = get_current_month()
-    data = load_data()
-    if current_month not in data:
-        data[current_month] = 0
-    if data[current_month] >= LIMIT:
-        await ctx.send("Monthly limit reached. Please wait until next month to make more paint requests.")
-        return
-    
-    quote = get_random_bob_ross_quote()
-    await ctx.send(f"{quote}")
-    
-    file_name = await generate_file_name(prompt)
-    
-    try: 
-        image_b64 = await fetch_image(prompt, "natural")
-        image_data = base64.b64decode(image_b64)
-        image_file = io.BytesIO(image_data)       
-        await ctx.send(file=discord.File(image_file, file_name, description=f"{prompt}"))
-        data = load_data()
-        if current_month not in data:
-            data[current_month] = 0
-        data[current_month] += 1
-        save_data(data)
-        await ctx.send(f"Current Monthly requests: {data[current_month]}")
-    except Exception as e:
-        await ctx.send(f"No painting for: {prompt}, exception for this request: {e}")
 
 @bot.command(name='paint', help='Paint a picture based on a prompt. monthly limit')
 async def paint(ctx, *, prompt):
@@ -100,13 +76,13 @@ async def paint(ctx, *, prompt):
 
     quote = get_random_bob_ross_quote()
     await ctx.send(f"{quote}")
-    
+
     file_name = await generate_file_name(prompt)
-    
+
     try:
         image_b64 = await fetch_image(prompt)
         image_data = base64.b64decode(image_b64)
-        image_file = io.BytesIO(image_data)       
+        image_file = io.BytesIO(image_data)
         await ctx.send(file=discord.File(image_file, file_name, description=f"{prompt}"))
         # reload the data for the increment since we are async
         data = load_data()
@@ -121,23 +97,23 @@ async def paint(ctx, *, prompt):
 
 async def fetch_image(prompt, style="vivid"):
     async with aiohttp.ClientSession() as session:
-        for _ in range(2): 
+        for _ in range(2):
             async with session.post(
-                "https://api.openai.com/v1/images/generations",
-                headers={
-                    "Authorization": f"Bearer {openai.api_key}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "dall-e-3",
-                    "prompt": prompt,
-                    "n": 1,
-                    "size": "1024x1024",
-                    "quality": "hd",
-                    "style": style,
-                    "user": "bot_ross",
-                    "response_format": "b64_json",
-                },
+                    "https://api.openai.com/v1/images/generations",
+                    headers={
+                        "Authorization": f"Bearer {openai.api_key}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": "dall-e-3",
+                        "prompt": prompt,
+                        "n": 1,
+                        "size": "1024x1024",
+                        "quality": "hd",
+                        "style": style,
+                        "user": "bot_ross",
+                        "response_format": "b64_json",
+                    },
             ) as response:
                 if response.status == 200:
                     data = await response.json()
@@ -161,9 +137,10 @@ async def fetch_image(prompt, style="vivid"):
                         save_data(data)
                     else:
                         logger.error(f"Request: {prompt} Error: {response.status}: {error_message}")
-                        
+
         raise Exception(f"response: {response.status}: {error_message}")
-                    
+
+
 async def generate_file_name(prompt):
     # replace all special characters with _
     file_name = re.sub(r'[^0-9a-zA-Z]', '_', prompt)
@@ -173,9 +150,10 @@ async def generate_file_name(prompt):
     # Define the characters that can be used in the string
     characters = string.ascii_letters + string.digits
     # Generate a random 6-character string
-    random_string = ''.join(random.choice(characters) for i in range(6))
+    random_string = ''.join(random.choice(characters) for _ in range(6))
     file_name = f"{file_name}_{random_string}.png"
     return file_name
+
 
 @bot.command(name='stats', help='Check monthly stats. (limit, requests)')
 async def stats(ctx):
@@ -186,7 +164,24 @@ async def stats(ctx):
     if 'safety_trips' not in data:
         data['safety_trips'] = 0
     uptime_in_hours = (datetime.now() - start_time).total_seconds() / 3600
-    await ctx.send(f"Uptime: {uptime_in_hours:.2f} hours\nMonthly limit: {LIMIT}\nMonthly requests: {data[current_month]}\nSafety Violations: {data['safety_trips']}")
+
+    # Construct the message parts
+    uptime_part = f"Uptime: {uptime_in_hours:.2f} hours"
+    limit_part = f"Monthly limit: {LIMIT}"
+    requests_part = f"Monthly requests: {data[current_month]}"
+    violations_part = f"Safety Violations: {data['safety_trips']}"
+
+    # Combine the parts into the final message
+    message = (
+        f"{uptime_part}\n"
+        f"{limit_part}\n"
+        f"{requests_part}\n"
+        f"{violations_part}"
+    )
+
+    # Send the message
+    await ctx.send(message)
+
 
 def get_random_bob_ross_quote():
     quotes = [
@@ -213,5 +208,6 @@ def get_random_bob_ross_quote():
     ]
 
     return random.choice(quotes)
+
 
 bot.run(DISCORD_BOT_TOKEN)
