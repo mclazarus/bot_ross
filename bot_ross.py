@@ -63,28 +63,46 @@ async def ping(ctx):
     await ctx.send(f'Pong! {round(bot.latency * 1000)}ms')
 
 
+@bot.command(name='meme', help='Create an image based on a GPT generated prompt takes suggestions. monthly limit')
+async def meme(ctx, *, prompt=None):
+    if prompt:
+        await ctx.send(f"Generating meme prompt based on: {prompt}")
+    else:
+        await ctx.send(f"Generating meme prompt based on GPTs wildest imagination.")
+    gpt_prompt = await get_meme_prompt(prompt)
+    await ctx.send(f"Generated prompt: {gpt_prompt}")
+    await do_the_art(ctx, gpt_prompt, "meme")
+    data = load_data()
+    if 'memes' not in data:
+        data['memes'] = 0
+    data['memes'] += 1
+    save_data(data)
+
+
 @bot.command(name='paint', help='Paint a picture based on a prompt. monthly limit')
 async def paint(ctx, *, prompt):
-    logger.info(f"Received request from {ctx.author.name} to paint: {prompt}")
-    current_month = get_current_month()
-    data = load_data()
-    if current_month not in data:
-        data[current_month] = 0
-    if data[current_month] >= LIMIT:
-        await ctx.send("Monthly limit reached. Please wait until next month to make more paint requests.")
-        return
-
     quote = get_random_bob_ross_quote()
     await ctx.send(f"{quote}")
+    await do_the_art(ctx, prompt, "paint")
+
+
+async def do_the_art(ctx, prompt, request_type):
+    logger.info(f"Received {request_type} request from {ctx.author.name} to paint: {prompt}")
+    current_month = get_current_month()
+    data = load_data()
+    if over_limit(data):
+        await ctx.send("Monthly limit reached. Please wait until next month to make more paint requests.")
+        return
 
     file_name = await generate_file_name(prompt)
 
     try:
-        image_b64 = await fetch_image(prompt)
-        image_data = base64.b64decode(image_b64)
+        response = await fetch_image(prompt)
+        image_data = base64.b64decode(response['image'])
         image_file = io.BytesIO(image_data)
-        await ctx.send(file=discord.File(image_file, file_name, description=f"{prompt}"))
+        await ctx.send(file=discord.File(image_file, file_name, description=f"{response['revised_prompt']}"))
         # reload the data for the increment since we are async
+        await ctx.send(f"**Revised prompt**: {response['revised_prompt']}")
         data = load_data()
         if current_month not in data:
             data[current_month] = 0
@@ -118,7 +136,8 @@ async def fetch_image(prompt, style="vivid"):
                 if response.status == 200:
                     data = await response.json()
                     logger.info(f"Request: {prompt} Success")
-                    return data["data"][0]["b64_json"]
+                    result = {"image": data["data"][0]["b64_json"], "revised_prompt": data["data"][0]["revised_prompt"]}
+                    return result
                 else:
                     error_json = await response.json()
                     if "error" in error_json:
@@ -163,12 +182,15 @@ async def stats(ctx):
         data[current_month] = 0
     if 'safety_trips' not in data:
         data['safety_trips'] = 0
+    if 'memes' not in data:
+        data['memes'] = 0
     uptime_in_hours = (datetime.now() - start_time).total_seconds() / 3600
 
     # Construct the message parts
     uptime_part = f"Uptime: {uptime_in_hours:.2f} hours"
     limit_part = f"Monthly limit: {LIMIT}"
     requests_part = f"Monthly requests: {data[current_month]}"
+    memes_part = f"Memes Requested: {data['memes']}"
     violations_part = f"Safety Violations: {data['safety_trips']}"
 
     # Combine the parts into the final message
@@ -176,11 +198,49 @@ async def stats(ctx):
         f"{uptime_part}\n"
         f"{limit_part}\n"
         f"{requests_part}\n"
+        f"{memes_part}\n"
         f"{violations_part}"
     )
 
     # Send the message
     await ctx.send(message)
+
+async def get_meme_prompt(user_prompt):
+    if user_prompt:
+        chat_prompt = f"Create a prompt for an image meme based on the following idea: {user_prompt}"
+    else:
+        chat_prompt = "Create a prompt for an image meme based on your wildest imagination."
+    system_message = """
+    You are a tragically online memelord you know every meme and understand all the funny jokes and variations.
+    You very much want to make a humorous image and so you will give a detailed prompt for an image generator
+    like DALL-E and similar.  The image should be specific and provide all the relevant funny details.
+    Your response should not include any explanation of the meme or any other information beyond the prompt. 
+    """
+    response = openai.ChatCompletion.create(
+        model="gpt-4",
+        messages=[
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": chat_prompt}
+        ]
+    )
+
+    print(response)
+
+    try:
+        dall_e_prompt = response['choices'][0]['message']['content'].strip()
+    except:
+        dall_e_prompt = "Two fluffy black cats trying to fix a broken robot based on Bob Ross"
+
+    return dall_e_prompt
+
+
+def over_limit(data):
+    current_month = get_current_month()
+    if current_month not in data:
+        data[current_month] = 0
+    if data[current_month] >= LIMIT:
+        return True
+    return False
 
 
 def get_random_bob_ross_quote():
