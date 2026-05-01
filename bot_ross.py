@@ -1,6 +1,7 @@
 import datetime
 import asyncio
 import aiohttp
+import time
 import discord
 import os
 import json
@@ -24,8 +25,47 @@ openai.api_key = os.environ['OPENAI_API_KEY']
 DISCORD_BOT_TOKEN = os.environ['DISCORD_BOT_TOKEN']
 
 # Configuration
-LIMIT = int(os.environ.get('API_LIMIT', 100))
-DATA_FILE = "data/request_data.json"
+LIMIT            = int(os.environ.get('API_LIMIT', 100))
+IMAGE_MODEL      = os.environ.get('IMAGE_MODEL', 'gpt-image-2-low')
+IMAGE_MODERATION = os.environ.get('IMAGE_MODERATION', 'low')
+MEME_MODEL       = os.environ.get('MEME_MODEL', 'gpt-5.4-mini')
+DATA_FILE        = "data/request_data.json"
+
+MODEL_CONFIGS = {
+    "gpt-image-2": {
+        "model": "gpt-image-2",
+        "params": {"size": "1024x1024", "quality": "high"},
+        "has_revised_prompt": False,
+        "supports_moderation": True,
+    },
+    "gpt-image-2-medium": {
+        "model": "gpt-image-2",
+        "params": {"size": "1024x1024", "quality": "medium"},
+        "has_revised_prompt": False,
+        "supports_moderation": True,
+    },
+    "gpt-image-2-low": {
+        "model": "gpt-image-2",
+        "params": {"size": "1024x1024", "quality": "low"},
+        "has_revised_prompt": False,
+        "supports_moderation": True,
+    },
+    "dall-e-3": {
+        "model": "dall-e-3",
+        "params": {"size": "1024x1024", "quality": "hd", "style": "vivid", "response_format": "b64_json"},
+        "has_revised_prompt": True,
+        "supports_moderation": False,
+    },
+}
+
+
+def format_duration(seconds):
+    if seconds < 1:
+        return f"{int(seconds * 1000)}ms"
+    elif seconds < 90:
+        return f"{seconds:.1f}s"
+    else:
+        return f"{int(seconds // 60)}m {int(seconds % 60)}s"
 
 intents = discord.Intents.default()
 intents.guilds = True
@@ -71,7 +111,7 @@ async def meme(ctx, *, prompt=None):
         await ctx.send(f"Generating meme prompt based on GPTs wildest imagination.")
     gpt_prompt = await get_meme_prompt(prompt)
     await ctx.send(f"Generated prompt: {gpt_prompt}")
-    await do_the_art(ctx, gpt_prompt, "meme")
+    await do_the_art(ctx, gpt_prompt, "meme", IMAGE_MODEL)
     data = load_data()
     if 'memes' not in data:
         data['memes'] = 0
@@ -81,13 +121,36 @@ async def meme(ctx, *, prompt=None):
 
 @bot.command(name='paint', help='Paint a picture based on a prompt. monthly limit')
 async def paint(ctx, *, prompt):
-    quote = get_random_bob_ross_quote()
-    await ctx.send(f"{quote}")
-    await do_the_art(ctx, prompt, "paint")
+    await ctx.send(get_random_bob_ross_quote())
+    await do_the_art(ctx, prompt, "paint", IMAGE_MODEL)
 
 
-async def do_the_art(ctx, prompt, request_type):
-    logger.info(f"Received {request_type} request from {ctx.author.name} to paint: {prompt}")
+@bot.command(name='hpaint', help='Paint a high quality picture with gpt-image-2. monthly limit')
+async def hpaint(ctx, *, prompt):
+    await ctx.send(get_random_bob_ross_quote())
+    await do_the_art(ctx, prompt, "hpaint", "gpt-image-2")
+
+
+@bot.command(name='mpaint', help='Paint a medium quality picture with gpt-image-2. monthly limit')
+async def mpaint(ctx, *, prompt):
+    await ctx.send(get_random_bob_ross_quote())
+    await do_the_art(ctx, prompt, "mpaint", "gpt-image-2-medium")
+
+
+@bot.command(name='lpaint', help='Paint a low quality picture with gpt-image-2. monthly limit')
+async def lpaint(ctx, *, prompt):
+    await ctx.send(get_random_bob_ross_quote())
+    await do_the_art(ctx, prompt, "lpaint", "gpt-image-2-low")
+
+
+@bot.command(name='dpaint', help='Paint with DALL-E 3. monthly limit')
+async def dpaint(ctx, *, prompt):
+    await ctx.send(get_random_bob_ross_quote())
+    await do_the_art(ctx, prompt, "dpaint", "dall-e-3")
+
+
+async def do_the_art(ctx, prompt, request_type, model):
+    logger.info(f"Received {request_type} request from {ctx.author.name} using {model} to paint: {prompt}")
     current_month = get_current_month()
     data = load_data()
     if over_limit(data):
@@ -97,23 +160,38 @@ async def do_the_art(ctx, prompt, request_type):
     file_name = await generate_file_name(prompt)
 
     try:
-        response = await fetch_image(prompt)
+        t0 = time.monotonic()
+        response = await fetch_image(prompt, model)
+        elapsed = time.monotonic() - t0
         image_data = base64.b64decode(response['image'])
         image_file = io.BytesIO(image_data)
-        await ctx.send(file=discord.File(image_file, file_name, description=f"{response['revised_prompt']}"))
+        description = (response['revised_prompt'] or prompt)[:1024]
+        await ctx.send(file=discord.File(image_file, file_name, description=description))
+        if response['revised_prompt']:
+            await ctx.send(f"**Revised prompt**: {response['revised_prompt']}")
         # reload the data for the increment since we are async
-        await ctx.send(f"**Revised prompt**: {response['revised_prompt']}")
         data = load_data()
         if current_month not in data:
             data[current_month] = 0
         data[current_month] += 1
         save_data(data)
-        await ctx.send(f"Current Monthly requests: {data[current_month]}")
+        await ctx.send(f"Generated in {format_duration(elapsed)} | Monthly requests: {data[current_month]}")
     except Exception as e:
         await ctx.send(f"No painting for: {prompt}, exception for this request: {e}")
 
 
-async def fetch_image(prompt, style="vivid"):
+async def fetch_image(prompt, model):
+    config = MODEL_CONFIGS.get(model, MODEL_CONFIGS["gpt-image-2"])
+    payload = {
+        "model": config["model"],
+        "prompt": prompt,
+        "n": 1,
+        "user": "bot_ross",
+        **config["params"],
+    }
+    if config["supports_moderation"]:
+        payload["moderation"] = IMAGE_MODERATION
+
     async with aiohttp.ClientSession() as session:
         for _ in range(2):
             async with session.post(
@@ -122,22 +200,14 @@ async def fetch_image(prompt, style="vivid"):
                         "Authorization": f"Bearer {openai.api_key}",
                         "Content-Type": "application/json"
                     },
-                    json={
-                        "model": "dall-e-3",
-                        "prompt": prompt,
-                        "n": 1,
-                        "size": "1024x1024",
-                        "quality": "hd",
-                        "style": style,
-                        "user": "bot_ross",
-                        "response_format": "b64_json",
-                    },
+                    json=payload,
             ) as response:
                 if response.status == 200:
                     data = await response.json()
                     logger.info(f"Request: {prompt} Success")
-                    result = {"image": data["data"][0]["b64_json"], "revised_prompt": data["data"][0]["revised_prompt"]}
-                    return result
+                    item = data["data"][0]
+                    revised = item.get("revised_prompt") if config["has_revised_prompt"] else None
+                    return {"image": item["b64_json"], "revised_prompt": revised}
                 else:
                     error_json = await response.json()
                     if "error" in error_json:
@@ -214,10 +284,11 @@ async def get_meme_prompt(user_prompt):
     You are a tragically online memelord you know every meme and understand all the funny jokes and variations.
     You very much want to make a humorous image and so you will give a detailed prompt for an image generator
     like DALL-E and similar.  The image should be specific and provide all the relevant funny details.
-    Your response should not include any explanation of the meme or any other information beyond the prompt. 
+    Your response should not include any explanation of the meme or any other information beyond the prompt.
+    Keep your response under 1024 characters.
     """
     response = openai.ChatCompletion.create(
-        model="gpt-4",
+        model=MEME_MODEL,
         messages=[
             {"role": "system", "content": system_message},
             {"role": "user", "content": chat_prompt}
