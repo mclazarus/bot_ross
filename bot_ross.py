@@ -1,4 +1,3 @@
-import datetime
 import asyncio
 import aiohttp
 import time
@@ -111,12 +110,12 @@ async def meme(ctx, *, prompt=None):
         await ctx.send(f"Generating meme prompt based on GPTs wildest imagination.")
     gpt_prompt = await get_meme_prompt(prompt)
     await ctx.send(f"Generated prompt: {gpt_prompt}")
-    await do_the_art(ctx, gpt_prompt, "meme", IMAGE_MODEL)
-    data = load_data()
-    if 'memes' not in data:
-        data['memes'] = 0
-    data['memes'] += 1
-    save_data(data)
+    if await do_the_art(ctx, gpt_prompt, "meme", IMAGE_MODEL):
+        data = load_data()
+        if 'memes' not in data:
+            data['memes'] = 0
+        data['memes'] += 1
+        save_data(data)
 
 
 @bot.command(name='paint', help='Paint a picture based on a prompt. monthly limit')
@@ -155,9 +154,9 @@ async def do_the_art(ctx, prompt, request_type, model):
     data = load_data()
     if over_limit(data):
         await ctx.send("Monthly limit reached. Please wait until next month to make more paint requests.")
-        return
+        return False
 
-    file_name = await generate_file_name(prompt)
+    file_name = generate_file_name(prompt)
 
     try:
         t0 = time.monotonic()
@@ -176,8 +175,10 @@ async def do_the_art(ctx, prompt, request_type, model):
         data[current_month] += 1
         save_data(data)
         await ctx.send(f"Generated in {format_duration(elapsed)} | Monthly requests: {data[current_month]}")
+        return True
     except Exception as e:
         await ctx.send(f"No painting for: {prompt}, exception for this request: {e}")
+        return False
 
 
 async def fetch_image(prompt, model):
@@ -210,38 +211,28 @@ async def fetch_image(prompt, model):
                     return {"image": item["b64_json"], "revised_prompt": revised}
                 else:
                     error_json = await response.json()
-                    if "error" in error_json:
-                        error_message = error_json["error"]["message"]
-                    else:
-                        error_message = await response.text()
-                    if response.status in [429, 500, 503]:
-                        logger.error(f"Request: {prompt} Trying again. Error: {response.status} {error_message}")
-                        await asyncio.sleep(5)
-                    elif response.status == 400:
+                    error_message = error_json.get("error", {}).get("message") or str(error_json)
+                    if response.status == 400:
                         logger.info(f"Request: {prompt} Safety Violation.")
                         data = load_data()
                         if 'safety_trips' not in data:
                             data['safety_trips'] = 0
                         data['safety_trips'] += 1
                         save_data(data)
+                        break
+                    elif response.status in [429, 500, 503]:
+                        logger.error(f"Request: {prompt} Trying again. Error: {response.status} {error_message}")
+                        await asyncio.sleep(5)
                     else:
                         logger.error(f"Request: {prompt} Error: {response.status}: {error_message}")
 
         raise Exception(f"response: {response.status}: {error_message}")
 
 
-async def generate_file_name(prompt):
-    # replace all special characters with _
-    file_name = re.sub(r'[^0-9a-zA-Z]', '_', prompt)
-    # limit size of string to 50 characters
-    file_name = file_name[:50]
-    # tack on a random bit of data to the end of the file name to avoid collisions
-    # Define the characters that can be used in the string
-    characters = string.ascii_letters + string.digits
-    # Generate a random 6-character string
-    random_string = ''.join(random.choice(characters) for _ in range(6))
-    file_name = f"{file_name}_{random_string}.png"
-    return file_name
+def generate_file_name(prompt):
+    file_name = re.sub(r'[^0-9a-zA-Z]', '_', prompt)[:50]
+    random_string = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(6))
+    return f"{file_name}_{random_string}.png"
 
 
 @bot.command(name='stats', help='Check monthly stats. (limit, requests)')
@@ -287,19 +278,18 @@ async def get_meme_prompt(user_prompt):
     Your response should not include any explanation of the meme or any other information beyond the prompt.
     Keep your response under 1024 characters.
     """
-    response = openai.ChatCompletion.create(
-        model=MEME_MODEL,
-        messages=[
-            {"role": "system", "content": system_message},
-            {"role": "user", "content": chat_prompt}
-        ]
+    messages = [
+        {"role": "system", "content": system_message},
+        {"role": "user", "content": chat_prompt}
+    ]
+    response = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: openai.ChatCompletion.create(model=MEME_MODEL, messages=messages)
     )
-
-    print(response)
+    logger.debug(f"Meme GPT response: {response}")
 
     try:
         dall_e_prompt = response['choices'][0]['message']['content'].strip()
-    except:
+    except Exception:
         dall_e_prompt = "Two fluffy black cats trying to fix a broken robot based on Bob Ross"
 
     return dall_e_prompt
