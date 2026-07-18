@@ -84,6 +84,24 @@ def format_duration(seconds):
         return f"{int(seconds // 60)}m {int(seconds % 60)}s"
 
 
+def format_uptime(seconds):
+    """Human-readable uptime as `Dd Hh Mm Ss`, dropping leading zero units.
+    e.g. 3h 15m 42s when under a day, 15m 42s when under an hour, 42s under a minute."""
+    seconds = int(seconds)
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or parts:
+        parts.append(f"{hours}h")
+    if minutes or parts:
+        parts.append(f"{minutes}m")
+    parts.append(f"{secs}s")
+    return " ".join(parts)
+
+
 def _load_magic_library():
     """Read the magic-prompt library fresh from disk. Not cached in memory."""
     try:
@@ -601,7 +619,8 @@ async def stats(ctx):
         data['safety_trips'] = 0
     if 'memes' not in data:
         data['memes'] = 0
-    uptime_in_hours = (datetime.now() - start_time).total_seconds() / 3600
+    uptime_seconds = (datetime.now() - start_time).total_seconds()
+    uptime_in_hours = uptime_seconds / 3600
 
     history = data.get('magic_rate_history', [])
     if history:
@@ -611,7 +630,7 @@ async def stats(ctx):
         last_change = "—"
 
     # Construct the message parts
-    uptime_part = f"Uptime: {uptime_in_hours:.2f} hours"
+    uptime_part = f"Uptime: {format_uptime(uptime_seconds)} ({uptime_in_hours:.2f} hours)"
     limit_part = f"Monthly limit: {LIMIT}"
     requests_part = f"Monthly requests: {data[current_month]}"
     memes_part = f"Memes Requested: {data['memes']}"
