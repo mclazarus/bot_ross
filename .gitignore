@@ -25,3 +25,9 @@ dist/
 # Environment files
 *.env
 
+# Runtime data volume (stats + working magic library; seeded at startup)
+data/
+
+# test_remix.py output artifact
+test_remix_output.png
+

@@ -4,7 +4,7 @@ import time
 import discord
 import os
 import json
-from datetime import datetime
+from datetime import datetime, date
 from discord.ext import commands
 import openai
 import random
@@ -37,7 +37,10 @@ try:
 except (TypeError, ValueError):
     MAGIC_PAINT_RATE = 0.05
 
-MAGIC_PROMPTS_FILE = "magic_prompts.json"
+# The working library lives on the persistent data/ volume so user-added mixins survive
+# redeploys; DEFAULT_MAGIC_PROMPTS_FILE is the seed baked into the image (see _seed_magic_library).
+MAGIC_PROMPTS_FILE = "data/magic_prompts.json"
+DEFAULT_MAGIC_PROMPTS_FILE = "magic_prompts.json"
 
 MODEL_CONFIGS = {
     "gpt-image-2": {
@@ -103,6 +106,40 @@ def _apply_random_magic_entry(prompt):
     return f"{prompt} {text}" if text else prompt
 
 
+def _save_magic_library(entries):
+    """Write the magic-prompt library to disk. Preserves unicode (♥️, —) for readability."""
+    with open(MAGIC_PROMPTS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(entries, f, indent=2, ensure_ascii=False)
+
+
+def _seed_magic_library():
+    """Deploy the bundled default library onto the persistent volume if it isn't there yet.
+    Runs at startup so user-added mixins in data/ survive image rebuilds/redeploys; only the
+    seed ships in the image."""
+    if os.path.exists(MAGIC_PROMPTS_FILE):
+        return
+    try:
+        with open(DEFAULT_MAGIC_PROMPTS_FILE, 'r', encoding='utf-8') as src:
+            entries = json.load(src)
+        _save_magic_library(entries)
+        logger.info(f"Seeded {MAGIC_PROMPTS_FILE} from {DEFAULT_MAGIC_PROMPTS_FILE} ({len(entries)} entries).")
+    except (OSError, json.JSONDecodeError) as e:
+        logger.error(f"Failed to seed magic library from {DEFAULT_MAGIC_PROMPTS_FILE}: {e}")
+
+
+def _slugify_magic_id(text, existing_ids):
+    """Build a stable, human-referenceable slug from the first few words of the text,
+    appending -2, -3, ... until it's unique against existing_ids."""
+    words = re.findall(r'[a-z0-9]+', text.lower())[:4]
+    base = '-'.join(words) or "magic"
+    slug = base
+    n = 2
+    while slug in existing_ids:
+        slug = f"{base}-{n}"
+        n += 1
+    return slug
+
+
 def maybe_apply_magic_paint(prompt):
     """Random-roll magic paint at MAGIC_PAINT_RATE. Only reads the library if the roll succeeds."""
     if random.random() < MAGIC_PAINT_RATE:
@@ -110,11 +147,61 @@ def maybe_apply_magic_paint(prompt):
     return prompt, False
 
 
+def parse_magic_rate(s):
+    """Parse a user-supplied magic rate into a probability in [0.0, 1.0].
+
+    Trailing '%' is interpreted exactly as a percent (10% -> 0.10, .1% -> 0.001).
+    Without '%': a value >= 1 is a percent number (10 -> 0.10, 1 -> 0.01),
+    a value < 1 is a raw fraction (.1 -> 0.10, .001 -> 0.001).
+    Raises ValueError on unparseable input or a result outside [0.0, 1.0]."""
+    s = s.strip()
+    if s.endswith('%'):
+        rate = float(s[:-1]) / 100.0
+    else:
+        num = float(s)
+        rate = num / 100.0 if num >= 1 else num
+    if not (0.0 <= rate <= 1.0):
+        raise ValueError(f"rate {rate} out of range [0.0, 1.0]")
+    return rate
+
+
+def format_magic_rate(rate):
+    """Render a probability as a percent string: 0.05 -> '5%', 0.001 -> '0.1%', 0.10 -> '10%'."""
+    return f"{rate * 100:g}%"
+
+
+def _record_rate_change(user, rate):
+    """Append a rate-change record to the persisted history (keeps the last 10) and log it."""
+    data = load_data()
+    history = data.get('magic_rate_history', [])
+    history.append({"user": user, "rate": rate, "time": datetime.now().isoformat()})
+    data['magic_rate_history'] = history[-10:]
+    save_data(data)
+    logger.info(f"Magic rate changed to {format_magic_rate(rate)} ({rate}) by {user}")
+
+
 async def send_quote(ctx, magic=False):
     quote = get_random_bob_ross_quote()
     if magic:
         quote += " 🖌️"
+        data = load_data()
+        data['magic'] = data.get('magic', 0) + 1
+        save_data(data)
     await ctx.send(quote)
+
+
+async def send_long(ctx, text):
+    """Send text to Discord, chunking on newlines to stay under the 2000-char message limit."""
+    chunk = ""
+    for line in text.split("\n"):
+        if len(chunk) + len(line) + 1 > 1900:
+            if chunk:
+                await ctx.send(chunk)
+            chunk = line
+        else:
+            chunk = f"{chunk}\n{line}" if chunk else line
+    if chunk:
+        await ctx.send(chunk)
 
 
 intents = discord.Intents.default()
@@ -209,16 +296,25 @@ async def xpaint(ctx, *, prompt):
     await do_the_art(ctx, magic_prompt, "xpaint", IMAGE_MODEL)
 
 
-@bot.command(name='remix', help='Remix an attached image, or paint a prompt if none is attached. monthly limit')
+@bot.command(name='remix', help='Remix an image with a prompt. Attach an image, reply to one, or do both — and add a prompt to guide the transformation. Falls back to painting if no image is found. Monthly limit applies.')
 async def remix(ctx, *, prompt=None):
     attachments = [a for a in ctx.message.attachments if (a.content_type or "").startswith("image/")]
     skipped = len(ctx.message.attachments) - len(attachments)
     if skipped:
         await ctx.send(f"Skipping {skipped} attachment(s) that aren't images.")
 
+    if ctx.message.reference:
+        try:
+            ref_msg = ctx.message.reference.resolved
+            if not isinstance(ref_msg, discord.Message):
+                ref_msg = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+            attachments += [a for a in ref_msg.attachments if (a.content_type or "").startswith("image/")]
+        except (discord.NotFound, discord.HTTPException):
+            pass
+
     if not attachments:
         if not prompt:
-            await ctx.send("Please provide a prompt or attach an image to remix.")
+            await ctx.send("We need a happy little image to work with before we can remix anything. Attach one, or reply to a message that has one!")
             return
         prompt, magic = maybe_apply_magic_paint(prompt)
         await send_quote(ctx, magic)
@@ -234,6 +330,86 @@ async def remix(ctx, *, prompt=None):
 
     await send_quote(ctx, magic)
     await do_the_art(ctx, prompt, "remix", IMAGE_MODEL, images=images)
+
+
+@bot.command(name='magic_list', help='List the magic mixins (id, text, author, date).')
+async def magic_list(ctx):
+    entries = _load_magic_library()
+    if not entries:
+        await ctx.send("The magic library is empty.")
+        return
+    lines = []
+    for entry in entries:
+        text = entry.get("text", "")
+        if len(text) > 80:
+            text = text[:77] + "..."
+        author = entry.get("author", "built-in")
+        added = entry.get("added", "—")
+        lines.append(f"`{entry.get('id', '?')}` — {text} (by {author}, {added})")
+    await send_long(ctx, "\n".join(lines))
+
+
+@bot.command(name='magic_add', help='Add a magic mixin. The text is appended to prompts when magic fires.')
+async def magic_add(ctx, *, text=None):
+    if not text or not text.strip():
+        await ctx.send("Give me some happy little text to add, like `&magic_add In the background, a squirrel juggles acorns.`")
+        return
+    text = text.strip()
+    entries = _load_magic_library()
+    existing_ids = {e.get("id") for e in entries}
+    new_id = _slugify_magic_id(text, existing_ids)
+    entries.append({
+        "id": new_id,
+        "text": text,
+        "author": ctx.author.name,
+        "added": date.today().isoformat(),
+    })
+    _save_magic_library(entries)
+    await ctx.send(f"Added magic mixin `{new_id}`. Remove it with `&magic_remove {new_id}`.")
+
+
+@bot.command(name='magic_remove', help='Remove a magic mixin by id (see &magic_list).')
+async def magic_remove(ctx, entry_id=None):
+    if not entry_id:
+        await ctx.send("Which one? `&magic_remove <id>` — see `&magic_list` for ids.")
+        return
+    entries = _load_magic_library()
+    remaining = [e for e in entries if e.get("id") != entry_id]
+    if len(remaining) == len(entries):
+        await ctx.send(f"No entry with id `{entry_id}`.")
+        return
+    _save_magic_library(remaining)
+    note = " The library is now empty — magic paint will do nothing until you add more." if not remaining else ""
+    await ctx.send(f"Removed magic mixin `{entry_id}`.{note}")
+
+
+@bot.command(name='magic_rate', help='Show or set the magic paint rate. e.g. &magic_rate, &magic_rate 10, &magic_rate .1, &magic_rate 10%, &magic_rate .1%')
+async def magic_rate(ctx, value=None):
+    global MAGIC_PAINT_RATE
+    if value is None:
+        data = load_data()
+        history = data.get('magic_rate_history', [])
+        msg = f"Magic rate: {format_magic_rate(MAGIC_PAINT_RATE)}"
+        if history:
+            last = history[-1]
+            when = last['time'][:10]
+            msg += f"\nLast changed by {last['user']} on {when}"
+            if len(history) > 1:
+                recent = "\n".join(
+                    f"  {h['time'][:16].replace('T', ' ')} — {format_magic_rate(h['rate'])} by {h['user']}"
+                    for h in history[-5:]
+                )
+                msg += f"\nRecent changes:\n{recent}"
+        await ctx.send(msg)
+        return
+    try:
+        rate = parse_magic_rate(value)
+    except ValueError:
+        await ctx.send("Couldn't read that rate. Try `10`, `.1`, `10%`, or `.1%` (values map to a 0–100% chance).")
+        return
+    MAGIC_PAINT_RATE = rate
+    _record_rate_change(ctx.author.name, rate)
+    await ctx.send(f"Magic rate set to {format_magic_rate(rate)}.")
 
 
 async def do_the_art(ctx, prompt, request_type, model, images=None):
@@ -264,6 +440,8 @@ async def do_the_art(ctx, prompt, request_type, model, images=None):
         if current_month not in data:
             data[current_month] = 0
         data[current_month] += 1
+        if request_type == "remix":
+            data['remixes'] = data.get('remixes', 0) + 1
         save_data(data)
         await ctx.send(f"Generated in {format_duration(elapsed)} | Monthly requests: {data[current_month]}")
         return True
@@ -353,6 +531,9 @@ async def fetch_image_edit(prompt, model, images):
             size = config["params"].get("size")
             if size:
                 form.add_field("size", size)
+            quality = config["params"].get("quality")
+            if quality:
+                form.add_field("quality", quality)
             if config["supports_moderation"]:
                 form.add_field("moderation", IMAGE_MODERATION)
             for i, (img_bytes, content_type) in enumerate(images):
@@ -397,12 +578,23 @@ async def stats(ctx):
         data['memes'] = 0
     uptime_in_hours = (datetime.now() - start_time).total_seconds() / 3600
 
+    history = data.get('magic_rate_history', [])
+    if history:
+        last = history[-1]
+        last_change = f"by {last['user']} on {last['time'][:10]}"
+    else:
+        last_change = "—"
+
     # Construct the message parts
     uptime_part = f"Uptime: {uptime_in_hours:.2f} hours"
     limit_part = f"Monthly limit: {LIMIT}"
     requests_part = f"Monthly requests: {data[current_month]}"
     memes_part = f"Memes Requested: {data['memes']}"
     violations_part = f"Safety Violations: {data['safety_trips']}"
+    magic_rate_part = f"Magic rate: {format_magic_rate(MAGIC_PAINT_RATE)}"
+    magic_part = f"Magic applied: {data.get('magic', 0)}"
+    remixes_part = f"Remixes: {data.get('remixes', 0)}"
+    last_change_part = f"Last rate change: {last_change}"
 
     # Combine the parts into the final message
     message = (
@@ -410,7 +602,11 @@ async def stats(ctx):
         f"{limit_part}\n"
         f"{requests_part}\n"
         f"{memes_part}\n"
-        f"{violations_part}"
+        f"{violations_part}\n"
+        f"{magic_rate_part}\n"
+        f"{magic_part}\n"
+        f"{remixes_part}\n"
+        f"{last_change_part}"
     )
 
     # Send the message
@@ -481,4 +677,5 @@ def get_random_bob_ross_quote():
     return random.choice(quotes)
 
 
+_seed_magic_library()
 bot.run(DISCORD_BOT_TOKEN)

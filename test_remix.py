@@ -80,5 +80,7 @@ if __name__ == "__main__":
     model = os.environ.get("IMAGE_MODEL", "gpt-image-2")
     if not model.startswith("gpt-image"):
         model = "gpt-image-2"
-    print(f"Model: {model}")
-    asyncio.run(test(prompt, model, api_key, image_paths))
+    # IMAGE_MODEL may be an internal alias like "gpt-image-2-low"; resolve to the real API model name
+    api_model = "gpt-image-2" if model.startswith("gpt-image-2") else model
+    print(f"Model: {api_model}")
+    asyncio.run(test(prompt, api_model, api_key, image_paths))

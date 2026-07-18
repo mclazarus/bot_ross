@@ -9,8 +9,12 @@ Bot Ross is a Discord bot that generates images using OpenAI's image models. Cha
 | `&paint <prompt>` | Generate an image with gpt-image-2 (or `IMAGE_MODEL`) |
 | `&dpaint <prompt>` | Generate an image with DALL-E 3 |
 | `&meme [idea]` | GPT generates a meme prompt, then paints it |
-| `&remix [prompt]` | Remix attached image(s) with a prompt, or paint a prompt if none is attached |
-| `&stats` | Show uptime, monthly request count, and limit |
+| `&remix [prompt]` | Remix attached image(s) — or the image in a message you reply to — with a prompt, or paint a prompt if none is attached |
+| `&magic_list` | List the magic mixins (id, text, author, date) |
+| `&magic_add <text>` | Add a magic mixin appended to prompts when magic fires |
+| `&magic_remove <id>` | Remove a magic mixin by id |
+| `&magic_rate [value]` | Show the current magic rate, or set it (`10`, `.1`, `10%`, `.1%`) |
+| `&stats` | Show uptime, monthly request count, limit, and magic/remix activity |
 | `&ping` | Check bot latency |
 
 ## Setup
@@ -36,7 +40,7 @@ Bot Ross is a Discord bot that generates images using OpenAI's image models. Cha
 
 If a `bot_ross` container is already running, `run.sh` will stop and remove it before starting the new one. When a host is provided, `DOCKER_HOST=ssh://<host>` is set so all docker commands run against the remote daemon — the `.env` file is read locally and never copied to the remote host.
 
-The `data/` directory stores monthly request counts and stats — mount a host path to persist them across container restarts.
+The `data/` directory stores monthly request counts, stats, and the working magic-mixin library (`data/magic_prompts.json`) — mount a host path to persist them across container restarts and redeploys. On startup the bot seeds `data/magic_prompts.json` from the image's bundled default only if it isn't already present, so mixins added via `&magic_add` survive image rebuilds.
 
 ## Running locally
 
