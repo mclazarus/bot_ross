@@ -30,30 +30,43 @@ IMAGE_MODERATION = os.environ.get('IMAGE_MODERATION', 'low')
 MEME_MODEL       = os.environ.get('MEME_MODEL', 'gpt-5.4-mini')
 DATA_FILE        = "data/request_data.json"
 
+try:
+    MAGIC_PAINT_RATE = float(os.environ.get('MAGIC_PAINT_RATE', 0.05))
+    if not (0.0 <= MAGIC_PAINT_RATE <= 1.0):
+        raise ValueError
+except (TypeError, ValueError):
+    MAGIC_PAINT_RATE = 0.05
+
+MAGIC_PROMPTS_FILE = "magic_prompts.json"
+
 MODEL_CONFIGS = {
     "gpt-image-2": {
         "model": "gpt-image-2",
         "params": {"size": "1024x1024", "quality": "high"},
         "has_revised_prompt": False,
         "supports_moderation": True,
+        "supports_edit": True,
     },
     "gpt-image-2-medium": {
         "model": "gpt-image-2",
         "params": {"size": "1024x1024", "quality": "medium"},
         "has_revised_prompt": False,
         "supports_moderation": True,
+        "supports_edit": True,
     },
     "gpt-image-2-low": {
         "model": "gpt-image-2",
         "params": {"size": "1024x1024", "quality": "low"},
         "has_revised_prompt": False,
         "supports_moderation": True,
+        "supports_edit": True,
     },
     "dall-e-3": {
         "model": "dall-e-3",
         "params": {"size": "1024x1024", "quality": "hd", "style": "vivid", "response_format": "b64_json"},
         "has_revised_prompt": True,
         "supports_moderation": False,
+        "supports_edit": False,
     },
 }
 
@@ -65,6 +78,44 @@ def format_duration(seconds):
         return f"{seconds:.1f}s"
     else:
         return f"{int(seconds // 60)}m {int(seconds % 60)}s"
+
+
+def _load_magic_library():
+    """Read the magic-prompt library fresh from disk. Not cached in memory."""
+    try:
+        with open(MAGIC_PROMPTS_FILE, 'r') as f:
+            entries = json.load(f)
+        if not isinstance(entries, list) or not entries:
+            logger.error(f"{MAGIC_PROMPTS_FILE} is empty or malformed.")
+            return []
+        return entries
+    except (OSError, json.JSONDecodeError) as e:
+        logger.error(f"Failed to load magic prompt library: {e}")
+        return []
+
+
+def _apply_random_magic_entry(prompt):
+    """Load the library, pick one entry, append its text. Fails open (unchanged prompt) if the library is missing/empty."""
+    entries = _load_magic_library()
+    if not entries:
+        return prompt
+    text = random.choice(entries).get("text", "")
+    return f"{prompt} {text}" if text else prompt
+
+
+def maybe_apply_magic_paint(prompt):
+    """Random-roll magic paint at MAGIC_PAINT_RATE. Only reads the library if the roll succeeds."""
+    if random.random() < MAGIC_PAINT_RATE:
+        return _apply_random_magic_entry(prompt), True
+    return prompt, False
+
+
+async def send_quote(ctx, magic=False):
+    quote = get_random_bob_ross_quote()
+    if magic:
+        quote += " 🖌️"
+    await ctx.send(quote)
+
 
 intents = discord.Intents.default()
 intents.guilds = True
@@ -120,7 +171,8 @@ async def meme(ctx, *, prompt=None):
 
 @bot.command(name='paint', help='Paint a picture based on a prompt. monthly limit')
 async def paint(ctx, *, prompt):
-    await ctx.send(get_random_bob_ross_quote())
+    prompt, magic = maybe_apply_magic_paint(prompt)
+    await send_quote(ctx, magic)
     await do_the_art(ctx, prompt, "paint", IMAGE_MODEL)
 
 
@@ -148,7 +200,43 @@ async def dpaint(ctx, *, prompt):
     await do_the_art(ctx, prompt, "dpaint", "dall-e-3")
 
 
-async def do_the_art(ctx, prompt, request_type, model):
+# Hidden always-on variant of &paint. Named xpaint (not mpaint) since &mpaint is
+# already the medium-quality command. Not listed in help; the addition is never revealed.
+@bot.command(name='xpaint', help='Paint a picture, with a little extra magic.', hidden=True)
+async def xpaint(ctx, *, prompt):
+    magic_prompt = _apply_random_magic_entry(prompt)
+    await send_quote(ctx, magic=True)
+    await do_the_art(ctx, magic_prompt, "xpaint", IMAGE_MODEL)
+
+
+@bot.command(name='remix', help='Remix an attached image, or paint a prompt if none is attached. monthly limit')
+async def remix(ctx, *, prompt=None):
+    attachments = [a for a in ctx.message.attachments if (a.content_type or "").startswith("image/")]
+    skipped = len(ctx.message.attachments) - len(attachments)
+    if skipped:
+        await ctx.send(f"Skipping {skipped} attachment(s) that aren't images.")
+
+    if not attachments:
+        if not prompt:
+            await ctx.send("Please provide a prompt or attach an image to remix.")
+            return
+        prompt, magic = maybe_apply_magic_paint(prompt)
+        await send_quote(ctx, magic)
+        await do_the_art(ctx, prompt, "remix", IMAGE_MODEL)
+        return
+
+    images = [(await a.read(), a.content_type) for a in attachments]
+    if prompt:
+        prompt, magic = maybe_apply_magic_paint(prompt)
+    else:
+        prompt = _apply_random_magic_entry("creatively reinterpret this image")
+        magic = True
+
+    await send_quote(ctx, magic)
+    await do_the_art(ctx, prompt, "remix", IMAGE_MODEL, images=images)
+
+
+async def do_the_art(ctx, prompt, request_type, model, images=None):
     logger.info(f"Received {request_type} request from {ctx.author.name} using {model} to paint: {prompt}")
     current_month = get_current_month()
     data = load_data()
@@ -160,7 +248,10 @@ async def do_the_art(ctx, prompt, request_type, model):
 
     try:
         t0 = time.monotonic()
-        response = await fetch_image(prompt, model)
+        if images:
+            response = await fetch_image_edit(prompt, get_edit_model(model), images)
+        else:
+            response = await fetch_image(prompt, model)
         elapsed = time.monotonic() - t0
         image_data = base64.b64decode(response['image'])
         image_file = io.BytesIO(image_data)
@@ -179,6 +270,31 @@ async def do_the_art(ctx, prompt, request_type, model):
     except Exception as e:
         await ctx.send(f"No painting for: {prompt}, exception for this request: {e}")
         return False
+
+
+def get_edit_model(model):
+    config = MODEL_CONFIGS.get(model, MODEL_CONFIGS["gpt-image-2"])
+    return model if config.get("supports_edit") else "gpt-image-2"
+
+
+async def _classify_image_error(response, prompt):
+    """Shared by fetch_image and fetch_image_edit. Returns ('retry'|'safety'|'stop', error_message)."""
+    error_json = await response.json()
+    error_message = error_json.get("error", {}).get("message") or str(error_json)
+    if response.status == 400:
+        logger.info(f"Request: {prompt} Safety Violation.")
+        data = load_data()
+        if 'safety_trips' not in data:
+            data['safety_trips'] = 0
+        data['safety_trips'] += 1
+        save_data(data)
+        return 'safety', error_message
+    elif response.status in [429, 500, 503]:
+        logger.error(f"Request: {prompt} Trying again. Error: {response.status} {error_message}")
+        return 'retry', error_message
+    else:
+        logger.error(f"Request: {prompt} Error: {response.status}: {error_message}")
+        return 'stop', error_message
 
 
 async def fetch_image(prompt, model):
@@ -209,22 +325,56 @@ async def fetch_image(prompt, model):
                     item = data["data"][0]
                     revised = item.get("revised_prompt") if config["has_revised_prompt"] else None
                     return {"image": item["b64_json"], "revised_prompt": revised}
-                else:
-                    error_json = await response.json()
-                    error_message = error_json.get("error", {}).get("message") or str(error_json)
-                    if response.status == 400:
-                        logger.info(f"Request: {prompt} Safety Violation.")
-                        data = load_data()
-                        if 'safety_trips' not in data:
-                            data['safety_trips'] = 0
-                        data['safety_trips'] += 1
-                        save_data(data)
-                        break
-                    elif response.status in [429, 500, 503]:
-                        logger.error(f"Request: {prompt} Trying again. Error: {response.status} {error_message}")
-                        await asyncio.sleep(5)
-                    else:
-                        logger.error(f"Request: {prompt} Error: {response.status}: {error_message}")
+                verdict, error_message = await _classify_image_error(response, prompt)
+                if verdict == 'safety':
+                    break
+                if verdict == 'retry':
+                    await asyncio.sleep(5)
+
+        raise Exception(f"response: {response.status}: {error_message}")
+
+
+def _image_extension(content_type):
+    return (content_type or "image/png").split("/")[-1].split(";")[0] or "png"
+
+
+async def fetch_image_edit(prompt, model, images):
+    """images: list[(bytes, content_type)] of raw image content and its Discord-reported
+    content type (e.g. from discord.Attachment.read()/.content_type).
+    Returns {"image": b64, "revised_prompt": None} — the edits endpoint has no revised_prompt."""
+    config = MODEL_CONFIGS.get(model, MODEL_CONFIGS["gpt-image-2"])
+    async with aiohttp.ClientSession() as session:
+        for _ in range(2):
+            form = aiohttp.FormData()  # rebuilt every attempt: FormData is single-use
+            form.add_field("model", config["model"])
+            form.add_field("prompt", prompt)
+            form.add_field("n", "1")
+            form.add_field("user", "bot_ross")
+            size = config["params"].get("size")
+            if size:
+                form.add_field("size", size)
+            if config["supports_moderation"]:
+                form.add_field("moderation", IMAGE_MODERATION)
+            for i, (img_bytes, content_type) in enumerate(images):
+                ext = _image_extension(content_type)
+                form.add_field("image[]", img_bytes, filename=f"image_{i}.{ext}",
+                                content_type=content_type or "image/png")
+
+            async with session.post(
+                    "https://api.openai.com/v1/images/edits",
+                    headers={"Authorization": f"Bearer {openai.api_key}"},
+                    data=form,
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    logger.info(f"Edit request: {prompt} Success")
+                    item = data["data"][0]
+                    return {"image": item["b64_json"], "revised_prompt": None}
+                verdict, error_message = await _classify_image_error(response, prompt)
+                if verdict == 'safety':
+                    break
+                if verdict == 'retry':
+                    await asyncio.sleep(5)
 
         raise Exception(f"response: {response.status}: {error_message}")
 

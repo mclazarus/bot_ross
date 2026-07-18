@@ -6,6 +6,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot_ross.py .
+COPY magic_prompts.json .
 
 RUN mkdir -p /app/data
 
