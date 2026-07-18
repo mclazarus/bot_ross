@@ -14,6 +14,7 @@ import base64
 import io
 import string
 import re
+import release_image
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bot_ross")
@@ -332,6 +333,28 @@ async def remix(ctx, *, prompt=None):
     await do_the_art(ctx, prompt, "remix", IMAGE_MODEL, images=images)
 
 
+@bot.command(name='release_image', help='Generate a deterministic release avatar from a git hash (or any text) — same input always yields the same prompt. Flags: --george, --vN. Monthly limit applies.')
+async def release_image_cmd(ctx, *, args=None):
+    if not args or not args.strip():
+        await ctx.send("Give me a git hash or any text to immortalize as a release image...")
+        return
+    source, version, georgify = release_image.parse_release_args(args)
+    if not source:
+        await ctx.send("...I need something to hash besides the flags.")
+        return
+    try:
+        prompt, seed, ver = release_image.build_release_prompt(source, version, georgify)
+    except KeyError:
+        available = ", ".join(sorted(release_image.RELEASE_ALGORITHMS, key=lambda v: int(v)))
+        await ctx.send(f"Unknown algorithm version. Available: {available}")
+        return
+    # Release images are deliberately NOT subject to magic paint, so send a plain quote.
+    await send_quote(ctx)
+    george = " | 🥸 George mode" if georgify else ""
+    await ctx.send(f"Release image for `{source}` | seed {seed} | algo v{ver}{george}\n**Prompt**: {prompt}")
+    await do_the_art(ctx, prompt, "release_image", IMAGE_MODEL)
+
+
 @bot.command(name='magic_list', help='List the magic mixins (id, text, author, date).')
 async def magic_list(ctx):
     entries = _load_magic_library()
@@ -442,6 +465,8 @@ async def do_the_art(ctx, prompt, request_type, model, images=None):
         data[current_month] += 1
         if request_type == "remix":
             data['remixes'] = data.get('remixes', 0) + 1
+        if request_type == "release_image":
+            data['release_images'] = data.get('release_images', 0) + 1
         save_data(data)
         await ctx.send(f"Generated in {format_duration(elapsed)} | Monthly requests: {data[current_month]}")
         return True
@@ -594,6 +619,7 @@ async def stats(ctx):
     magic_rate_part = f"Magic rate: {format_magic_rate(MAGIC_PAINT_RATE)}"
     magic_part = f"Magic applied: {data.get('magic', 0)}"
     remixes_part = f"Remixes: {data.get('remixes', 0)}"
+    release_images_part = f"Release images: {data.get('release_images', 0)}"
     last_change_part = f"Last rate change: {last_change}"
 
     # Combine the parts into the final message
@@ -606,6 +632,7 @@ async def stats(ctx):
         f"{magic_rate_part}\n"
         f"{magic_part}\n"
         f"{remixes_part}\n"
+        f"{release_images_part}\n"
         f"{last_change_part}"
     )
 
