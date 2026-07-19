@@ -15,6 +15,8 @@ import io
 import string
 import re
 import release_image
+import magic_paint
+from magic_paint import parse_magic_rate, format_magic_rate
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bot_ross")
@@ -102,91 +104,28 @@ def format_uptime(seconds):
     return " ".join(parts)
 
 
+# Thin wrappers binding magic_paint's pure logic to this module's file paths and the
+# live (runtime-mutable) MAGIC_PAINT_RATE. The rate calculation itself lives in
+# magic_paint.py so it can be unit tested (see test_magic_paint.py).
 def _load_magic_library():
-    """Read the magic-prompt library fresh from disk. Not cached in memory."""
-    try:
-        with open(MAGIC_PROMPTS_FILE, 'r') as f:
-            entries = json.load(f)
-        if not isinstance(entries, list) or not entries:
-            logger.error(f"{MAGIC_PROMPTS_FILE} is empty or malformed.")
-            return []
-        return entries
-    except (OSError, json.JSONDecodeError) as e:
-        logger.error(f"Failed to load magic prompt library: {e}")
-        return []
+    return magic_paint.load_magic_library(MAGIC_PROMPTS_FILE)
 
 
 def _apply_random_magic_entry(prompt):
-    """Load the library, pick one entry, append its text. Fails open (unchanged prompt) if the library is missing/empty."""
-    entries = _load_magic_library()
-    if not entries:
-        return prompt
-    text = random.choice(entries).get("text", "")
-    return f"{prompt} {text}" if text else prompt
+    return magic_paint.apply_random_magic_entry(prompt, path=MAGIC_PROMPTS_FILE)
 
 
 def _save_magic_library(entries):
-    """Write the magic-prompt library to disk. Preserves unicode (♥️, —) for readability."""
-    with open(MAGIC_PROMPTS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(entries, f, indent=2, ensure_ascii=False)
+    magic_paint.save_magic_library(entries, MAGIC_PROMPTS_FILE)
 
 
 def _seed_magic_library():
-    """Deploy the bundled default library onto the persistent volume if it isn't there yet.
-    Runs at startup so user-added mixins in data/ survive image rebuilds/redeploys; only the
-    seed ships in the image."""
-    if os.path.exists(MAGIC_PROMPTS_FILE):
-        return
-    try:
-        with open(DEFAULT_MAGIC_PROMPTS_FILE, 'r', encoding='utf-8') as src:
-            entries = json.load(src)
-        _save_magic_library(entries)
-        logger.info(f"Seeded {MAGIC_PROMPTS_FILE} from {DEFAULT_MAGIC_PROMPTS_FILE} ({len(entries)} entries).")
-    except (OSError, json.JSONDecodeError) as e:
-        logger.error(f"Failed to seed magic library from {DEFAULT_MAGIC_PROMPTS_FILE}: {e}")
-
-
-def _slugify_magic_id(text, existing_ids):
-    """Build a stable, human-referenceable slug from the first few words of the text,
-    appending -2, -3, ... until it's unique against existing_ids."""
-    words = re.findall(r'[a-z0-9]+', text.lower())[:4]
-    base = '-'.join(words) or "magic"
-    slug = base
-    n = 2
-    while slug in existing_ids:
-        slug = f"{base}-{n}"
-        n += 1
-    return slug
+    magic_paint.seed_magic_library(MAGIC_PROMPTS_FILE, DEFAULT_MAGIC_PROMPTS_FILE)
 
 
 def maybe_apply_magic_paint(prompt):
-    """Random-roll magic paint at MAGIC_PAINT_RATE. Only reads the library if the roll succeeds."""
-    if random.random() < MAGIC_PAINT_RATE:
-        return _apply_random_magic_entry(prompt), True
-    return prompt, False
-
-
-def parse_magic_rate(s):
-    """Parse a user-supplied magic rate into a probability in [0.0, 1.0].
-
-    Trailing '%' is interpreted exactly as a percent (10% -> 0.10, .1% -> 0.001).
-    Without '%': a value >= 1 is a percent number (10 -> 0.10, 1 -> 0.01),
-    a value < 1 is a raw fraction (.1 -> 0.10, .001 -> 0.001).
-    Raises ValueError on unparseable input or a result outside [0.0, 1.0]."""
-    s = s.strip()
-    if s.endswith('%'):
-        rate = float(s[:-1]) / 100.0
-    else:
-        num = float(s)
-        rate = num / 100.0 if num >= 1 else num
-    if not (0.0 <= rate <= 1.0):
-        raise ValueError(f"rate {rate} out of range [0.0, 1.0]")
-    return rate
-
-
-def format_magic_rate(rate):
-    """Render a probability as a percent string: 0.05 -> '5%', 0.001 -> '0.1%', 0.10 -> '10%'."""
-    return f"{rate * 100:g}%"
+    """Random-roll magic paint at the live MAGIC_PAINT_RATE. Only reads the library if the roll succeeds."""
+    return magic_paint.maybe_apply_magic_paint(prompt, MAGIC_PAINT_RATE, path=MAGIC_PROMPTS_FILE)
 
 
 def format_rate_change_time(iso_str):
@@ -448,7 +387,7 @@ async def magic_add(ctx, *, text=None):
     text = text.strip()
     entries = _load_magic_library()
     existing_ids = {e.get("id") for e in entries}
-    new_id = _slugify_magic_id(text, existing_ids)
+    new_id = magic_paint.slugify_magic_id(text, existing_ids)
     entries.append({
         "id": new_id,
         "text": text,

@@ -7,6 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot_ross.py .
 COPY release_image.py .
+COPY magic_paint.py .
 # Seed library only. At startup bot_ross copies this to data/magic_prompts.json (the
 # persistent volume) if that file is absent, so user-added mixins survive redeploys.
 COPY magic_prompts.json .
