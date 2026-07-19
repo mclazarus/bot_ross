@@ -325,20 +325,15 @@ async def release_image_cmd(ctx, *, args=None):
     await do_the_art(ctx, prompt, "release_image", IMAGE_MODEL)
 
 
-@bot.command(name='magic_list', help='List the magic mixins (id, text, author, date).')
+@bot.command(name='magic_list', help='List the magic mixin ids and authors. Use &magic_show to read a prompt, &magic_update to change it.')
 async def magic_list(ctx):
     entries = _load_magic_library()
     if not entries:
         await ctx.send("The magic library is empty.")
         return
-    lines = []
+    lines = ["Use `&magic_show <id>` to see a mixin's prompt, `&magic_update <id> <text>` to change it."]
     for entry in entries:
-        text = entry.get("text", "")
-        if len(text) > 80:
-            text = text[:77] + "..."
-        author = entry.get("author", "built-in")
-        added = entry.get("added", "—")
-        lines.append(f"`{entry.get('id', '?')}` — {text} (by {author}, {added})")
+        lines.append(f"`{entry.get('id', '?')}` (by {entry.get('author', 'built-in')})")
     await send_long(ctx, "\n".join(lines))
 
 
