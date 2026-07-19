@@ -189,11 +189,24 @@ def format_magic_rate(rate):
     return f"{rate * 100:g}%"
 
 
+def format_rate_change_time(iso_str):
+    """Render a stored rate-change timestamp as 'YYYY-MM-DD HH:MM:SS ±HHMM'.
+    Legacy naive timestamps recorded before timezones were tracked render without the offset."""
+    try:
+        dt = datetime.fromisoformat(iso_str)
+    except ValueError:
+        return iso_str
+    rendered = dt.strftime("%Y-%m-%d %H:%M:%S")
+    if dt.tzinfo is not None:
+        rendered += dt.strftime(" %z")
+    return rendered
+
+
 def _record_rate_change(user, rate):
     """Append a rate-change record to the persisted history (keeps the last 10) and log it."""
     data = load_data()
     history = data.get('magic_rate_history', [])
-    history.append({"user": user, "rate": rate, "time": datetime.now().isoformat()})
+    history.append({"user": user, "rate": rate, "time": datetime.now().astimezone().isoformat()})
     data['magic_rate_history'] = history[-10:]
     save_data(data)
     logger.info(f"Magic rate changed to {format_magic_rate(rate)} ({rate}) by {user}")
@@ -390,6 +403,43 @@ async def magic_list(ctx):
     await send_long(ctx, "\n".join(lines))
 
 
+@bot.command(name='magic_show', help='Show the full text of a magic mixin by id (see &magic_list).')
+async def magic_show(ctx, entry_id=None):
+    if not entry_id:
+        await ctx.send("Which one? `&magic_show <id>` — see `&magic_list` for ids.")
+        return
+    entries = _load_magic_library()
+    entry = next((e for e in entries if e.get("id") == entry_id), None)
+    if not entry:
+        await ctx.send(f"No entry with id `{entry_id}`.")
+        return
+    lines = [
+        f"`{entry.get('id')}` — {entry.get('text', '')}",
+        f"Author: {entry.get('author', 'built-in')} | Added: {entry.get('added', '—')}",
+    ]
+    if entry.get("editor"):
+        lines.append(f"Last edited by: {entry['editor']} on {entry.get('edited', '—')}")
+    await send_long(ctx, "\n".join(lines))
+
+
+@bot.command(name='magic_update', help="Update a magic mixin's text in place by id (see &magic_list). Records you as editor.")
+async def magic_update(ctx, entry_id=None, *, text=None):
+    if not entry_id or not text or not text.strip():
+        await ctx.send("Usage: `&magic_update <id> <new text>` — see `&magic_list` for ids.")
+        return
+    text = text.strip()
+    entries = _load_magic_library()
+    entry = next((e for e in entries if e.get("id") == entry_id), None)
+    if not entry:
+        await ctx.send(f"No entry with id `{entry_id}`.")
+        return
+    entry["text"] = text
+    entry["editor"] = ctx.author.name
+    entry["edited"] = date.today().isoformat()
+    _save_magic_library(entries)
+    await ctx.send(f"Updated magic mixin `{entry_id}`.")
+
+
 @bot.command(name='magic_add', help='Add a magic mixin. The text is appended to prompts when magic fires.')
 async def magic_add(ctx, *, text=None):
     if not text or not text.strip():
@@ -433,11 +483,11 @@ async def magic_rate(ctx, value=None):
         msg = f"Magic rate: {format_magic_rate(MAGIC_PAINT_RATE)}"
         if history:
             last = history[-1]
-            when = last['time'][:10]
+            when = format_rate_change_time(last['time'])
             msg += f"\nLast changed by {last['user']} on {when}"
             if len(history) > 1:
                 recent = "\n".join(
-                    f"  {h['time'][:16].replace('T', ' ')} — {format_magic_rate(h['rate'])} by {h['user']}"
+                    f"  {format_rate_change_time(h['time'])} — {format_magic_rate(h['rate'])} by {h['user']}"
                     for h in history[-5:]
                 )
                 msg += f"\nRecent changes:\n{recent}"
@@ -625,7 +675,7 @@ async def stats(ctx):
     history = data.get('magic_rate_history', [])
     if history:
         last = history[-1]
-        last_change = f"by {last['user']} on {last['time'][:10]}"
+        last_change = f"by {last['user']} on {format_rate_change_time(last['time'])}"
     else:
         last_change = "—"
 
