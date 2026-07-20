@@ -15,6 +15,8 @@ import io
 import string
 import re
 import release_image
+import magic_paint
+from magic_paint import parse_magic_rate, format_magic_rate
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bot_ross")
@@ -102,98 +104,48 @@ def format_uptime(seconds):
     return " ".join(parts)
 
 
+# Thin wrappers binding magic_paint's pure logic to this module's file paths and the
+# live (runtime-mutable) MAGIC_PAINT_RATE. The rate calculation itself lives in
+# magic_paint.py so it can be unit tested (see test_magic_paint.py).
 def _load_magic_library():
-    """Read the magic-prompt library fresh from disk. Not cached in memory."""
-    try:
-        with open(MAGIC_PROMPTS_FILE, 'r') as f:
-            entries = json.load(f)
-        if not isinstance(entries, list) or not entries:
-            logger.error(f"{MAGIC_PROMPTS_FILE} is empty or malformed.")
-            return []
-        return entries
-    except (OSError, json.JSONDecodeError) as e:
-        logger.error(f"Failed to load magic prompt library: {e}")
-        return []
+    return magic_paint.load_magic_library(MAGIC_PROMPTS_FILE)
 
 
 def _apply_random_magic_entry(prompt):
-    """Load the library, pick one entry, append its text. Fails open (unchanged prompt) if the library is missing/empty."""
-    entries = _load_magic_library()
-    if not entries:
-        return prompt
-    text = random.choice(entries).get("text", "")
-    return f"{prompt} {text}" if text else prompt
+    return magic_paint.apply_random_magic_entry(prompt, path=MAGIC_PROMPTS_FILE)
 
 
 def _save_magic_library(entries):
-    """Write the magic-prompt library to disk. Preserves unicode (♥️, —) for readability."""
-    with open(MAGIC_PROMPTS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(entries, f, indent=2, ensure_ascii=False)
+    magic_paint.save_magic_library(entries, MAGIC_PROMPTS_FILE)
 
 
 def _seed_magic_library():
-    """Deploy the bundled default library onto the persistent volume if it isn't there yet.
-    Runs at startup so user-added mixins in data/ survive image rebuilds/redeploys; only the
-    seed ships in the image."""
-    if os.path.exists(MAGIC_PROMPTS_FILE):
-        return
-    try:
-        with open(DEFAULT_MAGIC_PROMPTS_FILE, 'r', encoding='utf-8') as src:
-            entries = json.load(src)
-        _save_magic_library(entries)
-        logger.info(f"Seeded {MAGIC_PROMPTS_FILE} from {DEFAULT_MAGIC_PROMPTS_FILE} ({len(entries)} entries).")
-    except (OSError, json.JSONDecodeError) as e:
-        logger.error(f"Failed to seed magic library from {DEFAULT_MAGIC_PROMPTS_FILE}: {e}")
-
-
-def _slugify_magic_id(text, existing_ids):
-    """Build a stable, human-referenceable slug from the first few words of the text,
-    appending -2, -3, ... until it's unique against existing_ids."""
-    words = re.findall(r'[a-z0-9]+', text.lower())[:4]
-    base = '-'.join(words) or "magic"
-    slug = base
-    n = 2
-    while slug in existing_ids:
-        slug = f"{base}-{n}"
-        n += 1
-    return slug
+    magic_paint.seed_magic_library(MAGIC_PROMPTS_FILE, DEFAULT_MAGIC_PROMPTS_FILE)
 
 
 def maybe_apply_magic_paint(prompt):
-    """Random-roll magic paint at MAGIC_PAINT_RATE. Only reads the library if the roll succeeds."""
-    if random.random() < MAGIC_PAINT_RATE:
-        return _apply_random_magic_entry(prompt), True
-    return prompt, False
+    """Random-roll magic paint at the live MAGIC_PAINT_RATE. Only reads the library if the roll succeeds."""
+    return magic_paint.maybe_apply_magic_paint(prompt, MAGIC_PAINT_RATE, path=MAGIC_PROMPTS_FILE)
 
 
-def parse_magic_rate(s):
-    """Parse a user-supplied magic rate into a probability in [0.0, 1.0].
-
-    Trailing '%' is interpreted exactly as a percent (10% -> 0.10, .1% -> 0.001).
-    Without '%': a value >= 1 is a percent number (10 -> 0.10, 1 -> 0.01),
-    a value < 1 is a raw fraction (.1 -> 0.10, .001 -> 0.001).
-    Raises ValueError on unparseable input or a result outside [0.0, 1.0]."""
-    s = s.strip()
-    if s.endswith('%'):
-        rate = float(s[:-1]) / 100.0
-    else:
-        num = float(s)
-        rate = num / 100.0 if num >= 1 else num
-    if not (0.0 <= rate <= 1.0):
-        raise ValueError(f"rate {rate} out of range [0.0, 1.0]")
-    return rate
-
-
-def format_magic_rate(rate):
-    """Render a probability as a percent string: 0.05 -> '5%', 0.001 -> '0.1%', 0.10 -> '10%'."""
-    return f"{rate * 100:g}%"
+def format_rate_change_time(iso_str):
+    """Render a stored rate-change timestamp as 'YYYY-MM-DD HH:MM:SS ±HHMM'.
+    Legacy naive timestamps recorded before timezones were tracked render without the offset."""
+    try:
+        dt = datetime.fromisoformat(iso_str)
+    except ValueError:
+        return iso_str
+    rendered = dt.strftime("%Y-%m-%d %H:%M:%S")
+    if dt.tzinfo is not None:
+        rendered += dt.strftime(" %z")
+    return rendered
 
 
 def _record_rate_change(user, rate):
     """Append a rate-change record to the persisted history (keeps the last 10) and log it."""
     data = load_data()
     history = data.get('magic_rate_history', [])
-    history.append({"user": user, "rate": rate, "time": datetime.now().isoformat()})
+    history.append({"user": user, "rate": rate, "time": datetime.now().astimezone().isoformat()})
     data['magic_rate_history'] = history[-10:]
     save_data(data)
     logger.info(f"Magic rate changed to {format_magic_rate(rate)} ({rate}) by {user}")
@@ -373,21 +325,53 @@ async def release_image_cmd(ctx, *, args=None):
     await do_the_art(ctx, prompt, "release_image", IMAGE_MODEL)
 
 
-@bot.command(name='magic_list', help='List the magic mixins (id, text, author, date).')
+@bot.command(name='magic_list', help='List the magic mixin ids and authors. Use &magic_show to read a prompt, &magic_update to change it.')
 async def magic_list(ctx):
     entries = _load_magic_library()
     if not entries:
         await ctx.send("The magic library is empty.")
         return
-    lines = []
+    lines = ["Use `&magic_show <id>` to see a mixin's prompt, `&magic_update <id> <text>` to change it."]
     for entry in entries:
-        text = entry.get("text", "")
-        if len(text) > 80:
-            text = text[:77] + "..."
-        author = entry.get("author", "built-in")
-        added = entry.get("added", "—")
-        lines.append(f"`{entry.get('id', '?')}` — {text} (by {author}, {added})")
+        lines.append(f"`{entry.get('id', '?')}` (by {entry.get('author', 'built-in')})")
     await send_long(ctx, "\n".join(lines))
+
+
+@bot.command(name='magic_show', help='Show the full text of a magic mixin by id (see &magic_list).')
+async def magic_show(ctx, entry_id=None):
+    if not entry_id:
+        await ctx.send("Which one? `&magic_show <id>` — see `&magic_list` for ids.")
+        return
+    entries = _load_magic_library()
+    entry = next((e for e in entries if e.get("id") == entry_id), None)
+    if not entry:
+        await ctx.send(f"No entry with id `{entry_id}`.")
+        return
+    lines = [
+        f"`{entry.get('id')}` — {entry.get('text', '')}",
+        f"Author: {entry.get('author', 'built-in')} | Added: {entry.get('added', '—')}",
+    ]
+    if entry.get("editor"):
+        lines.append(f"Last edited by: {entry['editor']} on {entry.get('edited', '—')}")
+    await send_long(ctx, "\n".join(lines))
+
+
+@bot.command(name='magic_update', help="Update a magic mixin's text in place by id (see &magic_list). Records you as editor.")
+async def magic_update(ctx, entry_id=None, *, text=None):
+    if not entry_id or not text or not text.strip():
+        await ctx.send("Usage: `&magic_update <id> <new text>` — see `&magic_list` for ids.")
+        return
+    text = text.strip()
+    entries = _load_magic_library()
+    entry = next((e for e in entries if e.get("id") == entry_id), None)
+    if not entry:
+        await ctx.send(f"No entry with id `{entry_id}`.")
+        return
+    entry["text"] = text
+    entry["editor"] = ctx.author.name
+    entry["edited"] = date.today().isoformat()
+    _save_magic_library(entries)
+    await ctx.send(f"Updated magic mixin `{entry_id}`.")
 
 
 @bot.command(name='magic_add', help='Add a magic mixin. The text is appended to prompts when magic fires.')
@@ -398,7 +382,7 @@ async def magic_add(ctx, *, text=None):
     text = text.strip()
     entries = _load_magic_library()
     existing_ids = {e.get("id") for e in entries}
-    new_id = _slugify_magic_id(text, existing_ids)
+    new_id = magic_paint.slugify_magic_id(text, existing_ids)
     entries.append({
         "id": new_id,
         "text": text,
@@ -433,11 +417,11 @@ async def magic_rate(ctx, value=None):
         msg = f"Magic rate: {format_magic_rate(MAGIC_PAINT_RATE)}"
         if history:
             last = history[-1]
-            when = last['time'][:10]
+            when = format_rate_change_time(last['time'])
             msg += f"\nLast changed by {last['user']} on {when}"
             if len(history) > 1:
                 recent = "\n".join(
-                    f"  {h['time'][:16].replace('T', ' ')} — {format_magic_rate(h['rate'])} by {h['user']}"
+                    f"  {format_rate_change_time(h['time'])} — {format_magic_rate(h['rate'])} by {h['user']}"
                     for h in history[-5:]
                 )
                 msg += f"\nRecent changes:\n{recent}"
@@ -625,7 +609,7 @@ async def stats(ctx):
     history = data.get('magic_rate_history', [])
     if history:
         last = history[-1]
-        last_change = f"by {last['user']} on {last['time'][:10]}"
+        last_change = f"by {last['user']} on {format_rate_change_time(last['time'])}"
     else:
         last_change = "—"
 
