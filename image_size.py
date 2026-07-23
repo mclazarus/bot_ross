@@ -1,89 +1,32 @@
 """Pure size selection for image generation (&paint family) and edits (&remix).
 
-Two related jobs, two endpoints with DIFFERENT size rules:
+Both the /v1/images/generations and /v1/images/edits endpoints (gpt-image-2) accept
+an arbitrary WxH size subject to: divisible by 16, aspect ratio in [1/3, 3], and
+within a max box (documented up to 3840x2160). The edit docs only advertise the three
+standard sizes + "auto", but the endpoint honors arbitrary sizes in practice, so both
+&paint and &remix coerce a requested size into that space with `coerce_generation_size`
+rather than snapping to a fixed size.
 
-- Edit (/v1/images/edits, &remix with an image) accepts only four `size` values:
-  1024x1024, 1536x1024, 1024x1536, or "auto". `edit_size_for_dimensions` picks the
-  allowed size whose aspect ratio is closest to the input image's (see below).
-- Generate (/v1/images/generations, &paint/&hpaint/&mpaint/&lpaint/&xpaint) also
-  accepts an arbitrary WxH (divisible by 16, ratio in [1/3, 3], within a 3840x2160
-  box). `coerce_generation_size` snaps an arbitrary `--res` into that space.
-
-The command flags (--square/--landscape/--portrait/--res) are parsed here too
-(`parse_size_flags`/`parse_resolution`), and `resolve_generation_size`/
-`resolve_edit_size` map a parsed request to the right size for each endpoint.
-
-The edit-side aspect matching:
-The OpenAI /v1/images/edits endpoint only accepts four `size` values: 1024x1024,
-1536x1024, 1024x1536, or "auto". &remix wants the output to roughly match the
-orientation of the first input image rather than always forcing a square, so this
-module picks the allowed size whose aspect ratio is closest to the input's.
-
-Because resizing to a *different* aspect ratio necessarily stretches the image (a
-multiplicative distortion, not an additive one), "closest" is measured in log-ratio
-space: the boundary between two neighboring target ratios is their GEOMETRIC mean,
-not their arithmetic mean. A ratio sitting exactly at a boundary is equidistant (in
-log space) from both neighbors; ties are broken toward the non-square neighbor (see
-edit_size_for_dimensions).
+- The command flags (--square/--landscape/--portrait/--res) are parsed here
+  (`parse_size_flags`/`parse_resolution`).
+- `resolve_generation_size` (paint family) and `resolve_edit_size` (remix) map a
+  parsed request to a final size. They differ only in their no-flag default: paint
+  defaults to a square, while remix matches the first attachment's own dimensions as
+  closely as a valid size allows (falling back to "auto" when Discord didn't report
+  them).
 
 No Discord/OpenAI/bot side effects -- bot_ross.py can't be imported under test because
 module load ends in bot.run(), so this logic lives here for test_image_size.py to
 exercise directly.
 """
 
-import math
 import re
 
-# The only four sizes the /v1/images/edits endpoint accepts.
+# The three standard sizes both endpoints accept, reused as the orientation presets.
 SQUARE = "1024x1024"
 LANDSCAPE = "1536x1024"
 PORTRAIT = "1024x1536"
 AUTO = "auto"
-
-# Aspect ratios (width / height) of the three fixed sizes.
-SQUARE_RATIO = 1.0
-LANDSCAPE_RATIO = 1536 / 1024   # 1.5
-PORTRAIT_RATIO = 1024 / 1536    # 0.6666...
-
-# Bucket boundaries are the geometric mean of neighboring target ratios -- the
-# log-space midpoint, since aspect distortion is multiplicative. The two thresholds
-# are reciprocals of each other (sqrt(1.5) * sqrt(2/3) == 1 exactly in the reals,
-# to ~1e-16 in float), which is what makes the three buckets symmetric under
-# transposition: (w, h) -> (h, w). That symmetry is exact for every realistic image
-# size; only a ratio landing within a float ULP of a boundary can transpose
-# asymmetrically, and no integer pixel dimensions in range do.
-LANDSCAPE_THRESHOLD = math.sqrt(SQUARE_RATIO * LANDSCAPE_RATIO)   # sqrt(1.5) ~= 1.224745
-PORTRAIT_THRESHOLD = math.sqrt(SQUARE_RATIO * PORTRAIT_RATIO)     # sqrt(2/3) ~= 0.816497
-
-
-def edit_size_for_dimensions(width, height):
-    """Pick the allowed /v1/images/edits `size` for an input image of `width` x `height`.
-
-    - ratio >= LANDSCAPE_THRESHOLD  -> LANDSCAPE (the boundary value itself is landscape)
-    - ratio <= PORTRAIT_THRESHOLD   -> PORTRAIT  (the boundary value itself is portrait)
-    - otherwise                     -> SQUARE
-    These two boundary conditions can never both fire (LANDSCAPE_THRESHOLD is strictly
-    greater than PORTRAIT_THRESHOLD) and leave no gap: every ratio falls into exactly
-    one bucket.
-
-    Returns AUTO when `width`/`height` are missing (None), non-numeric, or <= 0 --
-    e.g. discord.Attachment.width/.height are Optional[int] and are None for
-    attachments Discord didn't recognize as images, or couldn't probe.
-    """
-    try:
-        w = float(width)
-        h = float(height)
-    except (TypeError, ValueError):
-        return AUTO
-    if w <= 0 or h <= 0:
-        return AUTO
-
-    ratio = w / h
-    if ratio >= LANDSCAPE_THRESHOLD:
-        return LANDSCAPE
-    if ratio <= PORTRAIT_THRESHOLD:
-        return PORTRAIT
-    return SQUARE
 
 
 def describe_edit_size(size):
@@ -303,17 +246,17 @@ def resolve_edit_size(orientation=None, res_wh=None, width=None, height=None):
 
     Empirically, gpt-image-2's /v1/images/edits endpoint honors an arbitrary WxH
     exactly like /v1/images/generations does (despite the docs only listing the three
-    standard sizes + auto), so an explicit --res is coerced the same way as on the
-    generation path rather than snapped to one of the three standard sizes.
+    standard sizes + auto), so every path here coerces to an arbitrary valid size the
+    same way the generation path does, rather than snapping to a standard size.
 
     Returns (size, requested):
-      - res_wh WINS: size = coerce_generation_size(w, h) (an arbitrary valid size,
-        same coercion as generation), requested = f"{w}x{h}".
+      - res_wh WINS: size = coerce_generation_size(w, h), requested = f"{w}x{h}".
       - else orientation: size = ORIENTATIONS[orientation], requested = None.
-      - else (neither given): size = edit_size_for_dimensions(width, height),
-        requested = None -- exactly today's remix default (snap the input image's
-        aspect to a standard size), including AUTO when Discord didn't report
-        width/height.
+      - else (neither given): match the first attachment's OWN dimensions as closely
+        as a valid edit size allows -- size = coerce_generation_size(width, height),
+        requested = None -- so the remix keeps the input's exact aspect/scale instead
+        of being bucketed. Falls back to AUTO (requested None) when Discord didn't
+        report usable width/height (None, non-numeric, or <= 0).
     """
     if res_wh is not None:
         w, h = res_wh
@@ -321,4 +264,10 @@ def resolve_edit_size(orientation=None, res_wh=None, width=None, height=None):
         return coerce_generation_size(w, h), requested
     if orientation is not None:
         return ORIENTATIONS[orientation], None
-    return edit_size_for_dimensions(width, height), None
+    try:
+        w, h = float(width), float(height)
+    except (TypeError, ValueError):
+        return AUTO, None
+    if w <= 0 or h <= 0:
+        return AUTO, None
+    return coerce_generation_size(width, height), None

@@ -9,7 +9,7 @@ Bot Ross is a Discord bot that generates images using OpenAI's image models. Cha
 | `&paint <prompt>` | Generate an image with gpt-image-2 (or `IMAGE_MODEL`). Flags: `--landscape`/`--portrait`/`--square`, `--res WxH` (coerced to the nearest valid generation size) |
 | `&dpaint <prompt>` | Generate an image with DALL-E 3 |
 | `&meme [idea]` | GPT generates a meme prompt, then paints it |
-| `&remix [prompt]` | Remix attached image(s) — or the image in a message you reply to — with a prompt, or paint a prompt if none is attached. Output size matches the first image's orientation by default; override with `--landscape`/`--portrait`/`--square`/`--res WxH` (coerced to a valid size, same as `&paint`) |
+| `&remix [prompt]` | Remix attached image(s) — or the image in a message you reply to — with a prompt, or paint a prompt if none is attached. Output size matches the first image's own dimensions as closely as possible by default; override with `--landscape`/`--portrait`/`--square`/`--res WxH` (coerced to a valid size, same as `&paint`) |
 | `&release_image <git-hash-or-text> [--george] [--vN]` | Mint a deterministic release avatar: the input is hashed to pick a mad-libs image prompt, so the same input always yields the same prompt. `--george` reimagines the subject as George Costanza; `--vN` selects an algorithm version. Not subject to magic paint |
 | `&magic_list` | List the magic mixins (id, truncated text, author, date) |
 | `&magic_show <id>` | Show the full text of a magic mixin |
@@ -48,9 +48,9 @@ Whenever a macro is used, the bot echoes the fully expanded prompt back on an `e
 max-3840x2160, max-3:1-ratio arbitrary size, with a note if the coerced size differs
 from what you typed. This works the same on `&paint` and on `&remix` — gpt-image-2's
 edit endpoint honors arbitrary sizes too, so a remix keeps your ultrawide/tall aspect
-instead of collapsing it to a standard size. (`&remix` with no size flag still just
-matches the input image's orientation.) `--res` wins if you give both an orientation
-flag and `--res`.
+instead of collapsing it to a standard size. (`&remix` with no size flag matches the
+first attachment's own dimensions as closely as a valid size allows.) `--res` wins if
+you give both an orientation flag and `--res`.
 
 ## Setup
 
