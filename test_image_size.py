@@ -216,6 +216,13 @@ class DescribeEditSizeTest(unittest.TestCase):
     def test_unknown_size_label(self):
         self.assertEqual(describe_edit_size("bogus"), "unknown")
 
+    def test_arbitrary_size_classified_by_orientation(self):
+        # --res can now coerce to an arbitrary edit size, so the label is derived from
+        # the WxH rather than falling back to "unknown".
+        self.assertEqual(describe_edit_size("1536x640"), "landscape")
+        self.assertEqual(describe_edit_size("640x1536"), "portrait")
+        self.assertEqual(describe_edit_size("1200x1200"), "square")
+
 
 class ParseSizeFlagsTest(unittest.TestCase):
     def test_orientation_flags_stripped_and_mapped(self):
@@ -424,19 +431,30 @@ class ResolveEditSizeTest(unittest.TestCase):
                 self.assertEqual(size, ORIENTATIONS[o])
                 self.assertIsNone(requested)
 
-    def test_res_wh_snaps_with_notice(self):
+    def test_res_wh_coerces_like_generation(self):
+        # gpt-image-2's edit endpoint honors arbitrary sizes, so --res on remix is
+        # coerced the same way as on the generation path -- NOT snapped to one of the
+        # three standard sizes. 1920x1080 -> 1920x1088 (rounded to a multiple of 16).
         size, requested = resolve_edit_size(res_wh=(1920, 1080))
-        self.assertEqual((size, requested), (LANDSCAPE, "1920x1080"))
-        self.assertNotEqual(size, requested)
+        self.assertEqual((size, requested), ("1920x1088", "1920x1080"))
+        self.assertEqual(size, coerce_generation_size(1920, 1080))
+        self.assertNotEqual(size, requested)  # coerced -> notice fires
 
-    def test_res_wh_equal_to_standard_no_notice(self):
+    def test_res_wh_ultrawide_is_kept_not_snapped(self):
+        # The case that motivated this: an ultrawide --res is preserved (coerced only
+        # to satisfy the /16 + ratio + box constraints), not collapsed to 1536x1024.
+        size, requested = resolve_edit_size(res_wh=(1536, 640))
+        self.assertEqual((size, requested), ("1536x640", "1536x640"))
+        self.assertEqual(size, requested)  # already valid -> no notice
+
+    def test_res_wh_already_valid_no_notice(self):
         size, requested = resolve_edit_size(res_wh=(1536, 1024))
-        self.assertEqual((size, requested), (LANDSCAPE, "1536x1024"))
+        self.assertEqual((size, requested), ("1536x1024", "1536x1024"))
         self.assertEqual(size, requested)
 
     def test_res_wh_overrides_orientation(self):
         size, requested = resolve_edit_size(orientation="square", res_wh=(1080, 1920))
-        self.assertEqual((size, requested), (PORTRAIT, "1080x1920"))
+        self.assertEqual((size, requested), (coerce_generation_size(1080, 1920), "1080x1920"))
         self.assertNotEqual(size, SQUARE)
 
     def test_neither_falls_through_to_dimensions(self):

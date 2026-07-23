@@ -377,7 +377,7 @@ async def xpaint(ctx, *, prompt):
     await do_the_art(ctx, magic_prompt, "xpaint", IMAGE_MODEL, size=size)
 
 
-@bot.command(name='remix', help='Remix an image with a prompt. Attach an image, reply to one, or do both — and add a prompt to guide the transformation. Flags: --landscape/--portrait/--square, --res WxH (snapped to the nearest of 1024x1024/1536x1024/1024x1536 when editing an image). Falls back to painting if no image is found. Monthly limit applies.')
+@bot.command(name='remix', help='Remix an image with a prompt. Attach an image, reply to one, or do both — and add a prompt to guide the transformation. Flags: --landscape/--portrait/--square, --res WxH (coerced to a valid size, same as &paint). Falls back to painting if no image is found. Monthly limit applies.')
 async def remix(ctx, *, prompt=None):
     # Flags are parsed FIRST, before macro expansion/magic paint, exactly like the
     # generation commands' _prep_generation_size -- but remix doesn't use that shared
@@ -436,10 +436,7 @@ async def remix(ctx, *, prompt=None):
     if res_wh and orientation:
         await ctx.send(f"(`--res` overrides `--{orientation}`)")
     if requested and requested != size:
-        await ctx.send(
-            f"Remix outputs one of 1024x1024/1536x1024/1024x1536; using `{size}` "
-            f"(`{image_size.describe_edit_size(size)}`)."
-        )
+        await ctx.send(f"Using `{size}` (adjusted from `{requested}` to fit the size limits).")
     logger.info(
         f"Remix size: {attachments[0].width}x{attachments[0].height} -> {size} "
         f"({image_size.describe_edit_size(size)})"

@@ -87,13 +87,21 @@ def edit_size_for_dimensions(width, height):
 
 
 def describe_edit_size(size):
-    """Human-readable label for a size constant, for logging only (never shown in Discord)."""
-    return {
-        SQUARE: "square",
-        LANDSCAPE: "landscape",
-        PORTRAIT: "portrait",
-        AUTO: "auto",
-    }.get(size, "unknown")
+    """Human-readable orientation label for a size, for logging only (never shown in
+    Discord). Handles the standard constants plus any arbitrary "WxH" (now that --res
+    can coerce to an arbitrary edit size); anything unparseable is "unknown"."""
+    known = {SQUARE: "square", LANDSCAPE: "landscape", PORTRAIT: "portrait", AUTO: "auto"}
+    if size in known:
+        return known[size]
+    try:
+        w, h = parse_resolution(size)
+    except (ValueError, TypeError):
+        return "unknown"
+    if w > h:
+        return "landscape"
+    if h > w:
+        return "portrait"
+    return "square"
 
 
 # --- Generation (/v1/images/generations, gpt-image-2) sizing -----------------------
@@ -293,19 +301,24 @@ def resolve_generation_size(orientation=None, res_wh=None):
 def resolve_edit_size(orientation=None, res_wh=None, width=None, height=None):
     """Resolve the /v1/images/edits `size` for &remix.
 
+    Empirically, gpt-image-2's /v1/images/edits endpoint honors an arbitrary WxH
+    exactly like /v1/images/generations does (despite the docs only listing the three
+    standard sizes + auto), so an explicit --res is coerced the same way as on the
+    generation path rather than snapped to one of the three standard sizes.
+
     Returns (size, requested):
-      - res_wh WINS: size = edit_size_for_dimensions(w, h) (snaps to the nearest of
-        the 3 standard sizes by ratio; never AUTO, since w/h are real numbers here),
-        requested = f"{w}x{h}".
+      - res_wh WINS: size = coerce_generation_size(w, h) (an arbitrary valid size,
+        same coercion as generation), requested = f"{w}x{h}".
       - else orientation: size = ORIENTATIONS[orientation], requested = None.
       - else (neither given): size = edit_size_for_dimensions(width, height),
-        requested = None -- exactly today's remix default, including AUTO when
-        Discord didn't report width/height.
+        requested = None -- exactly today's remix default (snap the input image's
+        aspect to a standard size), including AUTO when Discord didn't report
+        width/height.
     """
     if res_wh is not None:
         w, h = res_wh
         requested = f"{w}x{h}"
-        return edit_size_for_dimensions(w, h), requested
+        return coerce_generation_size(w, h), requested
     if orientation is not None:
         return ORIENTATIONS[orientation], None
     return edit_size_for_dimensions(width, height), None
