@@ -17,6 +17,7 @@ import re
 import release_image
 import magic_paint
 import macros
+import image_size
 from magic_paint import parse_magic_rate, format_magic_rate
 
 logging.basicConfig(level=logging.INFO)
@@ -342,6 +343,12 @@ async def remix(ctx, *, prompt=None):
         await do_the_art(ctx, prompt, "remix", IMAGE_MODEL)
         return
 
+    size = image_size.edit_size_for_dimensions(attachments[0].width, attachments[0].height)
+    logger.info(
+        f"Remix size: {attachments[0].width}x{attachments[0].height} -> {size} "
+        f"({image_size.describe_edit_size(size)})"
+    )
+
     images = [(await a.read(), a.content_type) for a in attachments]
     if prompt:
         prompt = await expand_prompt_macros(ctx, prompt)
@@ -351,7 +358,7 @@ async def remix(ctx, *, prompt=None):
         magic = True
 
     await send_quote(ctx, magic)
-    await do_the_art(ctx, prompt, "remix", IMAGE_MODEL, images=images)
+    await do_the_art(ctx, prompt, "remix", IMAGE_MODEL, images=images, size=size)
 
 
 @bot.command(name='release_image', help='Generate a deterministic release avatar from a git hash (or any text) — same input always yields the same prompt. Flags: --george, --vN. Monthly limit applies.')
@@ -583,7 +590,10 @@ async def macro_remove(ctx, entry_id=None):
     await ctx.send(f"Removed macro `;{normalized_id}`.{note}")
 
 
-async def do_the_art(ctx, prompt, request_type, model, images=None):
+async def do_the_art(ctx, prompt, request_type, model, images=None, size=None):
+    # `size` (see image_size.py) only applies on the edit path below; fetch_image
+    # (generation, images=None) always uses the model config's own fixed size, so
+    # &paint/&hpaint/&mpaint/&lpaint/&dpaint/&meme/&xpaint/&release_image are unaffected.
     logger.info(f"Received {request_type} request from {ctx.author.name} using {model} to paint: {prompt}")
     current_month = get_current_month()
     data = load_data()
@@ -596,7 +606,7 @@ async def do_the_art(ctx, prompt, request_type, model, images=None):
     try:
         t0 = time.monotonic()
         if images:
-            response = await fetch_image_edit(prompt, get_edit_model(model), images)
+            response = await fetch_image_edit(prompt, get_edit_model(model), images, size=size)
         else:
             response = await fetch_image(prompt, model)
         elapsed = time.monotonic() - t0
@@ -689,9 +699,12 @@ def _image_extension(content_type):
     return (content_type or "image/png").split("/")[-1].split(";")[0] or "png"
 
 
-async def fetch_image_edit(prompt, model, images):
+async def fetch_image_edit(prompt, model, images, size=None):
     """images: list[(bytes, content_type)] of raw image content and its Discord-reported
     content type (e.g. from discord.Attachment.read()/.content_type).
+    `size`, when given, overrides the model config's default edit size (see
+    image_size.py, used by &remix to match the first input image's orientation);
+    None keeps today's behavior of always sending the model config's configured size.
     Returns {"image": b64, "revised_prompt": None} — the edits endpoint has no revised_prompt."""
     config = MODEL_CONFIGS.get(model, MODEL_CONFIGS["gpt-image-2"])
     async with aiohttp.ClientSession() as session:
@@ -701,9 +714,9 @@ async def fetch_image_edit(prompt, model, images):
             form.add_field("prompt", prompt)
             form.add_field("n", "1")
             form.add_field("user", "bot_ross")
-            size = config["params"].get("size")
-            if size:
-                form.add_field("size", size)
+            size_value = size if size is not None else config["params"].get("size")
+            if size_value:
+                form.add_field("size", size_value)
             quality = config["params"].get("quality")
             if quality:
                 form.add_field("quality", quality)
@@ -721,7 +734,7 @@ async def fetch_image_edit(prompt, model, images):
             ) as response:
                 if response.status == 200:
                     data = await response.json()
-                    logger.info(f"Edit request: {prompt} Success")
+                    logger.info(f"Edit request: {prompt} Success (size={size_value})")
                     item = data["data"][0]
                     return {"image": item["b64_json"], "revised_prompt": None}
                 verdict, error_message = await _classify_image_error(response, prompt)

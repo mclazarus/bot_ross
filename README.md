@@ -9,7 +9,7 @@ Bot Ross is a Discord bot that generates images using OpenAI's image models. Cha
 | `&paint <prompt>` | Generate an image with gpt-image-2 (or `IMAGE_MODEL`) |
 | `&dpaint <prompt>` | Generate an image with DALL-E 3 |
 | `&meme [idea]` | GPT generates a meme prompt, then paints it |
-| `&remix [prompt]` | Remix attached image(s) — or the image in a message you reply to — with a prompt, or paint a prompt if none is attached |
+| `&remix [prompt]` | Remix attached image(s) — or the image in a message you reply to — with a prompt, or paint a prompt if none is attached. Output size matches the first image's orientation (square/landscape/portrait) |
 | `&release_image <git-hash-or-text> [--george] [--vN]` | Mint a deterministic release avatar: the input is hashed to pick a mad-libs image prompt, so the same input always yields the same prompt. `--george` reimagines the subject as George Costanza; `--vN` selects an algorithm version. Not subject to magic paint |
 | `&magic_list` | List the magic mixins (id, truncated text, author, date) |
 | `&magic_show <id>` | Show the full text of a magic mixin |
