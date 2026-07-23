@@ -6,10 +6,10 @@ Bot Ross is a Discord bot that generates images using OpenAI's image models. Cha
 
 | Command | Description |
 |---|---|
-| `&paint <prompt>` | Generate an image with gpt-image-2 (or `IMAGE_MODEL`) |
+| `&paint <prompt>` | Generate an image with gpt-image-2 (or `IMAGE_MODEL`). Flags: `--landscape`/`--portrait`/`--square`, `--res WxH` (coerced to the nearest valid generation size) |
 | `&dpaint <prompt>` | Generate an image with DALL-E 3 |
 | `&meme [idea]` | GPT generates a meme prompt, then paints it |
-| `&remix [prompt]` | Remix attached image(s) — or the image in a message you reply to — with a prompt, or paint a prompt if none is attached. Output size matches the first image's orientation (square/landscape/portrait) |
+| `&remix [prompt]` | Remix attached image(s) — or the image in a message you reply to — with a prompt, or paint a prompt if none is attached. Output size matches the first image's orientation by default; override with `--landscape`/`--portrait`/`--square`/`--res WxH` (snapped to the nearest of 1024x1024/1536x1024/1024x1536) |
 | `&release_image <git-hash-or-text> [--george] [--vN]` | Mint a deterministic release avatar: the input is hashed to pick a mad-libs image prompt, so the same input always yields the same prompt. `--george` reimagines the subject as George Costanza; `--vN` selects an algorithm version. Not subject to magic paint |
 | `&magic_list` | List the magic mixins (id, truncated text, author, date) |
 | `&magic_show <id>` | Show the full text of a magic mixin |
@@ -34,6 +34,22 @@ Drop a `;token` anywhere in a `&paint`/`&hpaint`/`&mpaint`/`&lpaint`/`&dpaint`/`
 By convention a macro's text is an article-less noun phrase ending in a comma — you supply the article (`A ;rhe`, `two ;cat`), so the snippet drops into your sentence without doubling it up. Keep that shape when adding your own.
 
 Whenever a macro is used, the bot echoes the fully expanded prompt back on an `expanded prompt: ...` line so you can see exactly what it became — this is shown before any magic mixin is (silently) added, so it never gives the magic away. If `;rhe` isn't a known macro (typo, or it was removed), the bot swaps in a joke placeholder instead of failing, and calls it out with a leading `🎲` line so you know it didn't resolve as expected — generation still proceeds regardless. See `&macro_list` to browse the library, and note that `&release_image`/`&meme` are not wired up to macro expansion.
+
+## Sizing
+
+`&paint`/`&hpaint`/`&mpaint`/`&lpaint`/`&remix` accept size flags:
+
+    &paint --landscape a wide valley
+    &paint --res 1920x1080 a wide valley
+    &remix --portrait
+
+`--square`/`--landscape`/`--portrait` pick one of the three standard sizes silently.
+`--res WIDTHxHEIGHT` requests an exact size: on `&paint` and friends it's coerced (a
+divisible-by-16, max-3840x2160, max-3:1-ratio arbitrary size) with a note if the
+coerced size differs from what you typed; on `&remix` (when editing an image) it's
+snapped to the nearest of `1024x1024`/`1536x1024`/`1024x1536`, since the edit
+endpoint only accepts those three. `--res` wins if you give both an orientation flag
+and `--res`.
 
 ## Setup
 
