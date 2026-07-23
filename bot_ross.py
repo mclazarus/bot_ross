@@ -16,6 +16,7 @@ import string
 import re
 import release_image
 import magic_paint
+import macros
 from magic_paint import parse_magic_rate, format_magic_rate
 
 logging.basicConfig(level=logging.INFO)
@@ -44,6 +45,10 @@ except (TypeError, ValueError):
 # redeploys; DEFAULT_MAGIC_PROMPTS_FILE is the seed baked into the image (see _seed_magic_library).
 MAGIC_PROMPTS_FILE = "data/magic_prompts.json"
 DEFAULT_MAGIC_PROMPTS_FILE = "magic_prompts.json"
+
+# Same two-copy seed/working-volume pattern as the magic library, for ;macro expansions.
+MACROS_FILE = "data/macros.json"
+DEFAULT_MACROS_FILE = "macros.json"
 
 MODEL_CONFIGS = {
     "gpt-image-2": {
@@ -128,6 +133,21 @@ def maybe_apply_magic_paint(prompt):
     return magic_paint.maybe_apply_magic_paint(prompt, MAGIC_PAINT_RATE, path=MAGIC_PROMPTS_FILE)
 
 
+# Thin wrappers binding macros.py's pure logic to this module's file paths, mirroring
+# the magic-library wrappers above. The macro-expansion logic itself lives in macros.py
+# so it can be unit tested (see test_macros.py).
+def _load_macro_library():
+    return macros.load_macro_library(MACROS_FILE)
+
+
+def _save_macro_library(entries):
+    macros.save_macro_library(entries, MACROS_FILE)
+
+
+def _seed_macro_library():
+    macros.seed_macro_library(MACROS_FILE, DEFAULT_MACROS_FILE)
+
+
 def format_rate_change_time(iso_str):
     """Render a stored rate-change timestamp as 'YYYY-MM-DD HH:MM:SS ±HHMM'.
     Legacy naive timestamps recorded before timezones were tracked render without the offset."""
@@ -173,6 +193,29 @@ async def send_long(ctx, text):
             chunk = f"{chunk}\n{line}" if chunk else line
     if chunk:
         await ctx.send(chunk)
+
+
+async def expand_prompt_macros(ctx, prompt):
+    """Expand every ';token' in `prompt` via the macro library (data/macros.json).
+
+    The single chokepoint every prompt-bearing command calls, and always the FIRST
+    step -- before magic paint -- so an expanded macro's text is itself eligible to
+    pick up a magic mixin appended after it. A successful expansion is silent (no
+    channel message); an unresolved token is swapped for a joke fallback so the
+    prompt stays usable, and every miss is reported via one 🎲 message.
+    Increments the persisted 'macros'/'macro_misses' counters (shown in &stats) by
+    however many tokens actually hit/missed on this call -- if the prompt had no
+    ';tokens' at all, nothing is written to disk and nothing is sent."""
+    prompt, hits, misses = macros.expand_macros(prompt, path=MACROS_FILE)
+    if misses:
+        tokens = ", ".join(f"`;{m}`" for m in misses)
+        await ctx.send(f"🎲 {tokens} (macro not found, good luck)")
+    if hits or misses:
+        data = load_data()
+        data['macros'] = data.get('macros', 0) + len(hits)
+        data['macro_misses'] = data.get('macro_misses', 0) + len(misses)
+        save_data(data)
+    return prompt
 
 
 intents = discord.Intents.default()
@@ -229,6 +272,7 @@ async def meme(ctx, *, prompt=None):
 
 @bot.command(name='paint', help='Paint a picture based on a prompt. monthly limit')
 async def paint(ctx, *, prompt):
+    prompt = await expand_prompt_macros(ctx, prompt)
     prompt, magic = maybe_apply_magic_paint(prompt)
     await send_quote(ctx, magic)
     await do_the_art(ctx, prompt, "paint", IMAGE_MODEL)
@@ -236,24 +280,28 @@ async def paint(ctx, *, prompt):
 
 @bot.command(name='hpaint', help='Paint a high quality picture with gpt-image-2. monthly limit')
 async def hpaint(ctx, *, prompt):
+    prompt = await expand_prompt_macros(ctx, prompt)
     await ctx.send(get_random_bob_ross_quote())
     await do_the_art(ctx, prompt, "hpaint", "gpt-image-2")
 
 
 @bot.command(name='mpaint', help='Paint a medium quality picture with gpt-image-2. monthly limit')
 async def mpaint(ctx, *, prompt):
+    prompt = await expand_prompt_macros(ctx, prompt)
     await ctx.send(get_random_bob_ross_quote())
     await do_the_art(ctx, prompt, "mpaint", "gpt-image-2-medium")
 
 
 @bot.command(name='lpaint', help='Paint a low quality picture with gpt-image-2. monthly limit')
 async def lpaint(ctx, *, prompt):
+    prompt = await expand_prompt_macros(ctx, prompt)
     await ctx.send(get_random_bob_ross_quote())
     await do_the_art(ctx, prompt, "lpaint", "gpt-image-2-low")
 
 
 @bot.command(name='dpaint', help='Paint with DALL-E 3. monthly limit')
 async def dpaint(ctx, *, prompt):
+    prompt = await expand_prompt_macros(ctx, prompt)
     await ctx.send(get_random_bob_ross_quote())
     await do_the_art(ctx, prompt, "dpaint", "dall-e-3")
 
@@ -262,6 +310,7 @@ async def dpaint(ctx, *, prompt):
 # already the medium-quality command. Not listed in help; the addition is never revealed.
 @bot.command(name='xpaint', help='Paint a picture, with a little extra magic.', hidden=True)
 async def xpaint(ctx, *, prompt):
+    prompt = await expand_prompt_macros(ctx, prompt)
     magic_prompt = _apply_random_magic_entry(prompt)
     await send_quote(ctx, magic=True)
     await do_the_art(ctx, magic_prompt, "xpaint", IMAGE_MODEL)
@@ -287,6 +336,7 @@ async def remix(ctx, *, prompt=None):
         if not prompt:
             await ctx.send("We need a happy little image to work with before we can remix anything. Attach one, or reply to a message that has one!")
             return
+        prompt = await expand_prompt_macros(ctx, prompt)
         prompt, magic = maybe_apply_magic_paint(prompt)
         await send_quote(ctx, magic)
         await do_the_art(ctx, prompt, "remix", IMAGE_MODEL)
@@ -294,6 +344,7 @@ async def remix(ctx, *, prompt=None):
 
     images = [(await a.read(), a.content_type) for a in attachments]
     if prompt:
+        prompt = await expand_prompt_macros(ctx, prompt)
         prompt, magic = maybe_apply_magic_paint(prompt)
     else:
         prompt = _apply_random_magic_entry("creatively reinterpret this image")
@@ -435,6 +486,101 @@ async def magic_rate(ctx, value=None):
     MAGIC_PAINT_RATE = rate
     _record_rate_change(ctx.author.name, rate)
     await ctx.send(f"Magic rate set to {format_magic_rate(rate)}.")
+
+
+@bot.command(name='macro_list', help='List the ;macro ids and authors. Use &macro_show to read one, &macro_update to change it.')
+async def macro_list(ctx):
+    entries = _load_macro_library()
+    if not entries:
+        await ctx.send("The macro library is empty.")
+        return
+    lines = ["Use `&macro_show <id>` to see a macro's full text, `&macro_update <id> <text>` to change it."]
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue  # tolerate a hand-corrupted library row rather than crash the listing
+        text = entry.get('text', '') or ''
+        preview = text if len(text) <= 60 else text[:60].rstrip() + "…"
+        lines.append(f"`;{entry.get('id', '?')}` — {preview} (by {entry.get('author', 'built-in')})")
+    await send_long(ctx, "\n".join(lines))
+
+
+@bot.command(name='macro_show', help='Show the full text of a ;macro by id (see &macro_list).')
+async def macro_show(ctx, entry_id=None):
+    if not entry_id:
+        await ctx.send("Which one? `&macro_show <id>` — see `&macro_list` for ids.")
+        return
+    entry_id = macros.normalize_macro_id(entry_id)
+    entries = _load_macro_library()
+    entry = next((e for e in entries if macros.entry_id(e) == entry_id), None)
+    if not entry:
+        await ctx.send(f"No macro with id `;{entry_id}`.")
+        return
+    lines = [
+        f"`;{entry.get('id')}` — {entry.get('text', '')}",
+        f"Author: {entry.get('author', 'built-in')} | Added: {entry.get('added', '—')}",
+    ]
+    if entry.get("editor"):
+        lines.append(f"Last edited by: {entry['editor']} on {entry.get('edited', '—')}")
+    await send_long(ctx, "\n".join(lines))
+
+
+@bot.command(name='macro_add', help='Add a ;macro. &macro_add <id> <text> — the id is what you type as ;<id> in a prompt.')
+async def macro_add(ctx, macro_id=None, *, text=None):
+    if not macro_id or not text or not text.strip():
+        await ctx.send("Usage: `&macro_add <id> <text>`, e.g. `&macro_add lasso a cowboy twirling a glowing lasso,`")
+        return
+    normalized_id = macros.normalize_macro_id(macro_id)
+    if not macros.is_valid_macro_id(normalized_id):
+        await ctx.send("Macro ids must be 1-32 characters: lowercase letters, digits, `_`, or `-`.")
+        return
+    text = text.strip()
+    entries = _load_macro_library()
+    if any(macros.entry_id(e) == normalized_id for e in entries):
+        await ctx.send(f"`;{normalized_id}` already exists. Use `&macro_update {normalized_id} <text>` to change it.")
+        return
+    entries.append({
+        "id": normalized_id,
+        "text": text,
+        "author": ctx.author.name,
+        "added": date.today().isoformat(),
+    })
+    _save_macro_library(entries)
+    await ctx.send(f"Added macro `;{normalized_id}`. Remove it with `&macro_remove {normalized_id}`.")
+
+
+@bot.command(name='macro_update', help="Update a ;macro's text in place by id (see &macro_list). Records you as editor.")
+async def macro_update(ctx, entry_id=None, *, text=None):
+    if not entry_id or not text or not text.strip():
+        await ctx.send("Usage: `&macro_update <id> <new text>` — see `&macro_list` for ids.")
+        return
+    normalized_id = macros.normalize_macro_id(entry_id)
+    text = text.strip()
+    entries = _load_macro_library()
+    entry = next((e for e in entries if macros.entry_id(e) == normalized_id), None)
+    if not entry:
+        await ctx.send(f"No macro with id `;{normalized_id}`.")
+        return
+    entry["text"] = text
+    entry["editor"] = ctx.author.name
+    entry["edited"] = date.today().isoformat()
+    _save_macro_library(entries)
+    await ctx.send(f"Updated macro `;{normalized_id}`.")
+
+
+@bot.command(name='macro_remove', help='Remove a ;macro by id (see &macro_list).')
+async def macro_remove(ctx, entry_id=None):
+    if not entry_id:
+        await ctx.send("Which one? `&macro_remove <id>` — see `&macro_list` for ids.")
+        return
+    normalized_id = macros.normalize_macro_id(entry_id)
+    entries = _load_macro_library()
+    remaining = [e for e in entries if macros.entry_id(e) != normalized_id]
+    if len(remaining) == len(entries):
+        await ctx.send(f"No macro with id `;{normalized_id}`.")
+        return
+    _save_macro_library(remaining)
+    note = " The macro library is now empty — ;tokens will always miss until you add more." if not remaining else ""
+    await ctx.send(f"Removed macro `;{normalized_id}`.{note}")
 
 
 async def do_the_art(ctx, prompt, request_type, model, images=None):
@@ -623,6 +769,8 @@ async def stats(ctx):
     magic_part = f"Magic applied: {data.get('magic', 0)}"
     remixes_part = f"Remixes: {data.get('remixes', 0)}"
     release_images_part = f"Release images: {data.get('release_images', 0)}"
+    macros_part = f"Macros expanded: {data.get('macros', 0)}"
+    macro_misses_part = f"Macros not found: {data.get('macro_misses', 0)}"
     last_change_part = f"Last rate change: {last_change}"
 
     # Combine the parts into the final message
@@ -636,6 +784,8 @@ async def stats(ctx):
         f"{magic_part}\n"
         f"{remixes_part}\n"
         f"{release_images_part}\n"
+        f"{macros_part}\n"
+        f"{macro_misses_part}\n"
         f"{last_change_part}"
     )
 
@@ -708,4 +858,5 @@ def get_random_bob_ross_quote():
 
 
 _seed_magic_library()
+_seed_macro_library()
 bot.run(DISCORD_BOT_TOKEN)
