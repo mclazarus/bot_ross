@@ -201,17 +201,22 @@ async def expand_prompt_macros(ctx, prompt):
 
     The single chokepoint every prompt-bearing command calls, and always the FIRST
     step -- before magic paint -- so an expanded macro's text is itself eligible to
-    pick up a magic mixin appended after it. A successful expansion is silent (no
-    channel message); an unresolved token is swapped for a joke fallback so the
-    prompt stays usable, and every miss is reported via one 🎲 message.
+    pick up a magic mixin appended after it. Whenever any ';token' was present, the
+    fully expanded prompt is echoed back on an 'expanded prompt: ...' line -- this is
+    the post-macro, PRE-magic-paint prompt, so it deliberately never reveals a magic
+    mixin. An unresolved token is swapped for a joke fallback so the prompt stays
+    usable, and every miss is also called out on a leading 🎲 line.
     Increments the persisted 'macros'/'macro_misses' counters (shown in &stats) by
     however many tokens actually hit/missed on this call -- if the prompt had no
     ';tokens' at all, nothing is written to disk and nothing is sent."""
     prompt, hits, misses = macros.expand_macros(prompt, path=MACROS_FILE)
-    if misses:
-        tokens = ", ".join(f"`;{m}`" for m in misses)
-        await ctx.send(f"🎲 {tokens} (macro not found, good luck)")
     if hits or misses:
+        lines = []
+        if misses:
+            tokens = ", ".join(f"`;{m}`" for m in misses)
+            lines.append(f"🎲 {tokens} (macro not found, good luck)")
+        lines.append(f"expanded prompt: {prompt}")
+        await send_long(ctx, "\n".join(lines))
         data = load_data()
         data['macros'] = data.get('macros', 0) + len(hits)
         data['macro_misses'] = data.get('macro_misses', 0) + len(misses)

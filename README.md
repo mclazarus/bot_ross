@@ -33,7 +33,7 @@ Drop a `;token` anywhere in a `&paint`/`&hpaint`/`&mpaint`/`&lpaint`/`&dpaint`/`
 
 By convention a macro's text is an article-less noun phrase ending in a comma — you supply the article (`A ;rhe`, `two ;cat`), so the snippet drops into your sentence without doubling it up. Keep that shape when adding your own.
 
-If `;rhe` isn't a known macro (typo, or it was removed), the bot swaps in a joke placeholder instead of failing, and calls it out with a `🎲` message so you know it didn't resolve as expected — generation still proceeds regardless. Successful expansions are silent. See `&macro_list` to browse the library, and note that `&release_image`/`&meme` are not wired up to macro expansion.
+Whenever a macro is used, the bot echoes the fully expanded prompt back on an `expanded prompt: ...` line so you can see exactly what it became — this is shown before any magic mixin is (silently) added, so it never gives the magic away. If `;rhe` isn't a known macro (typo, or it was removed), the bot swaps in a joke placeholder instead of failing, and calls it out with a leading `🎲` line so you know it didn't resolve as expected — generation still proceeds regardless. See `&macro_list` to browse the library, and note that `&release_image`/`&meme` are not wired up to macro expansion.
 
 ## Setup
 
