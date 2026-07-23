@@ -276,33 +276,85 @@ async def meme(ctx, *, prompt=None):
         save_data(data)
 
 
-@bot.command(name='paint', help='Paint a picture based on a prompt. monthly limit')
+async def _prep_generation_size(ctx, raw):
+    """Parse --square/--landscape/--portrait/--res out of a generation command's raw
+    prompt text. Called FIRST, before macro expansion or magic paint, so the flags
+    never reach the image prompt.
+
+    Returns (cleaned_prompt, size) on success. Returns (None, None) after already
+    sending the user an error message, for two failure cases: an invalid --res value,
+    or nothing left to paint once the flags are stripped out. Along the way it may
+    also send an informational (non-error) message: a note when --res overrides an
+    orientation flag given in the same command, and a coercion notice when the
+    resolved size differs from what was literally requested (silent otherwise --
+    orientation presets and an already-valid --res never trigger this notice).
+    """
+    text, orientation, res_raw = image_size.parse_size_flags(raw)
+
+    res_wh = None
+    if res_raw is not None:
+        try:
+            res_wh = image_size.parse_resolution(res_raw)
+        except ValueError:
+            await ctx.send(
+                f"`--res {res_raw}` isn't a size I understand — use `WIDTHxHEIGHT`, "
+                f"e.g. `--res 1920x1080`."
+            )
+            return None, None
+
+    prompt = text.strip()
+    if not prompt:
+        await ctx.send("...I need something to paint besides the size flags.")
+        return None, None
+
+    size, requested = image_size.resolve_generation_size(orientation, res_wh)
+    if res_wh and orientation:
+        await ctx.send(f"(`--res` overrides `--{orientation}`)")
+    if requested and requested != size:
+        await ctx.send(f"Using `{size}` (adjusted from `{requested}` to fit the size limits).")
+
+    return prompt, size
+
+
+@bot.command(name='paint', help='Paint a picture based on a prompt. Flags: --landscape/--portrait/--square, --res WxH. monthly limit')
 async def paint(ctx, *, prompt):
+    prompt, size = await _prep_generation_size(ctx, prompt)
+    if prompt is None:
+        return
     prompt = await expand_prompt_macros(ctx, prompt)
     prompt, magic = maybe_apply_magic_paint(prompt)
     await send_quote(ctx, magic)
-    await do_the_art(ctx, prompt, "paint", IMAGE_MODEL)
+    await do_the_art(ctx, prompt, "paint", IMAGE_MODEL, size=size)
 
 
-@bot.command(name='hpaint', help='Paint a high quality picture with gpt-image-2. monthly limit')
+@bot.command(name='hpaint', help='Paint a high quality picture with gpt-image-2. Flags: --landscape/--portrait/--square, --res WxH. monthly limit')
 async def hpaint(ctx, *, prompt):
+    prompt, size = await _prep_generation_size(ctx, prompt)
+    if prompt is None:
+        return
     prompt = await expand_prompt_macros(ctx, prompt)
     await ctx.send(get_random_bob_ross_quote())
-    await do_the_art(ctx, prompt, "hpaint", "gpt-image-2")
+    await do_the_art(ctx, prompt, "hpaint", "gpt-image-2", size=size)
 
 
-@bot.command(name='mpaint', help='Paint a medium quality picture with gpt-image-2. monthly limit')
+@bot.command(name='mpaint', help='Paint a medium quality picture with gpt-image-2. Flags: --landscape/--portrait/--square, --res WxH. monthly limit')
 async def mpaint(ctx, *, prompt):
+    prompt, size = await _prep_generation_size(ctx, prompt)
+    if prompt is None:
+        return
     prompt = await expand_prompt_macros(ctx, prompt)
     await ctx.send(get_random_bob_ross_quote())
-    await do_the_art(ctx, prompt, "mpaint", "gpt-image-2-medium")
+    await do_the_art(ctx, prompt, "mpaint", "gpt-image-2-medium", size=size)
 
 
-@bot.command(name='lpaint', help='Paint a low quality picture with gpt-image-2. monthly limit')
+@bot.command(name='lpaint', help='Paint a low quality picture with gpt-image-2. Flags: --landscape/--portrait/--square, --res WxH. monthly limit')
 async def lpaint(ctx, *, prompt):
+    prompt, size = await _prep_generation_size(ctx, prompt)
+    if prompt is None:
+        return
     prompt = await expand_prompt_macros(ctx, prompt)
     await ctx.send(get_random_bob_ross_quote())
-    await do_the_art(ctx, prompt, "lpaint", "gpt-image-2-low")
+    await do_the_art(ctx, prompt, "lpaint", "gpt-image-2-low", size=size)
 
 
 @bot.command(name='dpaint', help='Paint with DALL-E 3. monthly limit')
@@ -314,16 +366,41 @@ async def dpaint(ctx, *, prompt):
 
 # Hidden always-on variant of &paint. Named xpaint (not mpaint) since &mpaint is
 # already the medium-quality command. Not listed in help; the addition is never revealed.
-@bot.command(name='xpaint', help='Paint a picture, with a little extra magic.', hidden=True)
+@bot.command(name='xpaint', help='Paint a picture, with a little extra magic. Flags: --landscape/--portrait/--square, --res WxH.', hidden=True)
 async def xpaint(ctx, *, prompt):
+    prompt, size = await _prep_generation_size(ctx, prompt)
+    if prompt is None:
+        return
     prompt = await expand_prompt_macros(ctx, prompt)
     magic_prompt = _apply_random_magic_entry(prompt)
     await send_quote(ctx, magic=True)
-    await do_the_art(ctx, magic_prompt, "xpaint", IMAGE_MODEL)
+    await do_the_art(ctx, magic_prompt, "xpaint", IMAGE_MODEL, size=size)
 
 
-@bot.command(name='remix', help='Remix an image with a prompt. Attach an image, reply to one, or do both — and add a prompt to guide the transformation. Falls back to painting if no image is found. Monthly limit applies.')
+@bot.command(name='remix', help='Remix an image with a prompt. Attach an image, reply to one, or do both — and add a prompt to guide the transformation. Flags: --landscape/--portrait/--square, --res WxH (snapped to the nearest of 1024x1024/1536x1024/1024x1536 when editing an image). Falls back to painting if no image is found. Monthly limit applies.')
 async def remix(ctx, *, prompt=None):
+    # Flags are parsed FIRST, before macro expansion/magic paint, exactly like the
+    # generation commands' _prep_generation_size -- but remix doesn't use that shared
+    # helper because its size resolution differs by which path it ends up on below
+    # (edit vs. generation-fallback) and it must still work when there's no prompt at
+    # all (image-only remix).
+    orientation, res_wh = None, None
+    if prompt:
+        text, orientation, res_raw = image_size.parse_size_flags(prompt)
+        if res_raw is not None:
+            try:
+                res_wh = image_size.parse_resolution(res_raw)
+            except ValueError:
+                await ctx.send(
+                    f"`--res {res_raw}` isn't a size I understand — use `WIDTHxHEIGHT`, "
+                    f"e.g. `--res 1920x1080`."
+                )
+                return
+        # Stripping flags can empty the prompt (e.g. "&remix --landscape" on an
+        # attached image) -- fall back to None so the default "reinterpret this
+        # image" path below still runs, while the parsed size flags are still honored.
+        prompt = text.strip() or None
+
     attachments = [a for a in ctx.message.attachments if (a.content_type or "").startswith("image/")]
     skipped = len(ctx.message.attachments) - len(attachments)
     if skipped:
@@ -344,11 +421,25 @@ async def remix(ctx, *, prompt=None):
             return
         prompt = await expand_prompt_macros(ctx, prompt)
         prompt, magic = maybe_apply_magic_paint(prompt)
+        size, requested = image_size.resolve_generation_size(orientation, res_wh)
+        if res_wh and orientation:
+            await ctx.send(f"(`--res` overrides `--{orientation}`)")
+        if requested and requested != size:
+            await ctx.send(f"Using `{size}` (adjusted from `{requested}` to fit the size limits).")
         await send_quote(ctx, magic)
-        await do_the_art(ctx, prompt, "remix", IMAGE_MODEL)
+        await do_the_art(ctx, prompt, "remix", IMAGE_MODEL, size=size)
         return
 
-    size = image_size.edit_size_for_dimensions(attachments[0].width, attachments[0].height)
+    size, requested = image_size.resolve_edit_size(
+        orientation, res_wh, attachments[0].width, attachments[0].height
+    )
+    if res_wh and orientation:
+        await ctx.send(f"(`--res` overrides `--{orientation}`)")
+    if requested and requested != size:
+        await ctx.send(
+            f"Remix outputs one of 1024x1024/1536x1024/1024x1536; using `{size}` "
+            f"(`{image_size.describe_edit_size(size)}`)."
+        )
     logger.info(
         f"Remix size: {attachments[0].width}x{attachments[0].height} -> {size} "
         f"({image_size.describe_edit_size(size)})"
@@ -596,9 +687,11 @@ async def macro_remove(ctx, entry_id=None):
 
 
 async def do_the_art(ctx, prompt, request_type, model, images=None, size=None):
-    # `size` (see image_size.py) only applies on the edit path below; fetch_image
-    # (generation, images=None) always uses the model config's own fixed size, so
-    # &paint/&hpaint/&mpaint/&lpaint/&dpaint/&meme/&xpaint/&release_image are unaffected.
+    # `size` (see image_size.py) is now forwarded on BOTH paths below: fetch_image_edit
+    # (images given -- &remix with an attachment) and fetch_image (generation --
+    # &paint/&hpaint/&mpaint/&lpaint/&xpaint honoring --res/--landscape/--portrait/
+    # --square). None keeps each path's own model-config default size.
+    # &dpaint/&meme/&release_image never pass size, so they stay unaffected.
     logger.info(f"Received {request_type} request from {ctx.author.name} using {model} to paint: {prompt}")
     current_month = get_current_month()
     data = load_data()
@@ -613,7 +706,7 @@ async def do_the_art(ctx, prompt, request_type, model, images=None, size=None):
         if images:
             response = await fetch_image_edit(prompt, get_edit_model(model), images, size=size)
         else:
-            response = await fetch_image(prompt, model)
+            response = await fetch_image(prompt, model, size=size)
         elapsed = time.monotonic() - t0
         image_data = base64.b64decode(response['image'])
         image_file = io.BytesIO(image_data)
@@ -663,14 +756,22 @@ async def _classify_image_error(response, prompt):
         return 'stop', error_message
 
 
-async def fetch_image(prompt, model):
+async def fetch_image(prompt, model, size=None):
+    """`size`, when given, overrides the model config's default generation size (see
+    image_size.py -- used by &paint/&hpaint/&mpaint/&lpaint/&xpaint for
+    --res/--landscape/--portrait/--square); None keeps today's behavior of always
+    using the model config's configured size. Copies config["params"] into a local
+    dict before any override so the shared MODEL_CONFIGS entry is never mutated."""
     config = MODEL_CONFIGS.get(model, MODEL_CONFIGS["gpt-image-2"])
+    params = dict(config["params"])
+    if size is not None:
+        params["size"] = size
     payload = {
         "model": config["model"],
         "prompt": prompt,
         "n": 1,
         "user": "bot_ross",
-        **config["params"],
+        **params,
     }
     if config["supports_moderation"]:
         payload["moderation"] = IMAGE_MODERATION
