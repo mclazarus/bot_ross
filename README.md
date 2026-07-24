@@ -44,13 +44,15 @@ Whenever a macro is used, the bot echoes the fully expanded prompt back on an `e
     &remix --portrait
 
 `--square`/`--landscape`/`--portrait` pick one of the three standard sizes silently.
-`--res WIDTHxHEIGHT` requests an exact size, coerced to a divisible-by-16,
-max-3840x2160, max-3:1-ratio arbitrary size, with a note if the coerced size differs
-from what you typed. This works the same on `&paint` and on `&remix` — gpt-image-2's
-edit endpoint honors arbitrary sizes too, so a remix keeps your ultrawide/tall aspect
-instead of collapsing it to a standard size. (`&remix` with no size flag matches the
-first attachment's own dimensions as closely as a valid size allows.) `--res` wins if
-you give both an orientation flag and `--res`.
+`--res WIDTHxHEIGHT` requests an exact size, coerced to what the endpoint accepts:
+divisible by 16, aspect ratio within 3:1, no larger than 3840x2160, and no smaller than
+its minimum pixel budget (~0.67 MP — sizes below that are scaled up, keeping their
+aspect). You get a note if the coerced size differs from what you typed. This works the
+same on `&paint` and on `&remix` — gpt-image-2's edit endpoint honors arbitrary sizes
+too, so a remix keeps your ultrawide/tall aspect instead of collapsing it to a standard
+size. (`&remix` with no size flag matches the first attachment's own dimensions as
+closely as a valid size allows.) `--res` wins if you give both an orientation flag and
+`--res`.
 
 ## Setup
 

@@ -13,7 +13,7 @@ from image_size import (
     GEN_MAX_LONG,
     GEN_MAX_RATIO,
     GEN_MAX_SHORT,
-    GEN_MIN_SHORT,
+    GEN_MIN_PIXELS,
     GEN_STEP,
     LANDSCAPE,
     ORIENTATIONS,
@@ -154,7 +154,9 @@ class ParseResolutionTest(unittest.TestCase):
 
 
 class CoerceGenerationSizeTest(unittest.TestCase):
-    # (w, h, expected) -- the 15-row worked table from the implementation spec.
+    # (w, h, expected) -- worked table. Large inputs pass through the ratio/box/round
+    # steps unchanged; small inputs (area < GEN_MIN_PIXELS) are scaled UP to the pixel
+    # floor (see the area-floor rows: 100x100, 30x10, 50x40, 783x261).
     TABLE = [
         (1536, 1024, "1536x1024"),
         (1000, 1000, "1008x1008"),
@@ -164,13 +166,13 @@ class CoerceGenerationSizeTest(unittest.TestCase):
         (2000, 5000, "1536x3840"),
         (8000, 6000, "2880x2160"),
         (3000, 3000, "2160x2160"),
-        (100, 100, "256x256"),
-        (30, 10, "768x256"),
-        (10, 30, "256x768"),
-        (50, 40, "320x256"),
+        (100, 100, "816x816"),      # tiny square -> pixel floor (816x816 = GEN_MIN_PIXELS)
+        (30, 10, "1424x480"),       # tiny 3:1 -> scaled up to the floor, ratio kept ~3
+        (10, 30, "480x1424"),       # tiny 1:3 -> mirror
+        (50, 40, "912x736"),        # small 5:4 -> scaled up to the floor
         (3840, 2160, "3840x2160"),
         (3840, 1280, "3840x1280"),
-        (783, 261, "768x256"),
+        (783, 261, "1424x480"),     # 3:1, was 768x256 pre-floor; now raised to the floor
     ]
 
     def test_sample_table(self):
@@ -178,12 +180,29 @@ class CoerceGenerationSizeTest(unittest.TestCase):
             with self.subTest(w=w, h=h):
                 self.assertEqual(coerce_generation_size(w, h), expected)
 
-    def test_rounding_reclamp_is_required(self):
-        # Without step 5's re-clamp, independent per-axis rounding of (783, 261)
-        # would produce (784, 256) -- ratio 3.0625, which is > GEN_MAX_RATIO and
-        # therefore invalid. Step 5 snaps it back to (768, 256), ratio exactly 3.0.
-        self.assertEqual(coerce_generation_size(783, 261), "768x256")
-        self.assertGreater(784 / 256, GEN_MAX_RATIO)
+    def test_original_api_failure_now_valid(self):
+        # The exact size the API rejected ("below the current minimum pixel budget"):
+        # 1344x448 = 602,112 px. It's now scaled up over the floor. (Verified accepted
+        # by the live API in the commit that added GEN_MIN_PIXELS.)
+        size = coerce_generation_size(1344, 448)
+        self.assertEqual(size, "1424x480")
+        w, h = parse_resolution(size)
+        self.assertGreaterEqual(w * h, GEN_MIN_PIXELS)
+
+    def test_area_floor_boundary(self):
+        # 816x816 (== GEN_MIN_PIXELS) is left alone; anything smaller is raised to it.
+        self.assertEqual(coerce_generation_size(816, 816), "816x816")
+        self.assertEqual(coerce_generation_size(800, 800), "816x816")
+        self.assertEqual(parse_resolution("816x816")[0] ** 2, GEN_MIN_PIXELS)
+
+    def test_rounding_reclamp_still_applies(self):
+        # (783, 261) exercises step 5's ratio re-clamp internally (nearest-rounding the
+        # scaled dims would break 3:1), and step 6's floor guard; the result is a valid
+        # ~3:1 size at or above the floor.
+        size = coerce_generation_size(783, 261)
+        w, h = parse_resolution(size)
+        self.assertLessEqual(max(w, h) / min(w, h), GEN_MAX_RATIO + 1e-9)
+        self.assertGreaterEqual(w * h, GEN_MIN_PIXELS)
 
     def test_property_sweep(self):
         rng = random.Random(20260721)
@@ -213,9 +232,9 @@ class CoerceGenerationSizeTest(unittest.TestCase):
                 self.assertLessEqual(ratio, GEN_MAX_RATIO + 1e-9)
                 self.assertLessEqual(max(out_w, out_h), GEN_MAX_LONG)
                 self.assertLessEqual(min(out_w, out_h), GEN_MAX_SHORT)
-                # the shorter side is never dropped below the floor (step 3 raises it,
-                # and step 4/5 rounding can only land it on GEN_MIN_SHORT at lowest).
-                self.assertGreaterEqual(min(out_w, out_h), GEN_MIN_SHORT)
+                # every output meets the API's minimum pixel budget (the whole point of
+                # the area floor -- steps 3 and 6 guarantee it survives rounding).
+                self.assertGreaterEqual(out_w * out_h, GEN_MIN_PIXELS)
 
 
 class ResolveGenerationSizeTest(unittest.TestCase):

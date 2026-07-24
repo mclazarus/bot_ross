@@ -20,6 +20,7 @@ module load ends in bot.run(), so this logic lives here for test_image_size.py t
 exercise directly.
 """
 
+import math
 import re
 
 # The three standard sizes both endpoints accept, reused as the orientation presets.
@@ -64,7 +65,15 @@ GEN_STEP      = 16    # generated dims must be multiples of 16
 GEN_MAX_RATIO = 3.0   # aspect ratio clamped to [1/3, 3]
 GEN_MAX_LONG  = 3840  # longer side cap
 GEN_MAX_SHORT = 2160  # shorter side cap ("max 3840x2160")
-GEN_MIN_SHORT = 256   # conservative floor for the shorter side
+
+# Minimum total area ("pixel budget"). The endpoint rejects sizes with too few pixels
+# ("below the current minimum pixel budget") -- an area limit, independent of aspect
+# ratio. We probed it directly against the API (see the commit that added this): a
+# square rejects at 800x800 (640,000 px) but accepts at 816x816 (665,856 px); a 3:1 and
+# a 1:3 shape both accept at 691,200 px, so it's purely area, not per-side or ratio.
+# The true threshold sits at ~655,360 px (5/8 MP); we floor to the smallest area we
+# *confirmed* accepted, 665,856, so a coerced size is always safely above the limit.
+GEN_MIN_PIXELS = 816 * 816   # 665,856
 
 # coerce_generation_size's rounding step (nearest multiple of GEN_STEP) can only ever
 # leave a dimension <= a cap that is itself already a multiple of GEN_STEP (see the
@@ -73,7 +82,6 @@ GEN_MIN_SHORT = 256   # conservative floor for the shorter side
 # than let it fail silently later.
 assert GEN_MAX_LONG % GEN_STEP == 0
 assert GEN_MAX_SHORT % GEN_STEP == 0
-assert GEN_MIN_SHORT % GEN_STEP == 0
 
 
 def parse_size_flags(text):
@@ -149,30 +157,45 @@ def parse_resolution(res_raw):
     return width, height
 
 
+def _round_step(x):
+    """Round to the nearest multiple of GEN_STEP (round-half-up), floored at GEN_STEP
+    so a positive value never rounds to 0."""
+    return max(GEN_STEP, int(x / GEN_STEP + 0.5) * GEN_STEP)
+
+
+def _ceil_step(x):
+    """Round UP to a multiple of GEN_STEP, floored at GEN_STEP. Used by the area-floor
+    guard: ceiling both dims can only keep the total area at or above the target."""
+    return max(GEN_STEP, math.ceil(x / GEN_STEP) * GEN_STEP)
+
+
 def coerce_generation_size(width, height):
     """Coerce an arbitrary (width, height) into a "WxH" string valid for the
-    /v1/images/generations endpoint: both dimensions positive multiples of GEN_STEP,
-    aspect ratio within [1/GEN_MAX_RATIO, GEN_MAX_RATIO], and within the
-    GEN_MAX_LONG x GEN_MAX_SHORT box. Deterministic pipeline, in order:
+    /v1/images/generations (and, empirically, /v1/images/edits) endpoint: both
+    dimensions positive multiples of GEN_STEP, aspect ratio within
+    [1/GEN_MAX_RATIO, GEN_MAX_RATIO], within the GEN_MAX_LONG x GEN_MAX_SHORT box, AND
+    at least GEN_MIN_PIXELS total area. Deterministic pipeline, in order:
 
       1. Clamp ratio to [1/3, 3] by pulling the longer side in to `shorter * 3`.
       2. Fit the max box, preserving ratio (factor = min(MAX_LONG/long,
          MAX_SHORT/short, 1) -- this can only shrink, never grow).
-      3. Raise to the floor: if the shorter side is now < GEN_MIN_SHORT, scale UP
-         preserving ratio so the shorter side becomes exactly GEN_MIN_SHORT.
-      4. Round each dimension independently to the nearest multiple of GEN_STEP
-         (round-half-up: int(x / GEN_STEP + 0.5) * GEN_STEP, floored at GEN_STEP so
-         the result is never 0).
-      5. Re-clamp: rounding each dimension INDEPENDENTLY in step 4 can, on its own,
-         push the ratio back outside [1/3, 3] even though step 1 guaranteed it going
-         in (worked counter-example in the module's test file: (783, 261) has an
-         exact ratio of 3.0 after step 1-3, but rounds to (784, 256) -- ratio 3.0625,
-         which violates the bound). So after rounding, check again: if the longer
-         rounded side now exceeds `shorter_rounded * GEN_MAX_RATIO`, snap it down to
-         exactly `shorter_rounded * GEN_MAX_RATIO`. This is always an EXACT multiple
-         of GEN_STEP already (the shorter side is a multiple of GEN_STEP, and
-         GEN_MAX_RATIO is the integer 3), so no further rounding is needed and no
-         further violation is possible.
+      3. Raise to the pixel floor (still in floats, ratio preserved): if the area is
+         below GEN_MIN_PIXELS, scale both dims up so the area is exactly GEN_MIN_PIXELS.
+         (This supersedes any per-side minimum: at >= GEN_MIN_PIXELS with ratio <= 3,
+         the shorter side is always >= sqrt(GEN_MIN_PIXELS/3) ~= 471 px.)
+      4. Round each dimension independently to the nearest multiple of GEN_STEP.
+      5. Re-clamp ratio: independent per-axis rounding in step 4 can push the ratio
+         back outside [1/3, 3] (worked example: (783, 261), exact ratio 3.0, rounds to
+         (784, 256) -> 3.0625). If the longer rounded side exceeds
+         `shorter_rounded * GEN_MAX_RATIO`, snap it down to exactly that (an exact
+         multiple of GEN_STEP already, since the shorter side is and GEN_MAX_RATIO is 3).
+      6. Guard the pixel floor after rounding: rounding down in step 4 (and the snap in
+         step 5) can leave the area just under GEN_MIN_PIXELS. If so, scale back up to
+         the floor and round each dim UP (`_ceil_step`) -- ceiling guarantees the area
+         lands at or above GEN_MIN_PIXELS. Ceiling can nudge the ratio a hair over 3, so
+         re-clamp once more by raising the SHORTER side (which only increases area, so
+         the floor still holds). The floor area is far below the box, so this never
+         re-violates the max box.
 
     Returns "WxH" (both components plain ints, no leading zeros).
 
@@ -195,18 +218,15 @@ def coerce_generation_size(width, height):
     w *= factor
     h *= factor
 
-    # Step 3: raise the shorter side to the floor, preserving ratio (never downscales
-    # here -- GEN_MIN_SHORT is far below GEN_MAX_SHORT so this can't re-violate the box).
-    short_side = min(w, h)
-    if short_side < GEN_MIN_SHORT:
-        factor = GEN_MIN_SHORT / short_side
+    # Step 3: raise the area to the pixel floor, preserving ratio (never downscales --
+    # GEN_MIN_PIXELS is far below the box's area, so this can't re-violate the box).
+    area = w * h
+    if area < GEN_MIN_PIXELS:
+        factor = math.sqrt(GEN_MIN_PIXELS / area)
         w *= factor
         h *= factor
 
     # Step 4: round each dimension independently to the nearest multiple of GEN_STEP.
-    def _round_step(x):
-        return max(GEN_STEP, int(x / GEN_STEP + 0.5) * GEN_STEP)
-
     w, h = _round_step(w), _round_step(h)
 
     # Step 5: re-clamp ratio, which independent per-axis rounding can have violated.
@@ -214,6 +234,18 @@ def coerce_generation_size(width, height):
         w = int(h * GEN_MAX_RATIO)
     elif h > w * GEN_MAX_RATIO:
         h = int(w * GEN_MAX_RATIO)
+
+    # Step 6: guard the pixel floor, which rounding down in step 4/5 can have undercut.
+    if w * h < GEN_MIN_PIXELS:
+        factor = math.sqrt(GEN_MIN_PIXELS / (w * h))
+        w, h = _ceil_step(w * factor), _ceil_step(h * factor)
+        # Ceiling can push the ratio slightly over the bound; fix it by raising the
+        # shorter side (increasing area, so the floor still holds), not lowering the
+        # longer one (which would drop back under the floor).
+        if w > h * GEN_MAX_RATIO:
+            h = _ceil_step(w / GEN_MAX_RATIO)
+        elif h > w * GEN_MAX_RATIO:
+            w = _ceil_step(h / GEN_MAX_RATIO)
 
     return f"{int(w)}x{int(h)}"
 
