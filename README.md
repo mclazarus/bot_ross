@@ -75,7 +75,7 @@ closely as a valid size allows.) `--res` wins if you give both an orientation fl
 ./run.sh .env /path/to/data docks.local
 ```
 
-If a `bot_ross` container is already running, `run.sh` will stop and remove it before starting the new one. When a host is provided, `DOCKER_HOST=ssh://<host>` is set so all docker commands run against the remote daemon — the `.env` file is read locally and never copied to the remote host.
+If a `bot_ross` container is already running, `run.sh` will stop and remove it before starting the new one. The stop **drains in-flight image generations**: on SIGTERM the bot stops accepting new commands and waits (up to `DRAIN_TIMEOUT` seconds) for running generations to finish before exiting, so a redeploy doesn't drop paintings mid-flight. `run.sh` uses `docker stop -t $STOP_TIMEOUT` (default `90`, override via the `STOP_TIMEOUT` env var) — keep it above `DRAIN_TIMEOUT` so the bot exits on its own before Docker force-kills. When a host is provided, `DOCKER_HOST=ssh://<host>` is set so all docker commands run against the remote daemon — the `.env` file is read locally and never copied to the remote host.
 
 The `data/` directory stores monthly request counts, stats, the working magic-mixin library (`data/magic_prompts.json`), and the working macro library (`data/macros.json`) — mount a host path to persist them across container restarts and redeploys. On startup the bot seeds both `data/magic_prompts.json` and `data/macros.json` from the image's bundled defaults only if they aren't already present, so mixins/macros added via `&magic_add`/`&macro_add` survive image rebuilds.
 
@@ -100,3 +100,4 @@ All options are set via environment variables (see `env.example`):
 | `IMAGE_MODERATION` | `low` | Content moderation level (`low` or `auto`, gpt-image-2 only) |
 | `MEME_MODEL` | `gpt-5.4-mini` | GPT model used to generate meme prompts |
 | `MAGIC_PAINT_RATE` | `0.05` | Chance (0.0-1.0) that `&paint`/`&remix` silently appends a background gag to the prompt |
+| `DRAIN_TIMEOUT` | `60` | Seconds to let in-flight image generations finish on shutdown before the bot closes |

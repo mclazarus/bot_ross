@@ -1,6 +1,7 @@
 import asyncio
 import aiohttp
 import time
+import signal
 import discord
 import os
 import json
@@ -41,6 +42,15 @@ try:
         raise ValueError
 except (TypeError, ValueError):
     MAGIC_PAINT_RATE = 0.05
+
+# On SIGTERM/SIGINT the bot stops accepting new commands and waits up to DRAIN_TIMEOUT
+# seconds for in-flight image generations to finish before closing (see _graceful_shutdown).
+try:
+    DRAIN_TIMEOUT = float(os.environ.get('DRAIN_TIMEOUT', 60))
+    if DRAIN_TIMEOUT < 0:
+        raise ValueError
+except (TypeError, ValueError):
+    DRAIN_TIMEOUT = 60.0
 
 # The working library lives on the persistent data/ volume so user-added mixins survive
 # redeploys; DEFAULT_MAGIC_PROMPTS_FILE is the seed baked into the image (see _seed_magic_library).
@@ -233,6 +243,34 @@ bot = commands.Bot(command_prefix='&', intents=intents)
 
 start_time = datetime.now()
 
+# Graceful-drain state. Mutated only on the single asyncio loop thread, so no locking.
+# `active_requests` counts in-flight do_the_art() calls; `draining` blocks new commands
+# once a shutdown signal has been received. `_signals_installed` guards handler setup
+# against on_ready firing again on reconnect.
+active_requests = 0
+draining = False
+_signals_installed = False
+
+
+async def _graceful_shutdown(sig_name):
+    """Stop accepting new commands, wait (up to DRAIN_TIMEOUT) for in-flight generations
+    to finish, then close the bot so bot.run() returns and the process exits cleanly.
+    Installed as the SIGTERM (docker stop) and SIGINT (Ctrl+C) handler; a second signal
+    while already draining is a no-op (docker stop's own timeout is the hard backstop)."""
+    global draining
+    if draining:
+        return
+    draining = True
+    logger.info(f"{sig_name}: draining {active_requests} active request(s), up to {DRAIN_TIMEOUT:g}s")
+    deadline = time.monotonic() + DRAIN_TIMEOUT
+    while active_requests > 0 and time.monotonic() < deadline:
+        await asyncio.sleep(0.5)
+    if active_requests > 0:
+        logger.warning(f"Drain timed out with {active_requests} request(s) still running; closing anyway.")
+    else:
+        logger.info("Drain complete; closing.")
+    await bot.close()
+
 
 def load_data():
     if os.path.exists(DATA_FILE):
@@ -252,7 +290,37 @@ def get_current_month():
 
 @bot.event
 async def on_ready():
+    global _signals_installed
     logger.info(f'{bot.user.name} has connected to Discord!')
+    # discord.py installs no SIGTERM handler, so as PID 1 in Docker the process would
+    # ignore `docker stop` until it SIGKILLs. Install real loop handlers so we drain
+    # instead. Idempotent, but guard anyway since on_ready refires on reconnect.
+    if not _signals_installed:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(
+                sig, lambda s=sig: asyncio.create_task(_graceful_shutdown(s.name))
+            )
+        _signals_installed = True
+
+
+@bot.check
+async def _reject_while_draining(ctx):
+    """Global check: once draining, refuse new commands with a friendly note instead of
+    starting work we'd have to abandon at close()."""
+    if draining:
+        await ctx.send("🧹 Bot Ross is wrapping up and restarting for an update — try again in a moment.")
+        return False
+    return True
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    # Swallow the drain refusal (CheckFailure) and unknown commands so they don't spam
+    # "Ignoring exception in command" in the logs; log anything genuinely unexpected.
+    if isinstance(error, (commands.CheckFailure, commands.CommandNotFound)):
+        return
+    logger.error(f"Command error in {ctx.command}: {error}")
 
 
 @bot.command(name='ping', help='Check for bot liveness and latency. (ms)')
@@ -689,43 +757,52 @@ async def do_the_art(ctx, prompt, request_type, model, images=None, size=None):
     # &paint/&hpaint/&mpaint/&lpaint/&xpaint honoring --res/--landscape/--portrait/
     # --square). None keeps each path's own model-config default size.
     # &dpaint/&meme/&release_image never pass size, so they stay unaffected.
-    logger.info(f"Received {request_type} request from {ctx.author.name} using {model} to paint: {prompt}")
-    current_month = get_current_month()
-    data = load_data()
-    if over_limit(data):
-        await ctx.send("Monthly limit reached. Please wait until next month to make more paint requests.")
-        return False
-
-    file_name = generate_file_name(prompt)
-
+    #
+    # Every image command funnels through here, so bracketing the whole body with the
+    # active-request counter is what lets a shutdown drain in-flight work (see
+    # _graceful_shutdown); the finally guarantees the count is released on every path.
+    global active_requests
+    active_requests += 1
     try:
-        t0 = time.monotonic()
-        if images:
-            response = await fetch_image_edit(prompt, get_edit_model(model), images, size=size)
-        else:
-            response = await fetch_image(prompt, model, size=size)
-        elapsed = time.monotonic() - t0
-        image_data = base64.b64decode(response['image'])
-        image_file = io.BytesIO(image_data)
-        description = (response['revised_prompt'] or prompt)[:1024]
-        await ctx.send(file=discord.File(image_file, file_name, description=description))
-        if response['revised_prompt']:
-            await ctx.send(f"**Revised prompt**: {response['revised_prompt']}")
-        # reload the data for the increment since we are async
+        logger.info(f"Received {request_type} request from {ctx.author.name} using {model} to paint: {prompt}")
+        current_month = get_current_month()
         data = load_data()
-        if current_month not in data:
-            data[current_month] = 0
-        data[current_month] += 1
-        if request_type == "remix":
-            data['remixes'] = data.get('remixes', 0) + 1
-        if request_type == "release_image":
-            data['release_images'] = data.get('release_images', 0) + 1
-        save_data(data)
-        await ctx.send(f"Generated in {format_duration(elapsed)} | Monthly requests: {data[current_month]}")
-        return True
-    except Exception as e:
-        await ctx.send(f"No painting for: {prompt}, exception for this request: {e}")
-        return False
+        if over_limit(data):
+            await ctx.send("Monthly limit reached. Please wait until next month to make more paint requests.")
+            return False
+
+        file_name = generate_file_name(prompt)
+
+        try:
+            t0 = time.monotonic()
+            if images:
+                response = await fetch_image_edit(prompt, get_edit_model(model), images, size=size)
+            else:
+                response = await fetch_image(prompt, model, size=size)
+            elapsed = time.monotonic() - t0
+            image_data = base64.b64decode(response['image'])
+            image_file = io.BytesIO(image_data)
+            description = (response['revised_prompt'] or prompt)[:1024]
+            await ctx.send(file=discord.File(image_file, file_name, description=description))
+            if response['revised_prompt']:
+                await ctx.send(f"**Revised prompt**: {response['revised_prompt']}")
+            # reload the data for the increment since we are async
+            data = load_data()
+            if current_month not in data:
+                data[current_month] = 0
+            data[current_month] += 1
+            if request_type == "remix":
+                data['remixes'] = data.get('remixes', 0) + 1
+            if request_type == "release_image":
+                data['release_images'] = data.get('release_images', 0) + 1
+            save_data(data)
+            await ctx.send(f"Generated in {format_duration(elapsed)} | Monthly requests: {data[current_month]}")
+            return True
+        except Exception as e:
+            await ctx.send(f"No painting for: {prompt}, exception for this request: {e}")
+            return False
+    finally:
+        active_requests -= 1
 
 
 def get_edit_model(model):

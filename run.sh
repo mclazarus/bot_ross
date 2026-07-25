@@ -21,14 +21,19 @@ ENV_FILE=$1
 DATA_PATH=$2
 HOST=${3:-}
 
+# Grace period for `docker stop` to let the bot drain in-flight image generations before
+# it's force-killed. Must exceed the bot's DRAIN_TIMEOUT (default 60s) so the bot exits on
+# its own first; when idle the bot closes immediately and stop returns right away.
+STOP_TIMEOUT=${STOP_TIMEOUT:-90}
+
 if [ -n "$HOST" ]; then
     export DOCKER_HOST="ssh://$HOST"
     echo "Deploying to $HOST..."
 fi
 
 if docker ps -a --format '{{.Names}}' | grep -q '^bot_ross$'; then
-    echo "Stopping existing bot_ross container..."
-    docker stop bot_ross
+    echo "Stopping existing bot_ross container (draining in-flight requests, up to ${STOP_TIMEOUT}s)..."
+    docker stop -t "$STOP_TIMEOUT" bot_ross
     docker rm bot_ross
 fi
 
