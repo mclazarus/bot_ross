@@ -271,5 +271,74 @@ class DailyRetrySkipsSleepOnOverLimitTest(unittest.TestCase):
         )
 
 
+class GetCurrentMonthIsTimezoneAwareTest(unittest.TestCase):
+    """get_current_month() must read datetime.now(BOT_ZONE), not the naive
+    datetime.now() (the container's own UTC clock) it used before the daily
+    scheduler landed. This is a deliberate, documented behavior change to the
+    monthly API_LIMIT boundary (see CLAUDE.md, 'get_current_month() is
+    timezone-aware, not a UTC-only helper'): the spend-limit month now rolls
+    over at local midnight in BOT_TIMEZONE, up to ~5 hours earlier or later
+    than the old UTC-midnight boundary, once a month.
+
+    Regression this guards against: 3636c189's commit message originally
+    claimed the opposite -- that get_current_month() was "unaffected" and
+    there was "no change to the monthly-limit boundary in this commit" --
+    while the commit's own diff made exactly this change. The code and
+    CLAUDE.md were always correct; only the commit message lied. There is no
+    way for a unit test to inspect a historical commit message, but this
+    test pins the underlying code property the false message denied, so any
+    future regression back to a naive, non-timezone-aware datetime.now()
+    call -- which would silently reintroduce the exact "unaffected" claim as
+    true, contradicting CLAUDE.md's documented promise -- fails loudly here
+    instead of shipping quietly."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.func = _load_function("get_current_month")
+
+    def test_calls_datetime_now_with_bot_zone_argument(self):
+        now_calls = [
+            n for n in ast.walk(self.func)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "now"
+            and isinstance(n.func.value, ast.Name)
+            and n.func.value.id == "datetime"
+        ]
+        self.assertTrue(now_calls, "get_current_month must call datetime.now(...)")
+        self.assertEqual(
+            len(now_calls), 1,
+            "expected exactly one datetime.now(...) call in get_current_month",
+        )
+        call = now_calls[0]
+        self.assertTrue(
+            call.args and isinstance(call.args[0], ast.Name) and call.args[0].id == "BOT_ZONE",
+            "get_current_month's datetime.now(...) call must be passed BOT_ZONE "
+            "as its argument -- a bare, argument-less datetime.now() reads the "
+            "container's own (UTC) clock instead of the configured BOT_TIMEZONE, "
+            "silently moving the monthly API_LIMIT boundary back to UTC midnight",
+        )
+
+    def test_does_not_call_bare_datetime_now(self):
+        # Belt-and-suspenders: even if a future refactor renamed the BOT_ZONE
+        # argument check above into something that could be fooled, a bare
+        # `datetime.now()` call (zero args) anywhere in this function is
+        # itself the exact regression -- fail directly on its presence.
+        for n in ast.walk(self.func):
+            if (
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "now"
+                and isinstance(n.func.value, ast.Name)
+                and n.func.value.id == "datetime"
+            ):
+                self.assertTrue(
+                    n.args,
+                    "get_current_month must not call datetime.now() with no "
+                    "arguments -- that reads the container's own UTC clock, "
+                    "not BOT_TIMEZONE",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
