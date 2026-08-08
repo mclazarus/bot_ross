@@ -21,7 +21,7 @@ import magic_paint
 import macros
 import image_size
 import daily_schedule
-import pipes
+import pipe_chain
 import message_links
 from magic_paint import parse_magic_rate, format_magic_rate
 
@@ -788,17 +788,17 @@ async def _piped(ctx, raw, first_runner, request_type, model, magic_mode):
         await first_runner(ctx, None)
         return
 
-    segments, dropped, error = pipes.split_pipeline(raw)
+    segments, dropped, error = pipe_chain.split_pipeline(raw)
     if error == "too_many":
         # Load-bearing: this must be the ONLY message sent for this invocation --
         # no dropped note, no quote, nothing else.
-        await ctx.send(pipes.TOO_MANY_MESSAGE)
+        await ctx.send(pipe_chain.TOO_MANY_MESSAGE)
         return
     if error == "empty":
         await ctx.send("...I need something to paint besides the pipes.")
         return
     if dropped:
-        await ctx.send(pipes.dropped_note(dropped))
+        await ctx.send(pipe_chain.dropped_note(dropped))
 
     if len(segments) == 1:
         # No real chain: with no '|' at all, segments[0] is `raw` verbatim, so this
@@ -834,7 +834,7 @@ async def _run_chain(ctx, segments, first_runner, request_type, model, magic_mod
 
     result = await first_runner(ctx, segments[0])
     if not result:
-        await ctx.send(pipes.chain_stopped_message(1, total))
+        await ctx.send(pipe_chain.chain_stopped_message(1, total))
         return
     _bump_stat('pipe_segments')
     anchor = result.message
@@ -843,7 +843,7 @@ async def _run_chain(ctx, segments, first_runner, request_type, model, magic_mod
     for step, text in enumerate(segments[1:], start=2):
         result = await _pipe_edit_once(ctx, text, prev_bytes, anchor, model, magic_mode)
         if not result:
-            await ctx.send(pipes.chain_stopped_message(step, total))
+            await ctx.send(pipe_chain.chain_stopped_message(step, total))
             return
         _bump_stat('pipe_segments')
         prev_bytes = result.image_bytes
@@ -852,7 +852,7 @@ async def _run_chain(ctx, segments, first_runner, request_type, model, magic_mod
         # backward from any link, not just from its immediate predecessor.
 
     _bump_stat('pipes')
-    await ctx.send(pipes.chain_complete_message(total))
+    await ctx.send(pipe_chain.chain_complete_message(total))
 
 
 async def _pipe_edit_once(ctx, raw, prev_bytes, anchor, model, magic_mode):
@@ -1271,7 +1271,7 @@ async def do_the_art(ctx, prompt, request_type, model, images=None, size=None,
             save_data(data)
             if not quiet:
                 await ctx.send(f"Generated in {format_duration(elapsed)} | Monthly requests: {data[current_month]}")
-            return pipes.ArtResult(sent, image_data, size, elapsed)
+            return pipe_chain.ArtResult(sent, image_data, size, elapsed)
         except Exception as e:
             if quiet:
                 await ctx.send(f"No painting this time, exception for this request: {e}")
@@ -1764,11 +1764,17 @@ def get_random_bob_ross_quote():
     return random.choice(quotes)
 
 
+# The Dockerfile's `mkdir -p /app/data/daily_images` is masked once data/ is a bind
+# mount (run.sh mounts the host data dir over /app/data), so ensure the retained-
+# image directory exists here too, at startup, every time. os.makedirs creates every
+# missing intermediate directory, so this one call also creates data/ itself -- which
+# is why it MUST run before the three _seed_* calls below, not after: each of them
+# writes its working copy straight to a data/... path, and json_library.seed_library
+# fails open (catches OSError, logs "Failed to seed ...") rather than raising, so on a
+# fresh checkout with no data/ yet, seeding after would silently no-op every library
+# on the first run and only actually seed on the second.
+os.makedirs(DAILY_IMAGES_DIR, exist_ok=True)
 _seed_magic_library()
 _seed_macro_library()
 _seed_daily_schedule()
-# The Dockerfile's `mkdir -p /app/data/daily_images` is masked once data/ is a bind
-# mount (run.sh mounts the host data dir over /app/data), so ensure the retained-
-# image directory exists here too, at startup, every time.
-os.makedirs(DAILY_IMAGES_DIR, exist_ok=True)
 bot.run(DISCORD_BOT_TOKEN)

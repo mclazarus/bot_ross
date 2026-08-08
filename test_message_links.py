@@ -228,7 +228,7 @@ class FindMessageLinksTest(unittest.TestCase):
 class StripMessageLinksTest(unittest.TestCase):
     def test_no_links_verbatim_passthrough(self):
         # Case 28: the SAME string, internal double spaces and all -- this is the
-        # same untouched-passthrough guarantee pipes.split_pipeline makes for a
+        # same untouched-passthrough guarantee pipe_chain.split_pipeline makes for a
         # promptless '|'; whitespace normalization is only earned by an actual
         # removal.
         text = "make it  neon   please"

@@ -3,7 +3,7 @@
 
 Kept separate from bot_ross.py (which ends in bot.run() at import) so it can be
 imported and unit tested without Discord/OpenAI secrets, mirroring release_image.py/
-image_size.py/macros.py/pipes.py. No I/O, no Discord import -- everything here is
+image_size.py/macros.py/pipe_chain.py. No I/O, no Discord import -- everything here is
 string parsing and id comparison.
 
 SECURITY CONTRACT -- read this before touching _resolve_linked_images in bot_ross.py:
@@ -109,7 +109,7 @@ def strip_message_links(text):
 
     No links found -> (text, []) with `text` returned VERBATIM, byte-for-byte --
     this feature must not perturb the overwhelming majority of &remix prompts that
-    contain no link, the same untouched-passthrough guarantee pipes.split_pipeline
+    contain no link, the same untouched-passthrough guarantee pipe_chain.split_pipeline
     makes for a promptless '|'.
 
     Otherwise, every matched substring is removed, then EACH LINE independently has

@@ -39,6 +39,14 @@ image on first run, same working-copy pattern as the magic/macro libraries) — 
 remove, retime, or reword a slot, or flip its `magic` flag, without a code change.
 Set `DAILY_IMAGE_ENABLED=false` to turn the whole thing off.
 
+The shipped schedule's 4 slots/day (1 generate + 3 edits) count against the same
+monthly `API_LIMIT` as every other command — 4 × ~30 days ≈ 120 generations/month
+minimum, more whenever a base image needs recovering or a retry fires — which by
+itself exceeds the documented default of `API_LIMIT=100`. If you enable
+`DAILY_IMAGE_CHANNEL_ID`, raise `API_LIMIT` to match, or the bot will hit its cap
+partway through the month and refuse every command — daily and user-triggered alike
+— until the next month rolls over.
+
 ## Macros
 
 Drop a `;token` anywhere in a `&paint`/`&hpaint`/`&mpaint`/`&lpaint`/`&dpaint`/`&xpaint`/`&remix` prompt and it's replaced, in place, with a short snippet before the image is generated:
@@ -152,12 +160,12 @@ All options are set via environment variables (see `env.example`):
 |---|---|---|
 | `OPENAI_API_KEY` | required | OpenAI API key |
 | `DISCORD_BOT_TOKEN` | required | Discord bot token |
-| `API_LIMIT` | `100` | Max image generations per calendar month |
+| `API_LIMIT` | `100` | Max image generations per calendar month. Note: the shipped daily-image schedule alone fires 4 slots/day (1 generate + 3 edits) — 4 × ~30 days ≈ 120/month, more on a base-image recovery or retry — which exceeds this default by itself, so enabling `DAILY_IMAGE_CHANNEL_ID` below means raising this accordingly |
 | `IMAGE_MODEL` | `gpt-image-2` | Image model for `&paint` and `&meme` |
 | `IMAGE_MODERATION` | `low` | Content moderation level (`low` or `auto`, gpt-image-2 only) |
 | `MEME_MODEL` | `gpt-5.4-mini` | GPT model used to generate meme prompts |
 | `MAGIC_PAINT_RATE` | `0.05` | Chance (0.0-1.0) that `&paint`/`&remix` silently appends a background gag to the prompt |
 | `DRAIN_TIMEOUT` | `300` | Seconds to let in-flight image generations (including a whole in-progress `\|` pipe chain) finish on shutdown before the bot closes |
 | `BOT_TIMEZONE` | `America/New_York` | IANA timezone the daily-image schedule's slot times are wall-clock in. An unknown zone falls back to UTC with a logged warning |
-| `DAILY_IMAGE_CHANNEL_ID` | unset | Discord channel id the daily image/edits post to. Unset disables the scheduler |
+| `DAILY_IMAGE_CHANNEL_ID` | unset | Discord channel id the daily image/edits post to. Unset disables the scheduler. Setting this adds ~120 generations/month against `API_LIMIT` (see above) — raise it accordingly |
 | `DAILY_IMAGE_ENABLED` | `true` | Set `false` to disable the daily-image scheduler outright, even with a channel id configured |

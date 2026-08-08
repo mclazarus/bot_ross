@@ -14,12 +14,10 @@ No escape syntax for a literal `|` -- consistent with macros.py's documented sta
 `;`. A prompt that genuinely needs a pipe character in it can't have one; that's a
 deliberate simplicity trade-off, not an oversight.
 
-Naming note: this local module deliberately shadows the deprecated stdlib `pipes`
-module (removed outright in Python 3.13). That's harmless here -- nothing in this
-codebase or its dependencies imports the stdlib one (only release_image, magic_paint,
-macros, image_size, and json_library are local imports; discord.py/aiohttp/coloredlogs
-don't touch stdlib `pipes` either) -- but it's worth a comment so nobody "fixes" the
-Python 3.10 shadowing warning by renaming this file.
+Naming note: this module is named pipe_chain.py, not pipes.py, specifically to avoid
+shadowing the stdlib `pipes` module -- a dependency (coloredlogs' converter submodule,
+pulled in transitively) does import and use stdlib `pipes`, and WORKDIR /app in Docker
+puts a same-named local module first on sys.path.
 """
 
 from typing import NamedTuple

@@ -1,14 +1,14 @@
-"""Unit tests for pipes.py: `|` pipe-chain splitting and the fixed status-message
+"""Unit tests for pipe_chain.py: `|` pipe-chain splitting and the fixed status-message
 templates. Pure module, no Discord/OpenAI/bot imports, no file I/O -- nothing here
 touches data/.
 
-Run from the repo root:  python -m unittest test_pipes -v
+Run from the repo root:  python -m unittest test_pipe_chain -v
 """
 
 import os
 import unittest
 
-from pipes import (
+from pipe_chain import (
     MAX_SEGMENTS,
     TOO_MANY_MESSAGE,
     ArtResult,

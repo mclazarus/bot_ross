@@ -340,5 +340,141 @@ class GetCurrentMonthIsTimezoneAwareTest(unittest.TestCase):
                 )
 
 
+class DataDirCreatedBeforeSeedingTest(unittest.TestCase):
+    """os.makedirs(DAILY_IMAGES_DIR, exist_ok=True) -- the only thing that
+    actually creates data/ on a fresh checkout run outside Docker (Docker's
+    bind-mounted volume supplies data/ for free, which is why this was never
+    noticed there) -- must execute BEFORE _seed_magic_library(),
+    _seed_macro_library(), and _seed_daily_schedule(), not after. Those three
+    seed functions write their working copy straight to a data/... path via
+    json_library.seed_library, which fails open (catches OSError, logs
+    "Failed to seed ...") rather than raising, so on a fresh checkout with no
+    data/ yet, seeding before the directory exists silently no-ops every
+    library on the first run -- they only actually seed on the second start.
+
+    Regression: bot_ross.py originally called the three _seed_* functions
+    first, and only then os.makedirs(DAILY_IMAGES_DIR, exist_ok=True) at the
+    very bottom of the module. Since os.makedirs creates every missing
+    intermediate directory, that call is also what creates data/ itself, so
+    it has to run first."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(BOT_ROSS_PATH, "r", encoding="utf-8") as f:
+            source = f.read()
+        cls.tree = ast.parse(source)
+
+    def _module_level_makedirs_calls(self, tree=None):
+        # os.makedirs(...) as a bare top-level statement (an ast.Expr whose
+        # value is the Call) -- deliberately restricted to MODULE scope (not
+        # ast.walk, which would also match a makedirs call nested inside some
+        # unrelated function) since ordering only means something among
+        # statements that actually run in source order at import time.
+        #
+        # Further restricted to the call that actually creates the data
+        # directory -- os.makedirs(DAILY_IMAGES_DIR, ...) (or a literal
+        # "data/..." string) -- so an unrelated module-level os.makedirs(...)
+        # added above the seed calls in the future can't make this test pass
+        # while the real DAILY_IMAGES_DIR call still regresses below them.
+        tree = tree if tree is not None else self.tree
+        calls = []
+        for stmt in tree.body:
+            if not isinstance(stmt, ast.Expr):
+                continue
+            call = stmt.value
+            if not (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "makedirs"
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id == "os"
+                and call.args
+            ):
+                continue
+            first_arg = call.args[0]
+            is_data_dir = (
+                isinstance(first_arg, ast.Name) and first_arg.id == "DAILY_IMAGES_DIR"
+            ) or (
+                isinstance(first_arg, ast.Constant)
+                and isinstance(first_arg.value, str)
+                and first_arg.value.startswith("data/")
+            )
+            if is_data_dir:
+                calls.append(call)
+        return calls
+
+    def _module_level_seed_call_linenos(self, tree=None):
+        tree = tree if tree is not None else self.tree
+        seed_names = {"_seed_magic_library", "_seed_macro_library", "_seed_daily_schedule"}
+        linenos = []
+        for stmt in tree.body:
+            if not isinstance(stmt, ast.Expr):
+                continue
+            call = stmt.value
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id in seed_names:
+                linenos.append(call.lineno)
+        return linenos
+
+    def test_makedirs_precedes_first_seed_call(self):
+        makedirs_calls = self._module_level_makedirs_calls()
+        self.assertTrue(
+            makedirs_calls,
+            "expected a module-level os.makedirs(...) call that creates data/ "
+            "at startup",
+        )
+        seed_linenos = self._module_level_seed_call_linenos()
+        self.assertEqual(
+            len(seed_linenos), 3,
+            "expected all three of _seed_magic_library()/_seed_macro_library()/"
+            "_seed_daily_schedule() to be called at module scope",
+        )
+        earliest_makedirs_lineno = min(c.lineno for c in makedirs_calls)
+        self.assertLess(
+            earliest_makedirs_lineno, min(seed_linenos),
+            "os.makedirs(...) (which creates data/) must run BEFORE the "
+            "_seed_*() calls -- json_library.seed_library fails open on a "
+            "missing data/ directory (catches OSError and just logs), so "
+            "seeding before the directory exists silently no-ops every "
+            "library's first-run seed instead of creating it",
+        )
+
+    def test_unrelated_makedirs_does_not_mask_a_regressed_data_dir_call(self):
+        """Regression test for the ordering check itself: an unrelated
+        module-level os.makedirs(...) that does NOT create the data
+        directory (e.g. os.makedirs('logs', ...)) must not be mistaken for
+        the real data-dir call. Without the DAILY_IMAGES_DIR/'data/' filter
+        in _module_level_makedirs_calls, an early unrelated makedirs would
+        satisfy test_makedirs_precedes_first_seed_call's ordering check even
+        while the actual DAILY_IMAGES_DIR makedirs had regressed to AFTER
+        the seed calls -- exactly the bug this class exists to catch."""
+        source = (
+            "import os\n"
+            "os.makedirs('logs', exist_ok=True)\n"
+            "_seed_magic_library()\n"
+            "_seed_macro_library()\n"
+            "_seed_daily_schedule()\n"
+            "os.makedirs(DAILY_IMAGES_DIR, exist_ok=True)\n"
+        )
+        tree = ast.parse(source)
+
+        makedirs_calls = self._module_level_makedirs_calls(tree)
+        self.assertEqual(
+            len(makedirs_calls), 1,
+            "the unrelated os.makedirs('logs', ...) call must be filtered "
+            "out -- only the DAILY_IMAGES_DIR call creates the data "
+            "directory",
+        )
+
+        seed_linenos = self._module_level_seed_call_linenos(tree)
+        earliest_makedirs_lineno = min(c.lineno for c in makedirs_calls)
+        self.assertGreater(
+            earliest_makedirs_lineno, min(seed_linenos),
+            "sanity check on the synthetic source: the real data-dir "
+            "makedirs() is deliberately placed AFTER the seed calls here, "
+            "so the filtered result must reflect that regression rather "
+            "than being masked by the earlier unrelated makedirs('logs')",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
