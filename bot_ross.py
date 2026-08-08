@@ -7,7 +7,6 @@ import os
 import json
 import types
 from datetime import datetime, date, timezone
-from typing import NamedTuple
 from discord.ext import commands
 import openai
 import random
@@ -22,6 +21,7 @@ import magic_paint
 import macros
 import image_size
 import daily_schedule
+import pipes
 from magic_paint import parse_magic_rate, format_magic_rate
 
 logging.basicConfig(level=logging.INFO)
@@ -47,13 +47,16 @@ except (TypeError, ValueError):
     MAGIC_PAINT_RATE = 0.05
 
 # On SIGTERM/SIGINT the bot stops accepting new commands and waits up to DRAIN_TIMEOUT
-# seconds for in-flight image generations to finish before closing (see _graceful_shutdown).
+# seconds for in-flight image generations to finish before closing (see
+# _graceful_shutdown). Raised from 60 to 300: a pipe chain now brackets its WHOLE
+# run (up to 5 sequential image calls) with active_requests, and a 5-segment chain
+# routinely takes well over a minute -- run.sh's STOP_TIMEOUT must stay above this.
 try:
-    DRAIN_TIMEOUT = float(os.environ.get('DRAIN_TIMEOUT', 60))
+    DRAIN_TIMEOUT = float(os.environ.get('DRAIN_TIMEOUT', 300))
     if DRAIN_TIMEOUT < 0:
         raise ValueError
 except (TypeError, ValueError):
-    DRAIN_TIMEOUT = 60.0
+    DRAIN_TIMEOUT = 300.0
 
 # The bot's single wall-clock timezone for the daily-image scheduler (see
 # _daily_scheduler_loop below) -- all slot times in daily_schedule.json are wall-clock
@@ -215,14 +218,22 @@ def _record_rate_change(user, rate):
     logger.info(f"Magic rate changed to {format_magic_rate(rate)} ({rate}) by {user}")
 
 
+def _bump_stat(key, amount=1):
+    """load / increment `key` (default 0) by `amount` / save. The single chokepoint
+    every simple persisted counter in this module funnels through -- 'magic',
+    'pipes', and 'pipe_segments' all use it (see _bump_magic_counter and
+    _run_chain)."""
+    data = load_data()
+    data[key] = data.get(key, 0) + amount
+    save_data(data)
+
+
 def _bump_magic_counter():
     """Increment the persisted 'magic' counter. Extracted out of send_quote so the
-    daily scheduler -- which has no quote message to attach the 🖌️ tell to -- can
-    bump it directly when a scheduled slot's magic roll succeeds; without this
-    extraction, the counter would silently stop counting scheduled magic."""
-    data = load_data()
-    data['magic'] = data.get('magic', 0) + 1
-    save_data(data)
+    daily scheduler and quiet pipe segments -- neither of which has a quote message
+    to attach the 🖌️ tell to -- can bump it directly when a magic roll succeeds;
+    without this extraction, the counter would silently stop counting them."""
+    _bump_stat('magic')
 
 
 async def send_quote(ctx, magic=False):
@@ -447,74 +458,50 @@ async def _prep_generation_size(ctx, raw):
     return prompt, size
 
 
-@bot.command(name='paint', help='Paint a picture based on a prompt. Flags: --landscape/--portrait/--square, --res WxH. monthly limit')
-async def paint(ctx, *, prompt):
-    prompt, size = await _prep_generation_size(ctx, prompt)
+# --- Per-command "once" bodies ---------------------------------------------------
+#
+# Each of these is a command's current body, moved verbatim (same message strings,
+# same ordering, same early returns) so it can run either as today's single command
+# OR as segment 1 of a pipe chain (see _piped/_run_chain below) with zero behavior
+# difference for the un-piped case. `magic_mode` is one of "roll" (the existing
+# probabilistic maybe_apply_magic_paint), "none", or "always" (the existing
+# guaranteed _apply_random_magic_entry, &xpaint's gag) -- it's threaded through
+# rather than hardcoded so _paint_once covers &paint/&hpaint/&mpaint/&lpaint/&xpaint,
+# whose only real difference is which magic mode and model config they use.
+
+async def _paint_once(ctx, raw, request_type, model, magic_mode):
+    """&paint/&hpaint/&mpaint/&lpaint/&xpaint's shared body: parse size flags ->
+    macro-expand -> apply magic per magic_mode -> post the requester's quote ->
+    generate."""
+    prompt, size = await _prep_generation_size(ctx, raw)
     if prompt is None:
-        return
+        return False
     prompt = await expand_prompt_macros(ctx, prompt)
-    prompt, magic = maybe_apply_magic_paint(prompt)
-    await send_quote(ctx, magic)
-    await do_the_art(ctx, prompt, "paint", IMAGE_MODEL, size=size)
+    if magic_mode == "roll":
+        prompt, magic = maybe_apply_magic_paint(prompt)
+        await send_quote(ctx, magic)
+    elif magic_mode == "always":
+        prompt = _apply_random_magic_entry(prompt)
+        await send_quote(ctx, magic=True)
+    else:
+        await ctx.send(get_random_bob_ross_quote())
+    return await do_the_art(ctx, prompt, request_type, model, size=size)
 
 
-@bot.command(name='hpaint', help='Paint a high quality picture with gpt-image-2. Flags: --landscape/--portrait/--square, --res WxH. monthly limit')
-async def hpaint(ctx, *, prompt):
-    prompt, size = await _prep_generation_size(ctx, prompt)
-    if prompt is None:
-        return
-    prompt = await expand_prompt_macros(ctx, prompt)
+async def _dpaint_once(ctx, raw):
+    """&dpaint's body, verbatim. dall-e-3 isn't wired to image_size, so there's
+    deliberately no size-flag parsing here (unlike _paint_once)."""
+    prompt = await expand_prompt_macros(ctx, raw)
     await ctx.send(get_random_bob_ross_quote())
-    await do_the_art(ctx, prompt, "hpaint", "gpt-image-2", size=size)
+    return await do_the_art(ctx, prompt, "dpaint", "dall-e-3")
 
 
-@bot.command(name='mpaint', help='Paint a medium quality picture with gpt-image-2. Flags: --landscape/--portrait/--square, --res WxH. monthly limit')
-async def mpaint(ctx, *, prompt):
-    prompt, size = await _prep_generation_size(ctx, prompt)
-    if prompt is None:
-        return
-    prompt = await expand_prompt_macros(ctx, prompt)
-    await ctx.send(get_random_bob_ross_quote())
-    await do_the_art(ctx, prompt, "mpaint", "gpt-image-2-medium", size=size)
-
-
-@bot.command(name='lpaint', help='Paint a low quality picture with gpt-image-2. Flags: --landscape/--portrait/--square, --res WxH. monthly limit')
-async def lpaint(ctx, *, prompt):
-    prompt, size = await _prep_generation_size(ctx, prompt)
-    if prompt is None:
-        return
-    prompt = await expand_prompt_macros(ctx, prompt)
-    await ctx.send(get_random_bob_ross_quote())
-    await do_the_art(ctx, prompt, "lpaint", "gpt-image-2-low", size=size)
-
-
-@bot.command(name='dpaint', help='Paint with DALL-E 3. monthly limit')
-async def dpaint(ctx, *, prompt):
-    prompt = await expand_prompt_macros(ctx, prompt)
-    await ctx.send(get_random_bob_ross_quote())
-    await do_the_art(ctx, prompt, "dpaint", "dall-e-3")
-
-
-# Hidden always-on variant of &paint. Named xpaint (not mpaint) since &mpaint is
-# already the medium-quality command. Not listed in help; the addition is never revealed.
-@bot.command(name='xpaint', help='Paint a picture, with a little extra magic. Flags: --landscape/--portrait/--square, --res WxH.', hidden=True)
-async def xpaint(ctx, *, prompt):
-    prompt, size = await _prep_generation_size(ctx, prompt)
-    if prompt is None:
-        return
-    prompt = await expand_prompt_macros(ctx, prompt)
-    magic_prompt = _apply_random_magic_entry(prompt)
-    await send_quote(ctx, magic=True)
-    await do_the_art(ctx, magic_prompt, "xpaint", IMAGE_MODEL, size=size)
-
-
-@bot.command(name='remix', help='Remix an image with a prompt. Attach an image, reply to one, or do both — and add a prompt to guide the transformation. Flags: --landscape/--portrait/--square, --res WxH (coerced to a valid size, same as &paint). Falls back to painting if no image is found. Monthly limit applies.')
-async def remix(ctx, *, prompt=None):
-    # Flags are parsed FIRST, before macro expansion/magic paint, exactly like the
-    # generation commands' _prep_generation_size -- but remix doesn't use that shared
-    # helper because its size resolution differs by which path it ends up on below
-    # (edit vs. generation-fallback) and it must still work when there's no prompt at
-    # all (image-only remix).
+async def _remix_once(ctx, raw):
+    """&remix's body, verbatim -- flags are parsed here rather than via the shared
+    _prep_generation_size because remix's size resolution differs by which path it
+    ends up on below (edit vs. generation-fallback), and it must still work with no
+    prompt at all (image-only remix, `raw` is None)."""
+    prompt = raw
     orientation, res_wh = None, None
     if prompt:
         text, orientation, res_raw = image_size.parse_size_flags(prompt)
@@ -526,7 +513,7 @@ async def remix(ctx, *, prompt=None):
                     f"`--res {res_raw}` isn't a size I understand — use `WIDTHxHEIGHT`, "
                     f"e.g. `--res 1920x1080`."
                 )
-                return
+                return False
         # Stripping flags can empty the prompt (e.g. "&remix --landscape" on an
         # attached image) -- fall back to None so the default "reinterpret this
         # image" path below still runs, while the parsed size flags are still honored.
@@ -549,7 +536,7 @@ async def remix(ctx, *, prompt=None):
     if not attachments:
         if not prompt:
             await ctx.send("We need a happy little image to work with before we can remix anything. Attach one, or reply to a message that has one!")
-            return
+            return False
         prompt = await expand_prompt_macros(ctx, prompt)
         prompt, magic = maybe_apply_magic_paint(prompt)
         size, requested = image_size.resolve_generation_size(orientation, res_wh)
@@ -558,8 +545,7 @@ async def remix(ctx, *, prompt=None):
         if requested and requested != size:
             await ctx.send(f"Using `{size}` (adjusted from `{requested}` to fit the size limits).")
         await send_quote(ctx, magic)
-        await do_the_art(ctx, prompt, "remix", IMAGE_MODEL, size=size)
-        return
+        return await do_the_art(ctx, prompt, "remix", IMAGE_MODEL, size=size)
 
     size, requested = image_size.resolve_edit_size(
         orientation, res_wh, attachments[0].width, attachments[0].height
@@ -582,29 +568,227 @@ async def remix(ctx, *, prompt=None):
         magic = True
 
     await send_quote(ctx, magic)
-    await do_the_art(ctx, prompt, "remix", IMAGE_MODEL, images=images, size=size)
+    return await do_the_art(ctx, prompt, "remix", IMAGE_MODEL, images=images, size=size)
 
 
-@bot.command(name='release_image', help='Generate a deterministic release avatar from a git hash (or any text) — same input always yields the same prompt. Flags: --george, --vN. Monthly limit applies.')
-async def release_image_cmd(ctx, *, args=None):
-    if not args or not args.strip():
+async def _release_image_once(ctx, raw):
+    """&release_image's body, verbatim, including its empty-args and
+    unknown-version early returns."""
+    if not raw or not raw.strip():
         await ctx.send("Give me a git hash or any text to immortalize as a release image...")
-        return
-    source, version, georgify = release_image.parse_release_args(args)
+        return False
+    source, version, georgify = release_image.parse_release_args(raw)
     if not source:
         await ctx.send("...I need something to hash besides the flags.")
-        return
+        return False
     try:
         prompt, seed, ver = release_image.build_release_prompt(source, version, georgify)
     except KeyError:
         available = ", ".join(sorted(release_image.RELEASE_ALGORITHMS, key=lambda v: int(v)))
         await ctx.send(f"Unknown algorithm version. Available: {available}")
-        return
+        return False
     # Release images are deliberately NOT subject to magic paint, so send a plain quote.
     await send_quote(ctx)
     george = " | 🥸 George mode" if georgify else ""
     await ctx.send(f"Release image for `{source}` | seed {seed} | algo v{ver}{george}\n**Prompt**: {prompt}")
-    await do_the_art(ctx, prompt, "release_image", IMAGE_MODEL)
+    return await do_the_art(ctx, prompt, "release_image", IMAGE_MODEL)
+
+
+# --- Pipe-chain runner -------------------------------------------------------------
+#
+# Shared by all eight piped commands. Ordering guarantee, preserved throughout: pipe
+# splitting is the FIRST thing done to the raw prompt (before size flags, macros, or
+# magic paint ever see it), and each individual segment is then processed in the same
+# size-flags -> macros -> magic order a plain single command always has been.
+
+async def _piped(ctx, raw, first_runner, request_type, model, magic_mode):
+    """Entry point for every pipe-capable command. Splits `raw` on '|' before
+    anything else touches it -- splitting after macro expansion would let a library
+    macro whose text happens to contain '|' inject extra pipeline steps; splitting
+    first makes that impossible, since macro/magic substitution only ever happens
+    WITHIN an already-split segment.
+
+    `raw is None` only ever happens for &remix (a bare image-only remix, no text at
+    all) -- there's nothing to split, so it runs first_runner directly, once, exactly
+    like today.
+    """
+    if raw is None:
+        await first_runner(ctx, None)
+        return
+
+    segments, dropped, error = pipes.split_pipeline(raw)
+    if error == "too_many":
+        # Load-bearing: this must be the ONLY message sent for this invocation --
+        # no dropped note, no quote, nothing else.
+        await ctx.send(pipes.TOO_MANY_MESSAGE)
+        return
+    if error == "empty":
+        await ctx.send("...I need something to paint besides the pipes.")
+        return
+    if dropped:
+        await ctx.send(pipes.dropped_note(dropped))
+
+    if len(segments) == 1:
+        # No real chain: with no '|' at all, segments[0] is `raw` verbatim, so this
+        # is byte-for-byte the pre-pipes code path for the overwhelming majority of
+        # invocations.
+        await first_runner(ctx, segments[0])
+        return
+
+    # A real (>=2 segment) chain: bracket the WHOLE run with active_requests so a
+    # shutdown drain waits for every segment, not just whichever one happens to be
+    # running when the signal arrives -- do_the_art's own bracket only covers one
+    # segment at a time, leaving a gap BETWEEN segments where active_requests could
+    # read 0 mid-chain and let a drain close the bot early. Nesting with do_the_art's
+    # own increment is harmless (the counter simply reaches 2 mid-segment).
+    global active_requests
+    active_requests += 1
+    try:
+        await _run_chain(ctx, segments, first_runner, request_type, model, magic_mode)
+    finally:
+        active_requests -= 1
+
+
+async def _run_chain(ctx, segments, first_runner, request_type, model, magic_mode):
+    """Run a real chain: segment 1 via `first_runner` (identical to today's un-piped
+    command), every later segment as an edit of the previous segment's output via
+    _pipe_edit_once. Aborts with "Chain stopped at step N of M" on the first failure
+    (prior images stay posted, and the pipes/pipe_segments counters reflect only what
+    actually completed); posts "Chain complete" and bumps `pipes` only if every step
+    succeeds. Deliberately does NOT check `draining` between segments -- the
+    active_requests bracket in _piped is what the raised DRAIN_TIMEOUT exists to
+    cover for a chain already in flight."""
+    total = len(segments)  # the post-drop count, so "step N of M" numbering is honest
+
+    result = await first_runner(ctx, segments[0])
+    if not result:
+        await ctx.send(pipes.chain_stopped_message(1, total))
+        return
+    _bump_stat('pipe_segments')
+    anchor = result.message
+    prev_bytes = result.image_bytes
+
+    for step, text in enumerate(segments[1:], start=2):
+        result = await _pipe_edit_once(ctx, text, prev_bytes, anchor, model, magic_mode)
+        if not result:
+            await ctx.send(pipes.chain_stopped_message(step, total))
+            return
+        _bump_stat('pipe_segments')
+        prev_bytes = result.image_bytes
+        # `anchor` is deliberately never reassigned -- every chained image replies
+        # to the FIRST image (a fixed anchor), so the chain stays traversable
+        # backward from any link, not just from its immediate predecessor.
+
+    _bump_stat('pipes')
+    await ctx.send(pipes.chain_complete_message(total))
+
+
+async def _pipe_edit_once(ctx, raw, prev_bytes, anchor, model, magic_mode):
+    """Every non-first pipe segment is an edit of the previous segment's output,
+    regardless of which command started the chain -- &dpaint's later segments still
+    edit via gpt-image-2 (do_the_art already routes edits through get_edit_model,
+    which falls back off dall-e-3 since it has no edit endpoint). Same per-segment
+    order as a single command: size flags -> macros -> magic."""
+    text, orientation, res_raw = image_size.parse_size_flags(raw)
+
+    res_wh = None
+    if res_raw is not None:
+        try:
+            res_wh = image_size.parse_resolution(res_raw)
+        except ValueError:
+            await ctx.send(
+                f"`--res {res_raw}` isn't a size I understand — use `WIDTHxHEIGHT`, "
+                f"e.g. `--res 1920x1080`."
+            )
+            return False
+
+    prompt = text.strip()
+    if prompt:
+        # Non-empty segment text is an explicit, deliberate instruction the
+        # requester typed -- macro echo/🎲-miss lines stay enabled even on a quiet
+        # segment, same transparency rationale as expand_prompt_macros' docstring.
+        prompt = await expand_prompt_macros(ctx, prompt)
+    else:
+        # A segment that's flags-only (e.g. "... | --portrait") -- the same literal
+        # fallback &remix uses for an image with no guiding text at all. Not run
+        # through macro expansion; there's no user text to expand.
+        prompt = "creatively reinterpret this image"
+
+    magic = False
+    if magic_mode == "roll":
+        prompt, magic = maybe_apply_magic_paint(prompt)
+    elif magic_mode == "always":
+        prompt = _apply_random_magic_entry(prompt)
+        magic = True
+    # magic_mode == "none": never applies magic, matching &hpaint/&mpaint/&lpaint/
+    # &dpaint/&release_image's segment-1 stance carried through to their chain edits.
+
+    # Size off the PREVIOUS segment's own PNG output, not anything threaded forward
+    # from segment 1 -- a first-segment &remix that resolved to AUTO has no size to
+    # thread, but the output PNG's own header always does.
+    dims = image_size.png_dimensions(prev_bytes) or (None, None)
+    size, requested = image_size.resolve_edit_size(orientation, res_wh, dims[0], dims[1])
+    if res_wh and orientation:
+        await ctx.send(f"(`--res` overrides `--{orientation}`)")
+    if requested and requested != size:
+        await ctx.send(f"Using `{size}` (adjusted from `{requested}` to fit the size limits).")
+
+    result = await do_the_art(
+        ctx, prompt, "pipe", model, images=[(prev_bytes, "image/png")], size=size,
+        reply_to=anchor, content=("🖌️" if magic else None), quiet=True,
+    )
+    if result and magic:
+        # Count at reveal time, same semantic send_quote uses: on a quiet segment
+        # the 🖌️ content IS the reveal, and it only exists once the send succeeds.
+        _bump_magic_counter()
+    return result
+
+
+@bot.command(name='paint', help='Paint a picture based on a prompt. Flags: --landscape/--portrait/--square, --res WxH. monthly limit Chain follow-up edits with | (up to 5 steps).')
+async def paint(ctx, *, prompt):
+    await _piped(ctx, prompt, lambda c, t: _paint_once(c, t, "paint", IMAGE_MODEL, "roll"),
+                 "paint", IMAGE_MODEL, "roll")
+
+
+@bot.command(name='hpaint', help='Paint a high quality picture with gpt-image-2. Flags: --landscape/--portrait/--square, --res WxH. monthly limit Chain follow-up edits with | (up to 5 steps).')
+async def hpaint(ctx, *, prompt):
+    await _piped(ctx, prompt, lambda c, t: _paint_once(c, t, "hpaint", "gpt-image-2", "none"),
+                 "hpaint", "gpt-image-2", "none")
+
+
+@bot.command(name='mpaint', help='Paint a medium quality picture with gpt-image-2. Flags: --landscape/--portrait/--square, --res WxH. monthly limit Chain follow-up edits with | (up to 5 steps).')
+async def mpaint(ctx, *, prompt):
+    await _piped(ctx, prompt, lambda c, t: _paint_once(c, t, "mpaint", "gpt-image-2-medium", "none"),
+                 "mpaint", "gpt-image-2-medium", "none")
+
+
+@bot.command(name='lpaint', help='Paint a low quality picture with gpt-image-2. Flags: --landscape/--portrait/--square, --res WxH. monthly limit Chain follow-up edits with | (up to 5 steps).')
+async def lpaint(ctx, *, prompt):
+    await _piped(ctx, prompt, lambda c, t: _paint_once(c, t, "lpaint", "gpt-image-2-low", "none"),
+                 "lpaint", "gpt-image-2-low", "none")
+
+
+@bot.command(name='dpaint', help='Paint with DALL-E 3. monthly limit Chain follow-up edits with | (up to 5 steps).')
+async def dpaint(ctx, *, prompt):
+    await _piped(ctx, prompt, _dpaint_once, "dpaint", "dall-e-3", "none")
+
+
+# Hidden always-on variant of &paint. Named xpaint (not mpaint) since &mpaint is
+# already the medium-quality command. Not listed in help; the addition is never revealed.
+@bot.command(name='xpaint', help='Paint a picture, with a little extra magic. Flags: --landscape/--portrait/--square, --res WxH. Chain follow-up edits with | (up to 5 steps).', hidden=True)
+async def xpaint(ctx, *, prompt):
+    await _piped(ctx, prompt, lambda c, t: _paint_once(c, t, "xpaint", IMAGE_MODEL, "always"),
+                 "xpaint", IMAGE_MODEL, "always")
+
+
+@bot.command(name='remix', help='Remix an image with a prompt. Attach an image, reply to one, or do both — and add a prompt to guide the transformation. Flags: --landscape/--portrait/--square, --res WxH (coerced to a valid size, same as &paint). Falls back to painting if no image is found. Monthly limit applies. Chain follow-up edits with | (up to 5 steps).')
+async def remix(ctx, *, prompt=None):
+    await _piped(ctx, prompt, _remix_once, "remix", IMAGE_MODEL, "roll")
+
+
+@bot.command(name='release_image', help='Generate a deterministic release avatar from a git hash (or any text) — same input always yields the same prompt. Flags: --george, --vN. Monthly limit applies. Chain follow-up edits with | (up to 5 steps).')
+async def release_image_cmd(ctx, *, args=None):
+    await _piped(ctx, args, _release_image_once, "release_image", IMAGE_MODEL, "none")
 
 
 @bot.command(name='magic_list', help='List the magic mixin ids and authors. Use &magic_show to read a prompt, &magic_update to change it.')
@@ -814,32 +998,30 @@ async def macro_remove(ctx, entry_id=None):
     await ctx.send(f"Removed macro `;{normalized_id}`.{note}")
 
 
-class ArtResult(NamedTuple):
-    """What do_the_art returns on success. A NamedTuple (a 4-tuple) is always
-    truthy, so every existing `if await do_the_art(...)` / return-ignoring call site
-    keeps working unchanged -- only callers that actually unpack the return value
-    (the daily scheduler, which needs the raw image bytes to retain them) need to
-    know this shape exists."""
-    message: object      # the discord.Message returned by ctx.send(file=...)
-    image_bytes: bytes   # decoded PNG bytes of the generated/edited image
-    size: object          # the `size` argument this call was made with (str or None)
-    elapsed: float         # seconds spent in the fetch call
-
-
-async def do_the_art(ctx, prompt, request_type, model, images=None, size=None, quiet=False):
+async def do_the_art(ctx, prompt, request_type, model, images=None, size=None,
+                      reply_to=None, content=None, quiet=False):
     # `size` (see image_size.py) is now forwarded on BOTH paths below: fetch_image_edit
-    # (images given -- &remix with an attachment) and fetch_image (generation --
-    # &paint/&hpaint/&mpaint/&lpaint/&xpaint honoring --res/--landscape/--portrait/
-    # --square). None keeps each path's own model-config default size.
-    # &dpaint/&meme/&release_image never pass size, so they stay unaffected.
+    # (images given -- &remix with an attachment, or a pipe chain's edit segments) and
+    # fetch_image (generation -- &paint/&hpaint/&mpaint/&lpaint/&xpaint honoring
+    # --res/--landscape/--portrait/--square). None keeps each path's own model-config
+    # default size. &dpaint/&meme/&release_image never pass size, so they stay
+    # unaffected.
     #
-    # `quiet` is used by the daily scheduler (request_type "daily_image"/"daily_edit"):
-    # it suppresses the "Generated in ... | Monthly requests: ..." trailer, and swaps
-    # the exception-path message for a prompt-free one -- the scheduler's prompt may
-    # carry a hidden magic mixin, and today's failure line echoes the full prompt,
-    # which would spoil the gag. The over-limit message and the "Revised prompt"
-    # message are NOT gated by `quiet` (the daily models are gpt-image-2, which never
-    # has a revised_prompt anyway).
+    # `reply_to` (a discord.Message, or None) threads the posted image as a Discord
+    # reply to that message -- used by pipe chains so every segment past the first
+    # replies to the FIRST image, making the chain traversable backward from any
+    # link. `content` is optional text for the image message itself -- used by a
+    # quiet pipe segment to surface a bare 🖌️ magic tell with no quote message to
+    # attach it to.
+    #
+    # `quiet` is used by the daily scheduler (request_type "daily_image"/"daily_edit")
+    # and by pipe-chain edit segments (request_type "pipe"): it suppresses the
+    # "Generated in ... | Monthly requests: ..." trailer, and swaps the exception-path
+    # message for a prompt-free one -- a quiet caller's prompt may carry a hidden
+    # magic mixin, and the normal failure line echoes the full prompt, which would
+    # spoil the gag. The over-limit message and the "Revised prompt" message are NOT
+    # gated by `quiet` (the daily/pipe models are gpt-image-2, which never has a
+    # revised_prompt anyway).
     #
     # Every image command funnels through here, so bracketing the whole body with the
     # active-request counter is what lets a shutdown drain in-flight work (see
@@ -854,15 +1036,15 @@ async def do_the_art(ctx, prompt, request_type, model, images=None, size=None, q
             await ctx.send("Monthly limit reached. Please wait until next month to make more paint requests.")
             return False
 
-        # Under quiet=True (the scheduler), the prompt must never be posted --
-        # not even indirectly as the attachment filename or alt text, since it
-        # may carry a hidden magic mixin the announcement's bare tell is meant
-        # to keep secret. So quiet callers get a neutral, prompt-free filename
-        # and drop the alt-text description entirely unless OpenAI itself
-        # supplied a revised_prompt (which never happens for the gpt-image-2
-        # family the scheduler uses, but is honored here for correctness).
-        # Neutral/feature-agnostic name (not "daily_image_...") -- quiet=True is also
-        # used by chained pipe segments, which are not daily images.
+        # Under quiet=True (the scheduler, or a pipe segment), the prompt must never
+        # be posted -- not even indirectly as the attachment filename or alt text,
+        # since it may carry a hidden magic mixin the announcement's bare tell is
+        # meant to keep secret. So quiet callers get a neutral, prompt-free filename
+        # and drop the alt-text description entirely unless OpenAI itself supplied a
+        # revised_prompt (which never happens for the gpt-image-2 family the
+        # scheduler/pipes use, but is honored here for correctness).
+        # Neutral/feature-agnostic name (not "daily_image_...") -- quiet=True covers
+        # both the daily scheduler and chained pipe segments.
         file_name = generate_file_name(prompt) if not quiet else f"painting_{int(time.time())}.png"
 
         try:
@@ -873,12 +1055,32 @@ async def do_the_art(ctx, prompt, request_type, model, images=None, size=None, q
                 response = await fetch_image(prompt, model, size=size)
             elapsed = time.monotonic() - t0
             image_data = base64.b64decode(response['image'])
-            image_file = io.BytesIO(image_data)
             if quiet:
                 description = response['revised_prompt'][:1024] if response['revised_prompt'] else None
             else:
                 description = (response['revised_prompt'] or prompt)[:1024]
-            sent = await ctx.send(file=discord.File(image_file, file_name, description=description))
+
+            send_kwargs = {"file": discord.File(io.BytesIO(image_data), file_name, description=description)}
+            if content is not None:
+                send_kwargs["content"] = content
+            if reply_to is not None:
+                send_kwargs["reference"] = reply_to
+            try:
+                sent = await ctx.send(**send_kwargs)
+            except discord.HTTPException:
+                # A deleted anchor message resolves as Discord 400 "reference_unknown".
+                # Only retry the reference case -- with reply_to None this is the
+                # existing (pre-pipes) behavior of letting HTTPException propagate to
+                # the generic handler below. The discord.File above already consumed
+                # its BytesIO on the failed attempt, so it must be rebuilt from
+                # scratch, not reused (a reused, exhausted BytesIO would send a
+                # 0-byte file the second time).
+                if reply_to is None:
+                    raise
+                send_kwargs.pop("reference")
+                send_kwargs["file"] = discord.File(io.BytesIO(image_data), file_name, description=description)
+                sent = await ctx.send(**send_kwargs)
+
             if response['revised_prompt']:
                 await ctx.send(f"**Revised prompt**: {response['revised_prompt']}")
             # reload the data for the increment since we are async
@@ -897,7 +1099,7 @@ async def do_the_art(ctx, prompt, request_type, model, images=None, size=None, q
             save_data(data)
             if not quiet:
                 await ctx.send(f"Generated in {format_duration(elapsed)} | Monthly requests: {data[current_month]}")
-            return ArtResult(sent, image_data, size, elapsed)
+            return pipes.ArtResult(sent, image_data, size, elapsed)
         except Exception as e:
             if quiet:
                 await ctx.send(f"No painting this time, exception for this request: {e}")
@@ -1298,6 +1500,8 @@ async def stats(ctx):
     daily_edits_part = f"Daily edits: {data.get('daily_edits', 0)}"
     macros_part = f"Macros expanded: {data.get('macros', 0)}"
     macro_misses_part = f"Macros not found: {data.get('macro_misses', 0)}"
+    pipes_part = f"Pipe chains: {data.get('pipes', 0)}"
+    pipe_segments_part = f"Pipe segments: {data.get('pipe_segments', 0)}"
     last_change_part = f"Last rate change: {last_change}"
 
     # Combine the parts into the final message
@@ -1315,6 +1519,8 @@ async def stats(ctx):
         f"{daily_edits_part}\n"
         f"{macros_part}\n"
         f"{macro_misses_part}\n"
+        f"{pipes_part}\n"
+        f"{pipe_segments_part}\n"
         f"{last_change_part}"
     )
 

@@ -4,6 +4,7 @@
 Run from the repo root:  python -m unittest test_image_size -v
 """
 
+import base64
 import random
 import struct
 import unittest
@@ -362,6 +363,29 @@ class PngDimensionsTest(unittest.TestCase):
         # Cuts off mid-IHDR (first 20 of the needed 24 bytes).
         self.assertIsNone(png_dimensions(self._png(100, 100)[:20]))
 
+    def test_one_byte_short_of_full_header_rejected(self):
+        # 23 bytes is exactly one byte short of the 24-byte window png_dimensions
+        # reads (struct.unpack(">II", data[16:24])). This pins the "< 24" guard
+        # exactly: a looser bound (e.g. "< 20") would let this 23-byte buffer
+        # through and struct.unpack would raise struct.error instead of the
+        # function failing open to None -- and _pipe_edit_once calls
+        # png_dimensions unguarded, so a raise there would abort a chain segment
+        # instead of falling back to AUTO.
+        self.assertIsNone(png_dimensions(self._png(1024, 1024)[:23]))
+
+    def test_real_encoder_produced_png(self):
+        # A genuine 1x1 transparent PNG as emitted by a real encoder (not bytes
+        # laid out by our own _png() helper in the same order the parser reads
+        # them). This independently pins the IHDR width/height byte offsets --
+        # if png_dimensions and _png shared an offset mistake (e.g. both reading
+        # 20:24/24:28), every test above would still pass while every real PNG
+        # would return garbage.
+        real_png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+            "YPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+        )
+        self.assertEqual(png_dimensions(real_png), (1, 1))
+
     def test_empty_bytes_rejected(self):
         self.assertIsNone(png_dimensions(b""))
 
@@ -384,6 +408,23 @@ class PngDimensionsTest(unittest.TestCase):
 
     def test_bytearray_accepted(self):
         self.assertEqual(png_dimensions(bytearray(self._png(10, 20))), (10, 20))
+
+    def test_wired_into_resolve_edit_size_when_dimensions_parse(self):
+        # Cross-module: a pipe chain segment sizes itself off the PREVIOUS segment's
+        # own PNG output (see bot_ross.py's _pipe_edit_once), which is exactly
+        # png_dimensions feeding straight into resolve_edit_size's no-flag default.
+        # 1024x1536 is already a valid edit size, so it's kept exactly, unchanged.
+        dims = png_dimensions(self._png(1024, 1536))
+        self.assertEqual(
+            resolve_edit_size(None, None, *dims), ("1024x1536", None)
+        )
+
+    def test_wired_into_resolve_edit_size_falls_back_to_auto_on_garbage(self):
+        # Cross-module fallback: unparseable bytes -> png_dimensions returns None ->
+        # caller falls back to (None, None) -> resolve_edit_size lands on AUTO, the
+        # exact same fallback remix already uses when Discord reports no dimensions.
+        dims = png_dimensions(b"junk") or (None, None)
+        self.assertEqual(resolve_edit_size(None, None, *dims), (AUTO, None))
 
 
 if __name__ == "__main__":

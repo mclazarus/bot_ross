@@ -6,11 +6,11 @@ Bot Ross is a Discord bot that generates images using OpenAI's image models. Cha
 
 | Command | Description |
 |---|---|
-| `&paint <prompt>` | Generate an image with gpt-image-2 (or `IMAGE_MODEL`). Flags: `--landscape`/`--portrait`/`--square`, `--res WxH` (coerced to the nearest valid generation size) |
-| `&dpaint <prompt>` | Generate an image with DALL-E 3 |
+| `&paint <prompt>` | Generate an image with gpt-image-2 (or `IMAGE_MODEL`). Flags: `--landscape`/`--portrait`/`--square`, `--res WxH` (coerced to the nearest valid generation size). Chain follow-up edits with `\|` (up to 5 steps) |
+| `&dpaint <prompt>` | Generate an image with DALL-E 3. Chain follow-up edits with `\|` (up to 5 steps) |
 | `&meme [idea]` | GPT generates a meme prompt, then paints it |
-| `&remix [prompt]` | Remix attached image(s) — or the image in a message you reply to — with a prompt, or paint a prompt if none is attached. Output size matches the first image's own dimensions as closely as possible by default; override with `--landscape`/`--portrait`/`--square`/`--res WxH` (coerced to a valid size, same as `&paint`) |
-| `&release_image <git-hash-or-text> [--george] [--vN]` | Mint a deterministic release avatar: the input is hashed to pick a mad-libs image prompt, so the same input always yields the same prompt. `--george` reimagines the subject as George Costanza; `--vN` selects an algorithm version. Not subject to magic paint |
+| `&remix [prompt]` | Remix attached image(s) — or the image in a message you reply to — with a prompt, or paint a prompt if none is attached. Output size matches the first image's own dimensions as closely as possible by default; override with `--landscape`/`--portrait`/`--square`/`--res WxH` (coerced to a valid size, same as `&paint`). Chain follow-up edits with `\|` (up to 5 steps) |
+| `&release_image <git-hash-or-text> [--george] [--vN]` | Mint a deterministic release avatar: the input is hashed to pick a mad-libs image prompt, so the same input always yields the same prompt. `--george` reimagines the subject as George Costanza; `--vN` selects an algorithm version. Not subject to magic paint. Chain follow-up edits with `\|` (up to 5 steps) |
 | `&magic_list` | List the magic mixins (id, truncated text, author, date) |
 | `&magic_show <id>` | Show the full text of a magic mixin |
 | `&magic_add <text>` | Add a magic mixin appended to prompts when magic fires |
@@ -22,7 +22,7 @@ Bot Ross is a Discord bot that generates images using OpenAI's image models. Cha
 | `&macro_add <id> <text>` | Add a ;macro — the id is what you type as `;<id>` in a prompt |
 | `&macro_update <id> <text>` | Update a ;macro's text in place, recording you as editor |
 | `&macro_remove <id>` | Remove a ;macro by id |
-| `&stats` | Show uptime, monthly request count, limit, and magic/remix/release-image/daily-image/macro activity |
+| `&stats` | Show uptime, monthly request count, limit, and magic/remix/release-image/daily-image/macro/pipe activity |
 | `&ping` | Check bot latency |
 
 ## Daily image of the day
@@ -48,6 +48,32 @@ Drop a `;token` anywhere in a `&paint`/`&hpaint`/`&mpaint`/`&lpaint`/`&dpaint`/`
 By convention a macro's text is an article-less noun phrase ending in a comma — you supply the article (`A ;rhe`, `two ;cat`), so the snippet drops into your sentence without doubling it up. Keep that shape when adding your own.
 
 Whenever a macro is used, the bot echoes the fully expanded prompt back on an `expanded prompt: ...` line so you can see exactly what it became — this is shown before any magic mixin is (silently) added, so it never gives the magic away. If `;rhe` isn't a known macro (typo, or it was removed), the bot swaps in a joke placeholder instead of failing, and calls it out with a leading `🎲` line so you know it didn't resolve as expected — generation still proceeds regardless. See `&macro_list` to browse the library, and note that `&release_image`/`&meme` are not wired up to macro expansion.
+
+## Pipes
+
+`&paint`/`&hpaint`/`&mpaint`/`&lpaint`/`&dpaint`/`&xpaint`/`&remix`/`&release_image`
+all accept `|` to chain up to five steps in one command:
+
+    &paint a lighthouse | make it winter | now at night
+
+The first segment behaves exactly like the command does today (its own quote, its
+own magic mode, its own sizing). Every later segment is an image-edit of the
+*previous* segment's output — its text becomes the edit instruction, and it goes
+through the same size-flags → macro → magic order as any single command, so
+`--res`/`--landscape`/`--portrait`/`;macros` and a magic roll all still work per
+segment. Each chained image is posted as a **reply to the first image** (not the
+previous one), so the whole chain is traversable backward from any link. A magic hit
+on a chain segment surfaces only as a bare 🖌️ on that image's message — the mixin
+text itself stays hidden, same as everywhere else. Only the first segment posts the
+usual quote/notices; later segments are quiet except for their own image and any
+size-coercion notice.
+
+More than 4 pipes (6+ segments) gets you exactly one reply — `Okay, simmer down,
+buddy.` — and nothing else. A step that fails aborts the chain with `Chain stopped at
+step N of M.`; everything posted before that point stays posted. There's no escape
+syntax for a literal `|` in a prompt — consistent with `;macros`' stance on `;` — and
+no cross-command chains (segment 2+ is always an edit step, regardless of which
+command started the chain).
 
 ## Sizing
 
@@ -89,7 +115,7 @@ closely as a valid size allows.) `--res` wins if you give both an orientation fl
 ./run.sh .env /path/to/data docks.local
 ```
 
-If a `bot_ross` container is already running, `run.sh` will stop and remove it before starting the new one. The stop **drains in-flight image generations**: on SIGTERM the bot stops accepting new commands and waits (up to `DRAIN_TIMEOUT` seconds) for running generations to finish before exiting, so a redeploy doesn't drop paintings mid-flight. `run.sh` uses `docker stop -t $STOP_TIMEOUT` (default `90`, override via the `STOP_TIMEOUT` env var) — keep it above `DRAIN_TIMEOUT` so the bot exits on its own before Docker force-kills. When a host is provided, `DOCKER_HOST=ssh://<host>` is set so all docker commands run against the remote daemon — the `.env` file is read locally and never copied to the remote host.
+If a `bot_ross` container is already running, `run.sh` will stop and remove it before starting the new one. The stop **drains in-flight image generations**: on SIGTERM the bot stops accepting new commands and waits (up to `DRAIN_TIMEOUT` seconds, default `300` — a full 5-step `|` pipe chain is bracketed as one drain unit and can easily take longer than a minute) for running generations to finish before exiting, so a redeploy doesn't drop paintings (or chains) mid-flight. `run.sh` uses `docker stop -t $STOP_TIMEOUT` (default `330`, override via the `STOP_TIMEOUT` env var) — keep it above `DRAIN_TIMEOUT` so the bot exits on its own before Docker force-kills. When a host is provided, `DOCKER_HOST=ssh://<host>` is set so all docker commands run against the remote daemon — the `.env` file is read locally and never copied to the remote host.
 
 The `data/` directory stores monthly request counts, stats, the working magic-mixin library (`data/magic_prompts.json`), the working macro library (`data/macros.json`), the working daily-image schedule (`data/daily_schedule.json`), the daily scheduler's fired-slot bookkeeping (`data/daily_state.json`), and the retained daily base images (`data/daily_images/`) — mount a host path to persist them across container restarts and redeploys. On startup the bot seeds `data/magic_prompts.json`, `data/macros.json`, and `data/daily_schedule.json` from the image's bundled defaults only if they aren't already present, so mixins/macros/schedule edits added via the bot's commands (or by hand, for the schedule) survive image rebuilds.
 
@@ -114,7 +140,7 @@ All options are set via environment variables (see `env.example`):
 | `IMAGE_MODERATION` | `low` | Content moderation level (`low` or `auto`, gpt-image-2 only) |
 | `MEME_MODEL` | `gpt-5.4-mini` | GPT model used to generate meme prompts |
 | `MAGIC_PAINT_RATE` | `0.05` | Chance (0.0-1.0) that `&paint`/`&remix` silently appends a background gag to the prompt |
-| `DRAIN_TIMEOUT` | `60` | Seconds to let in-flight image generations finish on shutdown before the bot closes |
+| `DRAIN_TIMEOUT` | `300` | Seconds to let in-flight image generations (including a whole in-progress `\|` pipe chain) finish on shutdown before the bot closes |
 | `BOT_TIMEZONE` | `America/New_York` | IANA timezone the daily-image schedule's slot times are wall-clock in. An unknown zone falls back to UTC with a logged warning |
 | `DAILY_IMAGE_CHANNEL_ID` | unset | Discord channel id the daily image/edits post to. Unset disables the scheduler |
 | `DAILY_IMAGE_ENABLED` | `true` | Set `false` to disable the daily-image scheduler outright, even with a channel id configured |
