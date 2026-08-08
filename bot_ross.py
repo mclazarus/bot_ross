@@ -1633,10 +1633,10 @@ async def _daily_scheduler_loop():
             countdown = format_duration((instant - datetime.now(timezone.utc)).total_seconds())
             slot_id = entry["id"]
             when = f"next: {slot_id} at {local:%H:%M %Z} on {local:%Y-%m-%d} (in {countdown})"
-        # Built on its own line, not inlined into the f-string below: a nested
-        # same-quoted f-string (f"...{','.join(f'{e['id']}' ...)}...") is PEP 701
-        # syntax that only parses on 3.12+, and the container runs 3.10 -- so it would
-        # pass every local check and then crash on deploy. See NoNestedFStringsTest.
+        # Built on its own line for readability. This placement used to guard a real
+        # hazard -- a PEP 701 nested f-string here parsed on the 3.12 dev interpreter
+        # but SyntaxErrored on the older container Python -- but dev and container now
+        # run the same version, a parity pinned by DockerfilePythonVersionTest.
         slot_list = ", ".join([e["id"] + " " + e["time"] for e in enabled])
         logger.info(
             f"Daily image scheduler started: zone={BOT_ZONE}, channel={DAILY_IMAGE_CHANNEL_ID}, "

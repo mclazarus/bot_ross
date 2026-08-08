@@ -514,8 +514,9 @@ class NeedsThreadMembershipCheckTest(unittest.TestCase):
     """needs_thread_membership_check decides whether _resolve_linked_images must
     run an extra channel.fetch_member(ctx.author.id) round-trip before trusting
     channel.permissions_for(ctx.author) for a linked message's channel -- because
-    discord.py 2.3.2's Thread.permissions_for delegates straight to the PARENT
-    channel and ignores private-thread membership entirely.
+    discord.py's Thread.permissions_for (re-verified on 2.7.1, the pinned
+    version) delegates straight to the PARENT channel and ignores
+    private-thread membership entirely.
     """
 
     def test_private_thread_without_manage_threads_needs_check(self):

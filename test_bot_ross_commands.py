@@ -504,12 +504,17 @@ class ImportSafetyTest(unittest.TestCase):
 
 class OpenAISDKNotImportedTest(unittest.TestCase):
     """T9 (C4): guards a lurking direct/transitive `import openai` anywhere in
-    the import graph. Would still pass locally today -- the 3.12 .venv keeps
-    the openai package installed until C6's rebuild -- but would crash-loop the
-    eventual 3.14 container, the exact invisible-import-failure class this
-    whole dependency-refresh plan exists to close. NOT a BotTestCase: this is
-    a property of the module already imported at the top of this file, not
-    something that needs the data/-redirecting harness."""
+    the import graph. Before C6 rebuilt the venv, openai was still installed
+    (leftover from the pre-refresh dependency set), so this sys.modules check
+    was the only thing that could catch a stray import -- the module would
+    still import cleanly either way. Now that C6 has rebuilt the .venv (and the
+    Docker image) on 3.14, openai is no longer installed at all, so a stray
+    `import openai` left anywhere in the graph raises ImportError and fails
+    the module import outright; this test still has teeth, just via a
+    different mechanism -- it now also documents that sys.modules can't even
+    contain the key. NOT a BotTestCase: this is a property of the module
+    already imported at the top of this file, not something that needs the
+    data/-redirecting harness."""
 
     def test_openai_is_not_in_sys_modules(self):
         self.assertNotIn("openai", sys.modules)
@@ -739,7 +744,7 @@ class RemixTest(BotTestCase):
 class RemixMessageLinkTest(BotTestCase):
     # NOTE (non-goal, matching the spec): private-thread membership requires a
     # real isinstance(channel, discord.Thread); forging that via object.__new__
-    # would couple this suite to discord.py internals right before the
+    # would couple this suite to discord.py internals across the
     # 2.3.2->2.7.1 bump. The pure decision function is covered directly in
     # test_message_links.py; the surrounding skip/bucket behavior is what T23/T24
     # below cover instead.

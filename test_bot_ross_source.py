@@ -803,7 +803,7 @@ class DockerfilePythonVersionTest(unittest.TestCase):
     """
 
     # Bump only alongside the development environment (.venv), never below it.
-    MINIMUM = (3, 12)
+    MINIMUM = (3, 14)
     DOCKERFILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Dockerfile")
 
     def _base_version(self):
@@ -1146,6 +1146,63 @@ class RequirementsNoLongerListAsyncioBackportTest(unittest.TestCase):
             f"requirements.txt still lists asyncio: {offenders!r} -- it is the inert "
             "2015 PyPI backport, shadowed by stdlib on sys.path; C4b removed it",
         )
+
+
+class NoStaleC6PreconditionClaimsTest(unittest.TestCase):
+    """Guards against three stale claims a Python-3.14 rework (r_c6_python314)
+    fixed in review. Each of these comments/docstrings asserted, in present
+    tense, a fact that was only true *before* C6 rebuilt the .venv/image on
+    3.14: that openai or coloredlogs was still installed pending a "future"
+    C6 rebuild, or that discord.py 2.3.2 (rather than the current 2.7.1 pin)
+    was "the installed discord.py source" for the Thread.permissions_for
+    security claim. C6 has since landed -- the .venv is 3.14, neither package
+    is installed, and the pinned discord.py is 2.7.1 -- so a maintainer
+    reading any of these phrases verbatim would draw a false conclusion (e.g.
+    "this test/mitigation is now vacuous, delete it") about code that in fact
+    still has teeth via a different mechanism. Each phrase below must never
+    reappear verbatim; a similar claim reintroduced later must be phrased in
+    the past tense against the current pin, not as present-tense fact about a
+    still-pending rebuild."""
+
+    REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+    # (relative path, forbidden phrase, why it's now false)
+    CASES = [
+        (
+            "test_bot_ross_commands.py",
+            "the 3.12 .venv keeps",
+            "OpenAISDKNotImportedTest's docstring claimed openai was still "
+            "installed pending C6; C6 has landed and openai is gone",
+        ),
+        (
+            "test_bot_ross_config.py",
+            "the 3.12 .venv still",
+            "test_coloredlogs_import_is_gone's comment claimed coloredlogs was "
+            "still installed pending C6; C6 has landed and coloredlogs is gone",
+        ),
+        (
+            "message_links.py",
+            "discord.py 2.3.2's Thread.permissions_for",
+            "needs_thread_membership_check's docstring pinned the security "
+            "claim to the pre-bump discord.py version instead of the pin",
+        ),
+        (
+            "test_message_links.py",
+            "discord.py 2.3.2's Thread.permissions_for",
+            "NeedsThreadMembershipCheckTest's docstring pinned the security "
+            "claim to the pre-bump discord.py version instead of the pin",
+        ),
+    ]
+
+    def test_stale_phrases_do_not_reappear(self):
+        for relpath, phrase, why in self.CASES:
+            path = os.path.join(self.REPO_ROOT, relpath)
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            self.assertNotIn(
+                phrase, content,
+                f"{relpath} still contains the stale phrase {phrase!r} -- {why}",
+            )
 
 
 if __name__ == "__main__":

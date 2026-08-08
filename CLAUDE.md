@@ -204,10 +204,12 @@ To add a new image model: add an entry to `MODEL_CONFIGS` with its supported par
 
 ## Key Dependencies
 
-- **Python 3.12** (`FROM python:3.12`), matching the development `.venv`. This parity is load-bearing, not incidental: the base image was 3.10 while development happened on 3.12, and a PEP 701 nested f-string (`f"...{f'{e['id']}'}..."`) passed the entire test suite, `ast.parse`, and review, then `SyntaxError`ed at container start. `ast.parse(..., feature_version=(3, 10))` does **not** catch that — `feature_version` doesn't downgrade the f-string tokenizer — and there's no CI on the older interpreter. `DockerfilePythonVersionTest` (`test_bot_ross_source.py`) pins `FROM python:X.Y` at ≥ 3.12 and additionally asserts that floor isn't ahead of the interpreter actually running the tests, so the claim stays verified from both sides. Lowering it means auditing the source for newer syntax first.
-- `discord.py ~2.3.2` — bot framework
-- `aiohttp` — direct HTTP calls to the OpenAI REST API: image generation, image edits, and (since the SDK was dropped) chat completions for `&meme`
+- **Python 3.14** (`FROM python:3.14`), matching the development `.venv`. This parity is load-bearing, not incidental: the base image was 3.10 while development happened on 3.12, and a PEP 701 nested f-string (`f"...{f'{e['id']}'}..."`) passed the entire test suite, `ast.parse`, and review, then `SyntaxError`ed at container start. `ast.parse(..., feature_version=(3, 10))` does **not** catch that — `feature_version` doesn't downgrade the f-string tokenizer — and there's no CI on the older interpreter. `DockerfilePythonVersionTest` (`test_bot_ross_source.py`) pins `FROM python:X.Y` at ≥ 3.14 and additionally asserts that floor isn't ahead of the interpreter actually running the tests, so the claim stays verified from both sides. Lowering it means auditing the source for newer syntax first.
+- `discord.py ~2.7.1` — bot framework. On Python 3.13+ it transitively pulls `audioop-lts` (the stdlib `audioop` module was removed by PEP 594, and `discord/player.py` imports it unconditionally — the exact failure that pinned this project to old interpreters). `audioop-lts` is deliberately NOT pinned in `requirements.txt`; discord.py owns that dependency.
+- `aiohttp ~3.14.3` — direct HTTP calls to the OpenAI REST API: image generation, image edits, and (since the SDK was dropped) chat completions for `&meme`. The 3.13+ floor is load-bearing: aiohttp 3.9.x ships no cp313/cp314 wheels and will not compile there.
 - `tzdata` — guarantees IANA timezone data for `zoneinfo` (used by `daily_schedule.py`/`BOT_TIMEZONE`) regardless of what the base image ships
+
+`test_runtime_deps.py` (stdlib `unittest`, run `python -m unittest test_runtime_deps`) is the suite's dependency smoke check: it imports `discord` (including `discord.player`, the audioop-failure module) and `aiohttp` at their real installed versions, proves `zoneinfo` has genuine DST data, and asserts every `requirements.txt` pin is satisfied by what is actually installed — before it existed, a broken pin could pass all tests and only fail at container start.
 
 ## Notes
 

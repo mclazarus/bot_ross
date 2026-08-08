@@ -165,11 +165,17 @@ class ImportSafetyTest(unittest.TestCase):
         self.assertIn("DISCORD_BOT_TOKEN", stderr)
 
     def test_coloredlogs_import_is_gone(self):
-        # C5/16 -- the 3.12 .venv still *has* coloredlogs installed until C6
-        # rebuilds it, so a stale `import coloredlogs` left in bot_ross.py
-        # would pass every other test in this gate. This subprocess check,
-        # inspecting sys.modules after import, is the only thing that
-        # proves the dependency drop is real before C6 removes the package.
+        # C5/16 -- before C6 rebuilt the .venv, coloredlogs was still
+        # installed (leftover from the pre-refresh dependency set), so a
+        # stale `import coloredlogs` left in bot_ross.py would still import
+        # cleanly and pass every other test in this gate; this subprocess
+        # check, inspecting sys.modules after import, was the only thing
+        # that could catch it. Now that C6 has rebuilt the .venv (and the
+        # Docker image) on 3.14, coloredlogs is no longer installed at all,
+        # so the same stray import would make the subprocess exit non-zero
+        # on ImportError -- this check still has teeth, just via a
+        # different mechanism (the assertEqual(returncode, 0) below now
+        # catches that too).
         result = subprocess.run(
             [
                 sys.executable, "-c",

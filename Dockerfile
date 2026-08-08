@@ -1,9 +1,9 @@
-# Must stay >= the Python the code is developed and tested against (3.12), or syntax
+# Must stay >= the Python the code is developed and tested against (3.14), or syntax
 # that passes every local check can SyntaxError at container start -- that already
 # happened once with a PEP 701 nested f-string, which 3.10 rejects and 3.12 accepts.
 # Pinned by DockerfilePythonVersionTest in test_bot_ross_source.py; downgrading means
 # auditing the source for newer syntax first, not just editing this line.
-FROM python:3.12
+FROM python:3.14
 
 WORKDIR /app
 

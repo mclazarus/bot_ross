@@ -210,9 +210,10 @@ def needs_thread_membership_check(is_private_thread, has_manage_threads):
     `channel.fetch_member(ctx.author.id)` check before trusting
     `channel.permissions_for(ctx.author)` for a linked message's channel.
 
-    discord.py 2.3.2's Thread.permissions_for(obj) delegates straight to
-    `self.parent.permissions_for(obj)` -- it does NOT factor in private-thread
-    membership at all (verified against the installed discord.py source: it reads
+    discord.py's Thread.permissions_for(obj) (re-verified on 2.7.1, the pinned
+    version) delegates straight to `self.parent.permissions_for(obj)` -- it does
+    NOT factor in private-thread membership at all (verified against the
+    installed discord.py source: it reads
     `parent = self.parent; base = GuildChannel.permissions_for(parent, obj)` and
     never touches thread membership). That means authoritative check (b) in
     _resolve_linked_images (view_channel + read_message_history) can come back
