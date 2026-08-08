@@ -568,6 +568,40 @@ class ValidateScheduleTest(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("lunch", errors[0])
 
+    def test_duplicate_id_detection_is_case_and_whitespace_insensitive(self):
+        # Regression: this deduplicated on raw_id.strip() while EVERY lookup path
+        # (the &daily_* commands -> normalize_slot_id + slot_entry_id) also lowercases.
+        # A schedule holding both "lunch" and "LUNCH" therefore kept both, and since a
+        # command's lookup normalizes to "lunch" and stops at the first match, the
+        # "LUNCH" entry fired every single day while being unreachable by &daily_show,
+        # &daily_update, &daily_toggle and &daily_remove alike -- a slot you could
+        # watch posting but could not turn off. Validation must agree with the command
+        # layer: anything that survives here has to be addressable by a command.
+        first = {"id": "lunch", "time": "12:00", "type": "generate", "message": "first"}
+        for shadow_id in ("LUNCH", " lunch ", "  LuNcH"):
+            with self.subTest(shadow_id=shadow_id):
+                shadow = {"id": shadow_id, "time": "13:00", "type": "generate", "message": "second"}
+                good, errors = validate_schedule([first, shadow])
+                self.assertEqual(good, [first])
+                self.assertEqual(len(errors), 1)
+
+    def test_every_surviving_entry_is_addressable_by_its_normalized_id(self):
+        # The invariant the fix above exists to guarantee, stated directly: each entry
+        # validate_schedule keeps must be findable by exactly the lookup the commands
+        # perform, and must resolve to ITSELF rather than to an earlier near-collision.
+        entries = [
+            {"id": "morning", "time": "07:00", "type": "generate", "message": "m"},
+            {"id": "Lunch", "time": "12:00", "type": "edit", "edit_prompt": "p", "message": "L"},
+            {"id": " goodnight ", "time": "22:00", "type": "edit", "edit_prompt": "q", "message": "G"},
+        ]
+        good, _errors = validate_schedule(entries)
+        self.assertEqual(len(good), 3)
+        for entry in good:
+            with self.subTest(entry_id=entry["id"]):
+                wanted = normalize_slot_id(entry["id"])
+                found = next((e for e in good if slot_entry_id(e) == wanted), None)
+                self.assertIs(found, entry, f"{entry['id']!r} resolves to a different entry")
+
     def test_edit_without_edit_prompt_dropped(self):
         for edit_prompt in (None, ""):
             entry = {"id": "e", "time": "07:00", "type": "edit", "message": "m"}
@@ -1734,6 +1768,40 @@ class FormatSlotDisplayTest(unittest.TestCase):
             lines[2],
             "⚠️ entry #3 in the file has no usable id — fix it by hand in data/daily_schedule.json",
         )
+
+    def test_format_schedule_lines_flags_a_shadowed_duplicate_id(self):
+        # validate_slot inspects ONE row in isolation, so it cannot see duplicates --
+        # but validate_schedule drops every occurrence after the first. Without an
+        # explicit duplicate check here, &daily_list rendered the shadowed row as a
+        # perfectly healthy summary while it silently never fired: the one case where
+        # the listing actively misleads a hand-editor about why their slot is dead.
+        first = {"id": "lunch", "time": "12:00", "type": "edit", "edit_prompt": "a", "message": "A"}
+        shadow = {"id": "lunch", "time": "13:00", "type": "edit", "edit_prompt": "b", "message": "B"}
+        lines = format_schedule_lines([first, shadow])
+
+        self.assertEqual(lines[0], format_slot_summary(first))
+        self.assertTrue(lines[1].startswith("⚠️"), lines[1])
+        self.assertIn("duplicate", lines[1])
+        self.assertIn("never fires", lines[1])
+        # The listing must agree with what the scheduler actually loads.
+        good, _errors = validate_schedule([first, shadow])
+        self.assertEqual(good, [first])
+
+    def test_format_schedule_lines_duplicate_check_is_case_insensitive(self):
+        # Ids are normalized (stripped, lowercased) before comparison everywhere else,
+        # so "Lunch" and "lunch" collide in validate_schedule too -- the listing must
+        # not disagree just because the file's casing differs.
+        first = {"id": "lunch", "time": "12:00", "type": "edit", "edit_prompt": "a", "message": "A"}
+        shadow = {"id": " LUNCH ", "time": "13:00", "type": "edit", "edit_prompt": "b", "message": "B"}
+        lines = format_schedule_lines([first, shadow])
+        self.assertIn("duplicate", lines[1])
+        self.assertEqual(len(validate_schedule([first, shadow])[0]), 1)
+
+    def test_format_schedule_lines_does_not_flag_distinct_ids(self):
+        # Guards the inverse regression: a too-eager duplicate check that warned on
+        # every row would make the whole listing useless.
+        lines = format_schedule_lines(self.seed)
+        self.assertFalse([l for l in lines if "duplicate" in l], lines)
 
     def test_format_schedule_lines_preserves_file_order(self):
         lines = format_schedule_lines(self.seed)

@@ -217,7 +217,20 @@ def validate_schedule(entries):
             continue
         entry_id = raw_id.strip()
 
-        if entry_id in accepted_ids:
+        # Deduplicate on the NORMALIZED id (strip + lowercase), not the merely
+        # stripped one, because that is what every lookup uses: the &daily_* commands
+        # resolve a typed id via normalize_slot_id and match it against
+        # slot_entry_id(entry), which lowercases too. Comparing case-sensitively here
+        # let a schedule holding both "lunch" and "LUNCH" keep BOTH -- and since every
+        # command's lookup normalizes to "lunch" and stops at the first match, the
+        # "LUNCH" entry fired every day while being unreachable by &daily_show,
+        # &daily_update, &daily_toggle and &daily_remove alike: a slot you could see
+        # posting but could not turn off. Normalizing here makes the scheduler agree
+        # with the command layer, so a slot that survives validation is always one a
+        # command can address.
+        normalized_id = normalize_slot_id(entry_id)
+
+        if normalized_id in accepted_ids:
             errors.append(f"entry id {entry_id!r} is a duplicate; keeping the first occurrence")
             continue
 
@@ -251,7 +264,7 @@ def validate_schedule(entries):
             errors.append(f"entry id {entry_id!r} has a non-bool enabled value: {entry.get('enabled')!r}")
             continue
 
-        accepted_ids.add(entry_id)
+        accepted_ids.add(normalized_id)
         good.append(entry)
 
     return good, errors
@@ -705,6 +718,7 @@ def format_schedule_lines(entries):
     if not isinstance(entries, list):
         return []
     lines = []
+    seen_ids = set()
     for index, entry in enumerate(entries):
         sid = slot_entry_id(entry)
         if sid is None:
@@ -713,6 +727,20 @@ def format_schedule_lines(entries):
                 "fix it by hand in data/daily_schedule.json"
             )
             continue
+        # validate_slot checks ONE row in isolation, so by construction it cannot see
+        # a duplicate id -- but validate_schedule drops every occurrence after the
+        # first. Without this the list would render a shadowed duplicate as a
+        # perfectly healthy "(magic off, enabled)" row while it silently never fires:
+        # the one case where &daily_list would actively mislead a hand-editor about
+        # why their slot isn't running. Track ids here so the list agrees with what
+        # the scheduler actually loads.
+        if sid in seen_ids:
+            lines.append(
+                f"⚠️ `{sid}` (entry #{index + 1}) is a duplicate id — it never fires; "
+                "the first one wins. Remove it by hand in data/daily_schedule.json"
+            )
+            continue
+        seen_ids.add(sid)
         error = validate_slot(entry)
         lines.append(format_slot_summary(entry) if error is None else f"⚠️ {error}")
     return lines

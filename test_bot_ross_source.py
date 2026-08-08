@@ -773,6 +773,46 @@ class DailyNoSuchSlotReplyIsBoundedTest(unittest.TestCase):
 
     COMMANDS = ("daily_show", "daily_update", "daily_remove", "daily_toggle")
 
+    # The SUCCESS path echoes the id too ("Removed daily slot `x`.", "Updated `x` ...",
+    # "Daily slot `x` is now **enabled**."), sourced from slot_entry_id(entry) rather
+    # than the typed slot_id. &daily_add caps a NEW id at 32 chars via is_valid_slot_id,
+    # but a hand-edited data/daily_schedule.json can hold an arbitrarily long one, so
+    # that path was unbounded while the not-found path above was already hardened. An
+    # over-cap reply there is worse than the not-found case: the write has already
+    # landed, so the user reads the HTTPException as "it failed" and may redo it.
+    SUCCESS_ECHO_COMMANDS = ("daily_update", "daily_remove", "daily_toggle")
+
+    def test_success_path_slot_entry_id_is_wrapped_in_truncate_text(self):
+        for name in self.SUCCESS_ECHO_COMMANDS:
+            with self.subTest(command=name):
+                func = _load_function(name)
+                bare = [
+                    node for node in _assigns_to(func, "sid")
+                    if isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Attribute)
+                    and node.value.func.attr == "slot_entry_id"
+                ]
+                self.assertEqual(
+                    bare, [],
+                    f"{name} assigns sid = daily_schedule.slot_entry_id(entry) unwrapped; "
+                    "sid is echoed into the success reply, so it must go through "
+                    "daily_schedule.truncate_text(...) like the not-found replies do",
+                )
+                wrapped = [
+                    call for call in _calls_attr(func, "daily_schedule", "truncate_text")
+                    if any(
+                        isinstance(arg, ast.Call)
+                        and isinstance(arg.func, ast.Attribute)
+                        and arg.func.attr == "slot_entry_id"
+                        for arg in call.args
+                    )
+                ]
+                self.assertTrue(
+                    wrapped,
+                    f"{name} must wrap daily_schedule.slot_entry_id(entry) in "
+                    "daily_schedule.truncate_text(...) before echoing it",
+                )
+
     def test_normalize_slot_id_is_wrapped_in_truncate_text(self):
         for name in self.COMMANDS:
             with self.subTest(command=name):

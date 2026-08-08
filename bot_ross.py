@@ -1882,7 +1882,13 @@ async def daily_update(ctx, slot_id=None, field=None, *, value=None):
     if entry is None:
         message = f"No daily slot with id `{daily_schedule.truncate_text(daily_schedule.normalize_slot_id(slot_id))}`."
     else:
-        sid = daily_schedule.slot_entry_id(entry)
+        # Display only (every use below is inside an f-string), so bound it the same
+        # way the not-found replies above already do. &daily_add caps a new id at 32
+        # chars, but a hand-edited data/daily_schedule.json can carry an arbitrarily
+        # long one, and echoing that unbounded can push the reply past Discord's
+        # 2000-char limit -- turning a successful write into an HTTPException the
+        # user reads as "the command failed" after it already succeeded.
+        sid = daily_schedule.truncate_text(daily_schedule.slot_entry_id(entry))
         new_entry, error = daily_schedule.apply_slot_update(
             entry, field, value, editor=ctx.author.name, edited=date.today().isoformat(),
         )
@@ -1947,7 +1953,13 @@ async def daily_remove(ctx, slot_id=None):
     if entry is None:
         message = f"No daily slot with id `{daily_schedule.truncate_text(daily_schedule.normalize_slot_id(slot_id))}`."
     else:
-        sid = daily_schedule.slot_entry_id(entry)
+        # Display only (every use below is inside an f-string), so bound it the same
+        # way the not-found replies above already do. &daily_add caps a new id at 32
+        # chars, but a hand-edited data/daily_schedule.json can carry an arbitrarily
+        # long one, and echoing that unbounded can push the reply past Discord's
+        # 2000-char limit -- turning a successful write into an HTTPException the
+        # user reads as "the command failed" after it already succeeded.
+        sid = daily_schedule.truncate_text(daily_schedule.slot_entry_id(entry))
         remaining = [e for e in entries if e is not entry]
         _save_daily_schedule(remaining)
         message = f"Removed daily slot `{sid}`."
@@ -1969,7 +1981,13 @@ async def daily_toggle(ctx, slot_id=None):
     if entry is None:
         message = f"No daily slot with id `{daily_schedule.truncate_text(daily_schedule.normalize_slot_id(slot_id))}`."
     else:
-        sid = daily_schedule.slot_entry_id(entry)
+        # Display only (every use below is inside an f-string), so bound it the same
+        # way the not-found replies above already do. &daily_add caps a new id at 32
+        # chars, but a hand-edited data/daily_schedule.json can carry an arbitrarily
+        # long one, and echoing that unbounded can push the reply past Discord's
+        # 2000-char limit -- turning a successful write into an HTTPException the
+        # user reads as "the command failed" after it already succeeded.
+        sid = daily_schedule.truncate_text(daily_schedule.slot_entry_id(entry))
         new_entry = daily_schedule.toggle_slot(entry, editor=ctx.author.name, edited=date.today().isoformat())
         # Informational only -- flipping `enabled` can never invalidate an
         # otherwise-valid entry (no other field changes), and a broken entry must
