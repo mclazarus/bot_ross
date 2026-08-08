@@ -5,7 +5,9 @@ import signal
 import discord
 import os
 import json
-from datetime import datetime, date
+import types
+from datetime import datetime, date, timezone
+from typing import NamedTuple
 from discord.ext import commands
 import openai
 import random
@@ -19,6 +21,7 @@ import release_image
 import magic_paint
 import macros
 import image_size
+import daily_schedule
 from magic_paint import parse_magic_rate, format_magic_rate
 
 logging.basicConfig(level=logging.INFO)
@@ -52,6 +55,22 @@ try:
 except (TypeError, ValueError):
     DRAIN_TIMEOUT = 60.0
 
+# The bot's single wall-clock timezone for the daily-image scheduler (see
+# _daily_scheduler_loop below) -- all slot times in daily_schedule.json are wall-clock
+# in THIS zone, regardless of the container's own (UTC) clock. A bad/unknown
+# BOT_TIMEZONE falls back to UTC rather than crashing at import; get_zone() reports
+# the problem back as a string so we can still log it loudly here.
+BOT_TIMEZONE = os.environ.get('BOT_TIMEZONE', daily_schedule.DEFAULT_TIMEZONE)
+BOT_ZONE, _tz_error = daily_schedule.get_zone(BOT_TIMEZONE)
+if _tz_error:
+    logger.warning(f"BOT_TIMEZONE problem, falling back to UTC: {_tz_error}")
+
+# DAILY_IMAGE_CHANNEL_ID unset (None) disables the scheduler entirely, same as
+# DAILY_IMAGE_ENABLED=false -- see on_ready. Both are parsed leniently (never raise) so a
+# typo'd env var can't crash the bot at import.
+DAILY_IMAGE_ENABLED = daily_schedule.parse_bool(os.environ.get('DAILY_IMAGE_ENABLED'), True)
+DAILY_IMAGE_CHANNEL_ID = daily_schedule.parse_channel_id(os.environ.get('DAILY_IMAGE_CHANNEL_ID'))
+
 # The working library lives on the persistent data/ volume so user-added mixins survive
 # redeploys; DEFAULT_MAGIC_PROMPTS_FILE is the seed baked into the image (see _seed_magic_library).
 MAGIC_PROMPTS_FILE = "data/magic_prompts.json"
@@ -60,6 +79,14 @@ DEFAULT_MAGIC_PROMPTS_FILE = "magic_prompts.json"
 # Same two-copy seed/working-volume pattern as the magic library, for ;macro expansions.
 MACROS_FILE = "data/macros.json"
 DEFAULT_MACROS_FILE = "macros.json"
+
+# Same two-copy seed/working-volume pattern again, for the daily-image schedule. The
+# fired-state file and the retained-image directory are volume-only -- never shipped,
+# never seeded (see daily_schedule.py's module docstring and _seed_daily_schedule below).
+DAILY_SCHEDULE_FILE = "data/daily_schedule.json"
+DEFAULT_DAILY_SCHEDULE_FILE = "daily_schedule.json"
+DAILY_STATE_FILE = "data/daily_state.json"
+DAILY_IMAGES_DIR = "data/daily_images"
 
 MODEL_CONFIGS = {
     "gpt-image-2": {
@@ -159,6 +186,12 @@ def _seed_macro_library():
     macros.seed_macro_library(MACROS_FILE, DEFAULT_MACROS_FILE)
 
 
+# Thin wrapper binding daily_schedule.py's seed logic to this module's file paths,
+# mirroring the magic/macro seed wrappers above.
+def _seed_daily_schedule():
+    daily_schedule.seed_schedule(DAILY_SCHEDULE_FILE, DEFAULT_DAILY_SCHEDULE_FILE)
+
+
 def format_rate_change_time(iso_str):
     """Render a stored rate-change timestamp as 'YYYY-MM-DD HH:MM:SS ±HHMM'.
     Legacy naive timestamps recorded before timezones were tracked render without the offset."""
@@ -182,13 +215,21 @@ def _record_rate_change(user, rate):
     logger.info(f"Magic rate changed to {format_magic_rate(rate)} ({rate}) by {user}")
 
 
+def _bump_magic_counter():
+    """Increment the persisted 'magic' counter. Extracted out of send_quote so the
+    daily scheduler -- which has no quote message to attach the 🖌️ tell to -- can
+    bump it directly when a scheduled slot's magic roll succeeds; without this
+    extraction, the counter would silently stop counting scheduled magic."""
+    data = load_data()
+    data['magic'] = data.get('magic', 0) + 1
+    save_data(data)
+
+
 async def send_quote(ctx, magic=False):
     quote = get_random_bob_ross_quote()
     if magic:
         quote += " 🖌️"
-        data = load_data()
-        data['magic'] = data.get('magic', 0) + 1
-        save_data(data)
+        _bump_magic_counter()
     await ctx.send(quote)
 
 
@@ -251,6 +292,12 @@ active_requests = 0
 draining = False
 _signals_installed = False
 
+# The daily-image scheduler's background task, and the last set of schedule-validation
+# errors we logged (so a persistently bad data/daily_schedule.json warns once per
+# distinct problem, not once a minute forever -- see _run_due_daily_slots).
+_daily_task = None
+_last_schedule_errors = []
+
 
 async def _graceful_shutdown(sig_name):
     """Stop accepting new commands, wait (up to DRAIN_TIMEOUT) for in-flight generations
@@ -285,12 +332,17 @@ def save_data(data):
 
 
 def get_current_month():
-    return datetime.now().strftime("%Y-%m")
+    # BEHAVIOR CHANGE: this used to be datetime.now().strftime(...) (the container's
+    # own, UTC, clock). Moving it to BOT_ZONE is the correct reading of "a single
+    # global timezone" for the daily scheduler, but it also moves the monthly
+    # spend-limit boundary by up to 5 hours on one day a month -- a deliberate,
+    # explicitly-called-out behavior change (see CLAUDE.md), not an incidental one.
+    return datetime.now(BOT_ZONE).strftime("%Y-%m")
 
 
 @bot.event
 async def on_ready():
-    global _signals_installed
+    global _signals_installed, _daily_task
     logger.info(f'{bot.user.name} has connected to Discord!')
     # discord.py installs no SIGTERM handler, so as PID 1 in Docker the process would
     # ignore `docker stop` until it SIGKILLs. Install real loop handlers so we drain
@@ -302,6 +354,17 @@ async def on_ready():
                 sig, lambda s=sig: asyncio.create_task(_graceful_shutdown(s.name))
             )
         _signals_installed = True
+
+    # Start the daily-image scheduler, idempotently -- on_ready can refire on
+    # reconnect, so guard against starting a second loop the same way _signals_installed
+    # guards the signal handlers above.
+    if not DAILY_IMAGE_ENABLED:
+        logger.info("Daily image scheduler disabled (DAILY_IMAGE_ENABLED is false).")
+    elif DAILY_IMAGE_CHANNEL_ID is None:
+        logger.info("Daily image scheduler disabled: no DAILY_IMAGE_CHANNEL_ID set.")
+    elif _daily_task is None or _daily_task.done():
+        _daily_task = asyncio.create_task(_daily_scheduler_loop())
+        _daily_task.add_done_callback(_log_daily_task_result)
 
 
 @bot.check
@@ -751,12 +814,32 @@ async def macro_remove(ctx, entry_id=None):
     await ctx.send(f"Removed macro `;{normalized_id}`.{note}")
 
 
-async def do_the_art(ctx, prompt, request_type, model, images=None, size=None):
+class ArtResult(NamedTuple):
+    """What do_the_art returns on success. A NamedTuple (a 4-tuple) is always
+    truthy, so every existing `if await do_the_art(...)` / return-ignoring call site
+    keeps working unchanged -- only callers that actually unpack the return value
+    (the daily scheduler, which needs the raw image bytes to retain them) need to
+    know this shape exists."""
+    message: object      # the discord.Message returned by ctx.send(file=...)
+    image_bytes: bytes   # decoded PNG bytes of the generated/edited image
+    size: object          # the `size` argument this call was made with (str or None)
+    elapsed: float         # seconds spent in the fetch call
+
+
+async def do_the_art(ctx, prompt, request_type, model, images=None, size=None, quiet=False):
     # `size` (see image_size.py) is now forwarded on BOTH paths below: fetch_image_edit
     # (images given -- &remix with an attachment) and fetch_image (generation --
     # &paint/&hpaint/&mpaint/&lpaint/&xpaint honoring --res/--landscape/--portrait/
     # --square). None keeps each path's own model-config default size.
     # &dpaint/&meme/&release_image never pass size, so they stay unaffected.
+    #
+    # `quiet` is used by the daily scheduler (request_type "daily_image"/"daily_edit"):
+    # it suppresses the "Generated in ... | Monthly requests: ..." trailer, and swaps
+    # the exception-path message for a prompt-free one -- the scheduler's prompt may
+    # carry a hidden magic mixin, and today's failure line echoes the full prompt,
+    # which would spoil the gag. The over-limit message and the "Revised prompt"
+    # message are NOT gated by `quiet` (the daily models are gpt-image-2, which never
+    # has a revised_prompt anyway).
     #
     # Every image command funnels through here, so bracketing the whole body with the
     # active-request counter is what lets a shutdown drain in-flight work (see
@@ -771,7 +854,16 @@ async def do_the_art(ctx, prompt, request_type, model, images=None, size=None):
             await ctx.send("Monthly limit reached. Please wait until next month to make more paint requests.")
             return False
 
-        file_name = generate_file_name(prompt)
+        # Under quiet=True (the scheduler), the prompt must never be posted --
+        # not even indirectly as the attachment filename or alt text, since it
+        # may carry a hidden magic mixin the announcement's bare tell is meant
+        # to keep secret. So quiet callers get a neutral, prompt-free filename
+        # and drop the alt-text description entirely unless OpenAI itself
+        # supplied a revised_prompt (which never happens for the gpt-image-2
+        # family the scheduler uses, but is honored here for correctness).
+        # Neutral/feature-agnostic name (not "daily_image_...") -- quiet=True is also
+        # used by chained pipe segments, which are not daily images.
+        file_name = generate_file_name(prompt) if not quiet else f"painting_{int(time.time())}.png"
 
         try:
             t0 = time.monotonic()
@@ -782,8 +874,11 @@ async def do_the_art(ctx, prompt, request_type, model, images=None, size=None):
             elapsed = time.monotonic() - t0
             image_data = base64.b64decode(response['image'])
             image_file = io.BytesIO(image_data)
-            description = (response['revised_prompt'] or prompt)[:1024]
-            await ctx.send(file=discord.File(image_file, file_name, description=description))
+            if quiet:
+                description = response['revised_prompt'][:1024] if response['revised_prompt'] else None
+            else:
+                description = (response['revised_prompt'] or prompt)[:1024]
+            sent = await ctx.send(file=discord.File(image_file, file_name, description=description))
             if response['revised_prompt']:
                 await ctx.send(f"**Revised prompt**: {response['revised_prompt']}")
             # reload the data for the increment since we are async
@@ -795,11 +890,19 @@ async def do_the_art(ctx, prompt, request_type, model, images=None, size=None):
                 data['remixes'] = data.get('remixes', 0) + 1
             if request_type == "release_image":
                 data['release_images'] = data.get('release_images', 0) + 1
+            if request_type == "daily_image":
+                data['daily_images'] = data.get('daily_images', 0) + 1
+            if request_type == "daily_edit":
+                data['daily_edits'] = data.get('daily_edits', 0) + 1
             save_data(data)
-            await ctx.send(f"Generated in {format_duration(elapsed)} | Monthly requests: {data[current_month]}")
-            return True
+            if not quiet:
+                await ctx.send(f"Generated in {format_duration(elapsed)} | Monthly requests: {data[current_month]}")
+            return ArtResult(sent, image_data, size, elapsed)
         except Exception as e:
-            await ctx.send(f"No painting for: {prompt}, exception for this request: {e}")
+            if quiet:
+                await ctx.send(f"No painting this time, exception for this request: {e}")
+            else:
+                await ctx.send(f"No painting for: {prompt}, exception for this request: {e}")
             return False
     finally:
         active_requests -= 1
@@ -926,6 +1029,235 @@ async def fetch_image_edit(prompt, model, images, size=None):
         raise Exception(f"response: {response.status}: {error_message}")
 
 
+# --- Daily image-of-the-day scheduler -------------------------------------------------
+#
+# Thin wrappers around daily_schedule.py's pure logic, deliberately untested (the loop
+# itself can't be imported/exercised under test since bot_ross.py ends in bot.run() at
+# module scope; everything testable about time/DST/retention lives in daily_schedule.py
+# instead -- see test_daily_schedule.py). Every actual image call still funnels through
+# do_the_art, so the scheduler inherits over_limit, the monthly counter, safety-trip
+# accounting, and the active_requests drain bracket for free.
+
+FAILURE_MESSAGE = "My paint brush hit me with a :circlegame: sorry nothing to see here"
+
+
+class _ChannelContext:
+    """Minimal stand-in for a discord.ext.commands.Context: just enough for
+    do_the_art (which only ever touches ctx.send and ctx.author.name) to run against
+    a plain channel instead of a real command invocation, so the scheduler can reuse
+    do_the_art unchanged."""
+
+    def __init__(self, channel):
+        self.channel = channel
+        self.author = types.SimpleNamespace(name="daily_schedule")
+
+    async def send(self, *args, **kwargs):
+        return await self.channel.send(*args, **kwargs)
+
+
+def _log_daily_task_result(task):
+    """Done-callback for the scheduler's background task. A bare asyncio.create_task()
+    return value with nothing holding a reference can be garbage-collected mid-flight,
+    and a loop that raises out of its own try/except would otherwise die silently --
+    log the exception (if any) so a dead scheduler shows up in the logs instead of just
+    quietly not posting anymore."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(f"Daily scheduler task died: {exc!r}", exc_info=exc)
+
+
+async def _daily_scheduler_loop():
+    """Per-minute tick. Sleeps to the next wall-clock minute boundary (recomputed from
+    BOT_ZONE's current time every iteration, so it self-corrects after an NTP step or
+    host suspend within one minute), then runs whatever slots are due. One bad tick
+    must never kill the heartbeat, so the tick body has its own try/except."""
+    while not draining:
+        await asyncio.sleep(daily_schedule.seconds_to_next_minute(datetime.now(BOT_ZONE)))
+        if draining:
+            break
+        try:
+            await _run_due_daily_slots()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Daily scheduler tick failed")
+
+
+async def _run_due_daily_slots():
+    """One tick: load+validate the schedule fresh (never cached, matching the
+    magic/macro libraries), find what's due, resolve the channel, and run each due
+    slot in order."""
+    global _last_schedule_errors
+    entries = daily_schedule.load_schedule(DAILY_SCHEDULE_FILE)
+    good, errors = daily_schedule.validate_schedule(entries)
+    if errors != _last_schedule_errors:
+        # Only log when the error set actually changes -- otherwise one bad entry in
+        # data/daily_schedule.json would spam a warning every 60 seconds forever.
+        for err in errors:
+            logger.warning(f"Daily schedule problem: {err}")
+        _last_schedule_errors = errors
+
+    state = daily_schedule.load_state(DAILY_STATE_FILE)
+    due = daily_schedule.due_slots(datetime.now(timezone.utc), good, state, BOT_ZONE)
+    if not due:
+        return
+
+    try:
+        channel = bot.get_channel(DAILY_IMAGE_CHANNEL_ID) or await bot.fetch_channel(DAILY_IMAGE_CHANNEL_ID)
+    except (discord.HTTPException, discord.NotFound, discord.Forbidden) as e:
+        # Deliberately do NOT mark anything fired here -- a transient Discord hiccup
+        # must not permanently consume the day's slot; it stays eligible for the rest
+        # of its MISS_WINDOW and the next tick(s) will retry channel resolution.
+        logger.error(f"Daily scheduler: couldn't resolve channel {DAILY_IMAGE_CHANNEL_ID}: {e}")
+        return
+
+    for entry, day in due:
+        if draining:
+            return
+        # Persist fired-state BEFORE running the slot: if the bot crashes mid-
+        # generation, a restart must not re-fire it (which would re-spend API budget
+        # and double-post the same slot).
+        state = daily_schedule.mark_fired(state, entry["id"], day)
+        daily_schedule.save_state(state, DAILY_STATE_FILE)
+        try:
+            await _run_daily_slot(channel, entry, day)
+        except Exception:
+            logger.exception(f"Daily scheduler: slot {entry.get('id')} failed")
+
+
+async def _retry_delay():
+    """Sleep the scheduler's 2-minute retry delay, checking `draining` both before
+    and after so a shutdown mid-wait doesn't (a) block close() by sleeping through it,
+    or (b) start a retry the drain is about to cut off anyway. Returns True if it's
+    still safe to retry, False if draining started during (or before) the wait."""
+    if draining:
+        return False
+    await asyncio.sleep(120)
+    return not draining
+
+
+async def _do_the_art_with_retry(ctx, prompt, request_type, model, **kwargs):
+    """Run do_the_art (always quiet=True -- every scheduler call is), retrying once
+    after a 2-minute delay if the first attempt failed. Returns the ArtResult on
+    success, or False if both attempts failed (or draining cut the retry short).
+
+    Skips the retry (and its 2-minute sleep) entirely when the first failure was
+    the monthly cap: do_the_art already posted "Monthly limit reached..." once, and
+    the retry would just hit the same cap and post the same message again, all
+    while stalling the scheduler loop for 2 minutes for no benefit -- once
+    API_LIMIT is reached this would otherwise repeat for every one of the day's
+    remaining slots. _run_daily_slot still posts FAILURE_MESSAGE once afterward,
+    so the caller-visible contract (one failure notice per failed slot) is
+    unchanged; only the pointless second attempt goes away.
+    """
+    result = await do_the_art(ctx, prompt, request_type, model, quiet=True, **kwargs)
+    if result:
+        return result
+    if over_limit(load_data()):
+        return False
+    if not await _retry_delay():
+        return False
+    return await do_the_art(ctx, prompt, request_type, model, quiet=True, **kwargs)
+
+
+def _daily_image_path(day):
+    return os.path.join(DAILY_IMAGES_DIR, daily_schedule.daily_image_filename(day))
+
+
+def _read_daily_image(path):
+    """Read a retained daily base PNG, or None if it doesn't exist / can't be read."""
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _save_daily_image(path, image_bytes):
+    """Persist a retained daily base image, then prune down to DAILY_IMAGE_RETENTION
+    newest. The image has already been posted to Discord by the time this runs, so
+    disk trouble here must not fail the slot -- log it and move on."""
+    try:
+        with open(path, "wb") as f:
+            f.write(image_bytes)
+        for name in daily_schedule.select_images_to_prune(os.listdir(DAILY_IMAGES_DIR)):
+            os.remove(os.path.join(DAILY_IMAGES_DIR, name))
+    except OSError as e:
+        logger.error(f"Daily scheduler: failed to save/prune retained image at {path}: {e}")
+
+
+async def _run_daily_slot(channel, entry, day):
+    """Run one due schedule slot: "generate" posts the day's deterministic base image
+    (announcing it, with an optional magic roll); "edit" edits today's retained base
+    (recovering it first, silently, if a previous generate never ran/succeeded).
+
+    The generated prompt is logged, never posted -- only the announcement + image
+    (and, for a failure, the fixed FAILURE_MESSAGE) is ever visible in the channel.
+    """
+    ctx = _ChannelContext(channel)
+    base_path = _daily_image_path(day)
+
+    if entry["type"] == "generate":
+        prompt, seed, ver = release_image.build_release_prompt(daily_schedule.seed_source_for(day))
+        logger.info(f"Daily image for {day.isoformat()}: seed={seed} v{ver} prompt={prompt}")
+
+        magic = False
+        if entry.get("magic"):
+            prompt, magic = maybe_apply_magic_paint(prompt)
+
+        message = daily_schedule.render_message(entry["message"], day)
+        if magic:
+            message += " 🖌️"
+            _bump_magic_counter()
+        await ctx.send(message)
+
+        result = await _do_the_art_with_retry(ctx, prompt, "daily_image", IMAGE_MODEL)
+        if not result:
+            await ctx.send(FAILURE_MESSAGE)
+            return
+        _save_daily_image(base_path, result.image_bytes)
+        return
+
+    # entry["type"] == "edit": read today's retained base, recovering it first (no
+    # announcement, no magic roll -- base recovery is plumbing, not the day's event)
+    # if it's missing.
+    png_bytes = _read_daily_image(base_path)
+    if png_bytes is None:
+        prompt, seed, ver = release_image.build_release_prompt(daily_schedule.seed_source_for(day))
+        logger.info(f"Daily image for {day.isoformat()} missing; recovering base: seed={seed} v{ver} prompt={prompt}")
+        result = await _do_the_art_with_retry(ctx, prompt, "daily_image", IMAGE_MODEL)
+        if not result:
+            await ctx.send(FAILURE_MESSAGE)
+            return
+        _save_daily_image(base_path, result.image_bytes)
+        png_bytes = result.image_bytes
+
+    # Size the edit off the retained base's OWN dimensions -- mirrors
+    # resolve_edit_size's no-flag default, including its AUTO fallback.
+    dims = image_size.png_dimensions(png_bytes)
+    size = image_size.coerce_generation_size(*dims) if dims else image_size.AUTO
+
+    prompt = entry["edit_prompt"]
+    magic = False
+    if entry.get("magic"):
+        prompt, magic = maybe_apply_magic_paint(prompt)
+
+    message = daily_schedule.render_message(entry["message"], day)
+    if magic:
+        message += " 🖌️"
+        _bump_magic_counter()
+    await ctx.send(message)
+
+    result = await _do_the_art_with_retry(
+        ctx, prompt, "daily_edit", IMAGE_MODEL,
+        images=[(png_bytes, "image/png")], size=size,
+    )
+    if not result:
+        await ctx.send(FAILURE_MESSAGE)
+
+
 def generate_file_name(prompt):
     file_name = re.sub(r'[^0-9a-zA-Z]', '_', prompt)[:50]
     random_string = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(6))
@@ -962,6 +1294,8 @@ async def stats(ctx):
     magic_part = f"Magic applied: {data.get('magic', 0)}"
     remixes_part = f"Remixes: {data.get('remixes', 0)}"
     release_images_part = f"Release images: {data.get('release_images', 0)}"
+    daily_images_part = f"Daily images: {data.get('daily_images', 0)}"
+    daily_edits_part = f"Daily edits: {data.get('daily_edits', 0)}"
     macros_part = f"Macros expanded: {data.get('macros', 0)}"
     macro_misses_part = f"Macros not found: {data.get('macro_misses', 0)}"
     last_change_part = f"Last rate change: {last_change}"
@@ -977,6 +1311,8 @@ async def stats(ctx):
         f"{magic_part}\n"
         f"{remixes_part}\n"
         f"{release_images_part}\n"
+        f"{daily_images_part}\n"
+        f"{daily_edits_part}\n"
         f"{macros_part}\n"
         f"{macro_misses_part}\n"
         f"{last_change_part}"
@@ -1052,4 +1388,9 @@ def get_random_bob_ross_quote():
 
 _seed_magic_library()
 _seed_macro_library()
+_seed_daily_schedule()
+# The Dockerfile's `mkdir -p /app/data/daily_images` is masked once data/ is a bind
+# mount (run.sh mounts the host data dir over /app/data), so ensure the retained-
+# image directory exists here too, at startup, every time.
+os.makedirs(DAILY_IMAGES_DIR, exist_ok=True)
 bot.run(DISCORD_BOT_TOKEN)

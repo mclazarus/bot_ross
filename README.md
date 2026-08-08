@@ -22,8 +22,22 @@ Bot Ross is a Discord bot that generates images using OpenAI's image models. Cha
 | `&macro_add <id> <text>` | Add a ;macro — the id is what you type as `;<id>` in a prompt |
 | `&macro_update <id> <text>` | Update a ;macro's text in place, recording you as editor |
 | `&macro_remove <id>` | Remove a ;macro by id |
-| `&stats` | Show uptime, monthly request count, limit, and magic/remix/release-image/macro activity |
+| `&stats` | Show uptime, monthly request count, limit, and magic/remix/release-image/daily-image/macro activity |
 | `&ping` | Check bot latency |
+
+## Daily image of the day
+
+If `DAILY_IMAGE_CHANNEL_ID` is set, Bot Ross posts a deterministic "image of the day"
+every morning (07:00, its prompt derived from the date the same way `&release_image`
+derives one from a git hash), then posts themed edits of that same retained image at
+lunch (12:00), quitting time (17:00), and bedtime (22:00) — all wall-clock in
+`BOT_TIMEZONE` (default `America/New_York`), not the container's own clock. The
+generated prompt is never shown in the channel, only the announcement and the image.
+Retained base images live at `data/daily_images/`, pruned to the newest 14; the
+schedule itself is editable by hand at `data/daily_schedule.json` (seeded from the
+image on first run, same working-copy pattern as the magic/macro libraries) — add,
+remove, retime, or reword a slot, or flip its `magic` flag, without a code change.
+Set `DAILY_IMAGE_ENABLED=false` to turn the whole thing off.
 
 ## Macros
 
@@ -77,7 +91,7 @@ closely as a valid size allows.) `--res` wins if you give both an orientation fl
 
 If a `bot_ross` container is already running, `run.sh` will stop and remove it before starting the new one. The stop **drains in-flight image generations**: on SIGTERM the bot stops accepting new commands and waits (up to `DRAIN_TIMEOUT` seconds) for running generations to finish before exiting, so a redeploy doesn't drop paintings mid-flight. `run.sh` uses `docker stop -t $STOP_TIMEOUT` (default `90`, override via the `STOP_TIMEOUT` env var) — keep it above `DRAIN_TIMEOUT` so the bot exits on its own before Docker force-kills. When a host is provided, `DOCKER_HOST=ssh://<host>` is set so all docker commands run against the remote daemon — the `.env` file is read locally and never copied to the remote host.
 
-The `data/` directory stores monthly request counts, stats, the working magic-mixin library (`data/magic_prompts.json`), and the working macro library (`data/macros.json`) — mount a host path to persist them across container restarts and redeploys. On startup the bot seeds both `data/magic_prompts.json` and `data/macros.json` from the image's bundled defaults only if they aren't already present, so mixins/macros added via `&magic_add`/`&macro_add` survive image rebuilds.
+The `data/` directory stores monthly request counts, stats, the working magic-mixin library (`data/magic_prompts.json`), the working macro library (`data/macros.json`), the working daily-image schedule (`data/daily_schedule.json`), the daily scheduler's fired-slot bookkeeping (`data/daily_state.json`), and the retained daily base images (`data/daily_images/`) — mount a host path to persist them across container restarts and redeploys. On startup the bot seeds `data/magic_prompts.json`, `data/macros.json`, and `data/daily_schedule.json` from the image's bundled defaults only if they aren't already present, so mixins/macros/schedule edits added via the bot's commands (or by hand, for the schedule) survive image rebuilds.
 
 ## Running locally
 
@@ -101,3 +115,6 @@ All options are set via environment variables (see `env.example`):
 | `MEME_MODEL` | `gpt-5.4-mini` | GPT model used to generate meme prompts |
 | `MAGIC_PAINT_RATE` | `0.05` | Chance (0.0-1.0) that `&paint`/`&remix` silently appends a background gag to the prompt |
 | `DRAIN_TIMEOUT` | `60` | Seconds to let in-flight image generations finish on shutdown before the bot closes |
+| `BOT_TIMEZONE` | `America/New_York` | IANA timezone the daily-image schedule's slot times are wall-clock in. An unknown zone falls back to UTC with a logged warning |
+| `DAILY_IMAGE_CHANNEL_ID` | unset | Discord channel id the daily image/edits post to. Unset disables the scheduler |
+| `DAILY_IMAGE_ENABLED` | `true` | Set `false` to disable the daily-image scheduler outright, even with a channel id configured |
