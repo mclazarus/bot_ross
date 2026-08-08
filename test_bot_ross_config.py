@@ -29,9 +29,7 @@ import bot_ross
 REPO = os.path.dirname(os.path.abspath(__file__))
 BASE_ENV = {"OPENAI_API_KEY": "test-openai-key", "DISCORD_BOT_TOKEN": "test-discord-token"}
 
-# The 14 globals load_config() reassigns, plus openai.api_key -- the legacy
-# SDK's own auth global, which load_config also sets as a transitional
-# side effect (see load_config's `# transitional` comment).
+# The 14 globals load_config() reassigns.
 _CONFIG_GLOBALS = (
     "OPENAI_API_KEY", "DISCORD_BOT_TOKEN", "LIMIT", "IMAGE_MODEL", "IMAGE_MODERATION",
     "MEME_MODEL", "MAGIC_PAINT_RATE", "DRAIN_TIMEOUT", "BOT_TIMEZONE", "BOT_ZONE",
@@ -43,22 +41,19 @@ _CONFIG_GLOBALS = (
 class ConfigMutationTestCase(unittest.TestCase):
     """Base class for any test that calls load_config() in-process.
 
-    load_config() mutates process-wide module state (bot_ross's globals,
-    plus the openai SDK's own `openai.api_key` global) -- without snapshot/
-    restore, a leaked override from one test would silently change the
-    "unconfigured import" defaults every OTHER test in this process relies
-    on, in whatever order unittest happens to run them. setUp/tearDown make
-    each test's mutation local to itself.
+    load_config() mutates process-wide module state (bot_ross's globals) --
+    without snapshot/restore, a leaked override from one test would silently
+    change the "unconfigured import" defaults every OTHER test in this
+    process relies on, in whatever order unittest happens to run them.
+    setUp/tearDown make each test's mutation local to itself.
     """
 
     def setUp(self):
         self._snapshot = {name: getattr(bot_ross, name) for name in _CONFIG_GLOBALS}
-        self._snapshot_openai_api_key = bot_ross.openai.api_key
 
     def tearDown(self):
         for name, value in self._snapshot.items():
             setattr(bot_ross, name, value)
-        bot_ross.openai.api_key = self._snapshot_openai_api_key
 
 
 class ImportSafetyTest(unittest.TestCase):
@@ -202,13 +197,16 @@ class LoadConfigParsingTest(ConfigMutationTestCase):
         self.assertIsNone(bot_ross.DAILY_IMAGE_CHANNEL_ID)
         self.assertIs(bot_ross.DAILY_CHANNEL_MISCONFIGURED, False)
 
-    def test_openai_api_key_sdk_global_is_kept_in_sync(self):
-        # M7 -- get_meme_prompt still authenticates via the v0.27 SDK global
-        # until C4; forgetting this assignment doesn't degrade &meme, it
-        # kills it outright (auth raises before the two-black-cats fallback
-        # is ever reached).
-        bot_ross.load_config(dict(BASE_ENV))
-        self.assertEqual(bot_ross.openai.api_key, "test-openai-key")
+    # M7 (test_openai_api_key_sdk_global_is_kept_in_sync) retired in C4: its
+    # subject, the legacy `openai.api_key` SDK global, no longer exists in
+    # production -- C4 deleted `import openai` and get_meme_prompt now
+    # authenticates via _fetch_meme_prompt's OPENAI_API_KEY closure, same as
+    # fetch_image/fetch_image_edit. The property it protected -- that the
+    # secret from load_config() actually reaches the fetchers -- is now
+    # carried by test_minimal_env_matches_unconfigured_defaults's (M6)
+    # `assertEqual(bot_ross.OPENAI_API_KEY, "test-openai-key")` above, plus
+    # test_bot_ross_source.FetchFunctionsUseOpenAIKeyConstantTest, which pins
+    # that the fetchers read the OPENAI_API_KEY constant by name.
 
     def test_non_secret_values_are_parsed(self):
         # M8

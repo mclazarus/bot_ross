@@ -502,6 +502,19 @@ class ImportSafetyTest(unittest.TestCase):
             self.assertIs(mod.DAILY_CHANNEL_MISCONFIGURED, True)
 
 
+class OpenAISDKNotImportedTest(unittest.TestCase):
+    """T9 (C4): guards a lurking direct/transitive `import openai` anywhere in
+    the import graph. Would still pass locally today -- the 3.12 .venv keeps
+    the openai package installed until C6's rebuild -- but would crash-loop the
+    eventual 3.14 container, the exact invisible-import-failure class this
+    whole dependency-refresh plan exists to close. NOT a BotTestCase: this is
+    a property of the module already imported at the top of this file, not
+    something that needs the data/-redirecting harness."""
+
+    def test_openai_is_not_in_sys_modules(self):
+        self.assertNotIn("openai", sys.modules)
+
+
 # =========================================================================== #
 # B. Harness self-checks
 # =========================================================================== #
@@ -1291,6 +1304,107 @@ class ChannelContextTest(BotTestCase):
 # O. &meme
 # =========================================================================== #
 
+# C4: get_meme_prompt no longer calls the openai SDK -- it POSTs through
+# _fetch_meme_prompt (bot_ross module global, resolved at call time), in
+# fetch_image's raw-aiohttp style. GetMemePromptTest (T1-T5) drives
+# get_meme_prompt() directly with _fetch_meme_prompt faked, so no test in
+# this section ever touches aiohttp or the network. MemeCommandTest's T6-T8
+# additions drive the same fake through the real &meme command, on top of
+# FakeImageAPI, to prove the rewritten prompt actually reaches fetch_image
+# (or doesn't, on a transport failure) end to end.
+
+class GetMemePromptTest(BotTestCase):
+    def _patch_fetch(self, fake):
+        self.enterContext(mock.patch.object(bot_ross, "_fetch_meme_prompt", fake))
+
+    async def test_content_reaches_caller_stripped(self):
+        # T1
+        async def fake(payload):
+            return {"choices": [{"message": {"content": "  A frog in a suit  "}}]}
+
+        self._patch_fetch(fake)
+        self.assertEqual(await bot_ross.get_meme_prompt("frogs"), "A frog in a suit")
+
+    async def test_payload_is_exactly_model_and_messages(self):
+        # T2 -- the live-400 guard: no max_tokens, no temperature, nothing but
+        # what the old SDK call sent.
+        captured = {}
+
+        async def fake(payload):
+            captured.update(payload)
+            return {"choices": [{"message": {"content": "x"}}]}
+
+        self._patch_fetch(fake)
+        await bot_ross.get_meme_prompt("frogs")
+        self.assertEqual(set(captured.keys()), {"model", "messages"})
+        self.assertEqual(captured["model"], bot_ross.MEME_MODEL)
+        self.assertEqual(len(captured["messages"]), 2)
+        self.assertEqual([m["role"] for m in captured["messages"]], ["system", "user"])
+        self.assertEqual(
+            captured["messages"][1]["content"],
+            "Create a prompt for an image meme based on the following idea: frogs",
+        )
+
+    async def test_no_suggestion_uses_wildest_imagination_line(self):
+        # T3
+        captured = {}
+
+        async def fake(payload):
+            captured.update(payload)
+            return {"choices": [{"message": {"content": "x"}}]}
+
+        self._patch_fetch(fake)
+        await bot_ross.get_meme_prompt(None)
+        self.assertEqual(
+            captured["messages"][1]["content"],
+            "Create a prompt for an image meme based on your wildest imagination.",
+        )
+
+    async def test_every_bad_shape_falls_back_and_logs_both_lines(self):
+        # T4 -- the assertLogs requirement: the fallback can never again be
+        # silent. `data` not a dict raises TypeError, missing/empty `choices`
+        # raises KeyError/IndexError, missing message/content raises KeyError,
+        # content=None raises AttributeError on .strip() -- all five must
+        # converge on the same fallback string AND the same two log lines.
+        bad_shapes = [
+            {},
+            {"choices": []},
+            {"choices": [{"message": {}}]},
+            {"choices": [{"message": {"content": None}}]},
+            [],
+        ]
+        for data in bad_shapes:
+            with self.subTest(data=data):
+                async def fake(payload, _data=data):
+                    return _data
+
+                self._patch_fetch(fake)
+                with self.assertLogs("bot_ross", level="WARNING") as cm:
+                    result = await bot_ross.get_meme_prompt("x")
+                self.assertEqual(
+                    result, "Two fluffy black cats trying to fix a broken robot based on Bob Ross"
+                )
+                error_records = [r for r in cm.records if r.levelname == "ERROR"]
+                warning_records = [r for r in cm.records if r.levelname == "WARNING"]
+                self.assertTrue(
+                    any("Meme prompt response had an unexpected shape" in r.getMessage() for r in error_records)
+                )
+                self.assertTrue(
+                    any("Falling back to the hardcoded meme prompt" in r.getMessage() for r in warning_records)
+                )
+
+    async def test_transport_failure_raises_never_falls_back(self):
+        # T5 -- the anti-"two-black-cats-forever" test: a 401/wrong-URL must
+        # abort, not paint. Proves the try/except around the parse can't
+        # swallow a transport/status failure raised OUTSIDE it.
+        async def fake(payload):
+            raise RuntimeError("boom")
+
+        self._patch_fetch(fake)
+        with self.assertRaises(RuntimeError):
+            await bot_ross.get_meme_prompt("x")
+
+
 class MemeCommandTest(BotTestCase):
     def setUp(self):
         super().setUp()
@@ -1316,6 +1430,58 @@ class MemeCommandTest(BotTestCase):
         await cmd("meme")(ctx)
         self.assertEqual(ctx.channel.texts[0], "Generating meme prompt based on GPTs wildest imagination.")
         self.assertEqual(self.meme_calls, [None])
+
+
+class MemeCommandFetchIntegrationTest(BotTestCase):
+    """Drives &meme with bot_ross._fetch_meme_prompt faked directly (rather than
+    get_meme_prompt, as MemeCommandTest does above) -- proves the rewritten chat
+    call's result actually reaches fetch_image end to end, and that a transport
+    failure spends no image generation."""
+
+    def _patch_fetch(self, fake):
+        self.enterContext(mock.patch.object(bot_ross, "_fetch_meme_prompt", fake))
+
+    async def test_meme_prompt_reaches_fetch_image_end_to_end(self):
+        # T6
+        async def fake(payload):
+            return {"choices": [{"message": {"content": "A meme about chairs"}}]}
+
+        self._patch_fetch(fake)
+        ctx = self.make_ctx()
+        await cmd("meme")(ctx, prompt="office chairs")
+        self.assertEqual(self.api.generate_calls[0].prompt, "A meme about chairs")
+        self.assertEqual(self.api.generate_calls[0].model, bot_ross.IMAGE_MODEL)
+        self.assertIn("Generated prompt: A meme about chairs", ctx.channel.texts)
+        self.assertEqual(self.read_data().get("memes"), 1)
+
+    async def test_transport_failure_spends_no_image(self):
+        # T7 -- confirms the failure ordering: prompt fetch fails => zero API spend.
+        async def fake(payload):
+            raise RuntimeError("boom")
+
+        self._patch_fetch(fake)
+        ctx = self.make_ctx()
+        with self.assertRaises(RuntimeError):
+            await cmd("meme")(ctx, prompt="office chairs")
+        self.assertEqual(self.api.call_count, 0)
+        self.assertFalse(any(t.startswith("Generated prompt:") for t in ctx.channel.texts))
+        self.assertNotIn(bot_ross.get_current_month(), self.read_data())
+
+    async def test_fallback_path_still_paints_and_warns(self):
+        # T8 -- the degraded mode is intentionally still functional; it just
+        # can no longer be quiet about it.
+        async def fake(payload):
+            return {}
+
+        self._patch_fetch(fake)
+        ctx = self.make_ctx()
+        with self.assertLogs("bot_ross", level="WARNING"):
+            await cmd("meme")(ctx, prompt="office chairs")
+        self.assertEqual(self.api.call_count, 1)
+        self.assertEqual(
+            self.api.generate_calls[0].prompt,
+            "Two fluffy black cats trying to fix a broken robot based on Bob Ross",
+        )
 
 
 # =========================================================================== #

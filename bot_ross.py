@@ -8,7 +8,6 @@ import json
 import types
 from datetime import datetime, date, timezone
 from discord.ext import commands
-import openai
 import random
 import logging
 import coloredlogs
@@ -88,8 +87,6 @@ def load_config(env=None):
     # Load OpenAI API key and Discord bot token from environment variables
     OPENAI_API_KEY = _require(env, 'OPENAI_API_KEY')
     DISCORD_BOT_TOKEN = _require(env, 'DISCORD_BOT_TOKEN')
-    # transitional: get_meme_prompt still authenticates via the v0.27 SDK global; removed in C4
-    openai.api_key = OPENAI_API_KEY
 
     # Configuration
     LIMIT            = int(env.get('API_LIMIT', 100))
@@ -2201,6 +2198,38 @@ async def stats(ctx):
     # Send the message
     await ctx.send(message)
 
+async def _fetch_meme_prompt(payload):
+    """Raw aiohttp POST to /v1/chat/completions, in fetch_image's style -- replaces
+    the old ChatCompletion.create SDK call. `payload` is the complete JSON
+    body (not just `messages`): payload construction stays in get_meme_prompt, so a
+    test that patches this function can capture the exact key set it was called
+    with, without ever touching aiohttp. That matters because newer OpenAI chat
+    models reject `max_tokens` (they want `max_completion_tokens`) and some reject
+    a non-default `temperature` -- a live-400 risk if either ever sneaks into the
+    payload unnoticed.
+
+    Deliberately no try/except, no retry loop, and no _classify_image_error here
+    (that helper bumps the image-specific safety_trips counter, which would be
+    wrong to touch from the meme-prompt path). A transport or non-200 failure
+    raises straight out of this function and propagates out of get_meme_prompt
+    uncaught, so &meme aborts loudly via on_command_error instead of being mistaken
+    for a response-shape parse failure and silently falling back -- and no image
+    generation is spent, since the command never reaches do_the_art."""
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json=payload,
+        ) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                raise Exception(f"meme prompt response: {response.status}: {error_text}")
+            return await response.json()
+
+
 async def get_meme_prompt(user_prompt):
     if user_prompt:
         chat_prompt = f"Create a prompt for an image meme based on the following idea: {user_prompt}"
@@ -2217,17 +2246,15 @@ async def get_meme_prompt(user_prompt):
         {"role": "system", "content": system_message},
         {"role": "user", "content": chat_prompt}
     ]
-    response = await asyncio.get_event_loop().run_in_executor(
-        None, lambda: openai.ChatCompletion.create(model=MEME_MODEL, messages=messages)
-    )
-    logger.debug(f"Meme GPT response: {response}")
+    data = await _fetch_meme_prompt({"model": MEME_MODEL, "messages": messages})
+    logger.debug(f"Meme GPT response: {data}")
 
     try:
-        dall_e_prompt = response['choices'][0]['message']['content'].strip()
-    except Exception:
-        dall_e_prompt = "Two fluffy black cats trying to fix a broken robot based on Bob Ross"
-
-    return dall_e_prompt
+        return data['choices'][0]['message']['content'].strip()
+    except Exception as e:
+        logger.error(f"Meme prompt response had an unexpected shape: {e!r}")
+        logger.warning("Falling back to the hardcoded meme prompt")
+        return "Two fluffy black cats trying to fix a broken robot based on Bob Ross"
 
 
 def over_limit(data):

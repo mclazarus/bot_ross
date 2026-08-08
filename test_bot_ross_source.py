@@ -11,8 +11,8 @@ negative check, main()'s makedirs-before-seed ordering, and the Dockerfile's
 Python floor) -- plus main()'s and load_config()'s own statement-level shape
 (the `__main__` guard, no import-time side effects, setup_logging-before-
 load_config-before-makedirs-before-seed ordering, the completeness of
-load_config's `global` list, and the fetchers reading OPENAI_API_KEY rather
-than the transitional openai.api_key) -- plus a handful of classes that were
+load_config's `global` list, and the fetchers authenticating via the
+OPENAI_API_KEY constant) -- plus a handful of classes that were
 candidates for retirement here but are still AST-only because
 test_bot_ross_commands.py does not yet drive the specific scenario that would
 supersede them. Each such class's docstring says so explicitly, and the
@@ -1054,13 +1054,13 @@ class LoadConfigGlobalListTest(unittest.TestCase):
 
 
 class FetchFunctionsUseOpenAIKeyConstantTest(unittest.TestCase):
-    """fetch_image and fetch_image_edit must authenticate via the module-level
+    """fetch_image and fetch_image_edit authenticate via the module-level
     OPENAI_API_KEY constant, not the legacy `openai.api_key` SDK global --
-    the two are kept in sync only transitionally (see load_config's
-    `# transitional` comment) until C4 removes the SDK entirely. Left half of
-    each test prevents the C4 time bomb: if a header were still reading
-    openai.api_key, deleting `import openai` in C4 would break both image
-    endpoints outright."""
+    C4 deleted `import openai` and that global along with it, so this is now
+    a permanent regression guard against reintroducing it, not a transitional
+    sync check. If a header referenced openai.api_key again, it would be an
+    outright NameError at &paint/&remix time (there is no `openai` module
+    imported to hold that attribute anymore)."""
 
     def _asserts_no_openai_api_key_attr(self, func_node, label):
         offenders = [
@@ -1070,10 +1070,9 @@ class FetchFunctionsUseOpenAIKeyConstantTest(unittest.TestCase):
         ]
         self.assertEqual(
             offenders, [],
-            f"{label} must not reference openai.api_key -- it's the "
-            "transitional SDK global assigned in load_config for "
-            "get_meme_prompt's benefit; a header still reading it would "
-            "break outright once C4 deletes `import openai`",
+            f"{label} must not reference openai.api_key -- C4 deleted the "
+            "openai SDK entirely, so a header still reading it would raise "
+            "NameError at request time, not merely drift from a live sync",
         )
 
     def _assert_references_openai_api_key_name(self, func_node, label):
@@ -1092,6 +1091,37 @@ class FetchFunctionsUseOpenAIKeyConstantTest(unittest.TestCase):
         node = _load_function("fetch_image_edit")
         self._asserts_no_openai_api_key_attr(node, "fetch_image_edit")
         self._assert_references_openai_api_key_name(node, "fetch_image_edit")
+
+    def test_fetch_meme_prompt(self):
+        # _fetch_meme_prompt (C4) is the third function POSTing to
+        # api.openai.com with a Bearer header, and the only one whose body
+        # is never exercised behaviorally (test_bot_ross_commands.py patches
+        # it out wholesale as a fake, so it never runs for real there) --
+        # this AST check is the only thing that would catch a future edit
+        # that reached for openai.api_key instead of the OPENAI_API_KEY
+        # constant.
+        node = _load_function("_fetch_meme_prompt")
+        self._asserts_no_openai_api_key_attr(node, "_fetch_meme_prompt")
+        self._assert_references_openai_api_key_name(node, "_fetch_meme_prompt")
+
+
+class RequirementsNoLongerListOpenAITest(unittest.TestCase):
+    """T10 (C4): guards reintroduction via a future merge resolution. C4 dropped
+    the openai SDK entirely (get_meme_prompt now POSTs through _fetch_meme_prompt,
+    the same raw-aiohttp style as the image endpoints) -- requirements.txt must
+    never list it again."""
+
+    REQUIREMENTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requirements.txt")
+
+    def test_no_openai_requirement_line(self):
+        with open(self.REQUIREMENTS_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        offenders = [line for line in lines if re.match(r"^openai\b", line)]
+        self.assertEqual(
+            offenders, [],
+            f"requirements.txt still lists openai: {offenders!r} -- C4 dropped the SDK "
+            "entirely in favor of a raw aiohttp POST (_fetch_meme_prompt)",
+        )
 
 
 if __name__ == "__main__":
