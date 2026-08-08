@@ -1,5 +1,4 @@
 discord.py~=2.3.2
 aiohttp~=3.9.2
-asyncio~=3.4.3
 coloredlogs~=15.0.1
 tzdata~=2025.1

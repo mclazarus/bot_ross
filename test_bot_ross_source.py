@@ -1124,5 +1124,29 @@ class RequirementsNoLongerListOpenAITest(unittest.TestCase):
         )
 
 
+class RequirementsNoLongerListAsyncioBackportTest(unittest.TestCase):
+    """T11 (C4b): the PyPI package `asyncio` is a 2015 backport of the (then-new)
+    stdlib module of the same name. `pip install -r requirements.txt` genuinely
+    places it in site-packages, but it has been inert on every Python this repo
+    has ever run on: the stdlib `asyncio` always wins on `sys.path` first, so the
+    installed backport is never actually imported. The line pinned nothing,
+    protected nothing, and only misled a reader into thinking asyncio was a
+    third-party dependency here -- nothing may ever depend on that accident
+    again, so this guards the line's reintroduction the same way T10 guards
+    openai's."""
+
+    REQUIREMENTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requirements.txt")
+
+    def test_no_asyncio_requirement_line(self):
+        with open(self.REQUIREMENTS_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        offenders = [line for line in lines if re.match(r"^asyncio\b", line)]
+        self.assertEqual(
+            offenders, [],
+            f"requirements.txt still lists asyncio: {offenders!r} -- it is the inert "
+            "2015 PyPI backport, shadowed by stdlib on sys.path; C4b removed it",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
