@@ -17,6 +17,8 @@ one way each:
 Run from the repo root:  python -m unittest test_bot_ross_config -v
 """
 
+import io
+import logging
 import os
 import subprocess
 import sys
@@ -36,6 +38,20 @@ _CONFIG_GLOBALS = (
     "DAILY_IMAGE_ENABLED", "_raw_daily_channel", "DAILY_IMAGE_CHANNEL_ID",
     "DAILY_CHANNEL_MISCONFIGURED",
 )
+
+
+def _record(level, msg="hello", exc_info=None):
+    # A minimal LogRecord; name/pathname/lineno are arbitrary but fixed --
+    # only levelno/msg/exc_info vary across the tests that use this.
+    return logging.LogRecord("bot_ross", level, __file__, 1, msg, (), exc_info)
+
+
+class _TtyStringIO(io.StringIO):
+    """A StringIO that claims to be a real terminal -- the only way to drive
+    the color path in-process, since a real tty isn't available under test."""
+
+    def isatty(self):
+        return True
 
 
 class ConfigMutationTestCase(unittest.TestCase):
@@ -147,6 +163,49 @@ class ImportSafetyTest(unittest.TestCase):
         stderr = result.stderr.decode()
         self.assertEqual(result.returncode, 1, f"stderr was: {stderr}")
         self.assertIn("DISCORD_BOT_TOKEN", stderr)
+
+    def test_coloredlogs_import_is_gone(self):
+        # C5/16 -- the 3.12 .venv still *has* coloredlogs installed until C6
+        # rebuilds it, so a stale `import coloredlogs` left in bot_ross.py
+        # would pass every other test in this gate. This subprocess check,
+        # inspecting sys.modules after import, is the only thing that
+        # proves the dependency drop is real before C6 removes the package.
+        result = subprocess.run(
+            [
+                sys.executable, "-c",
+                "import bot_ross, sys; "
+                "sys.exit(1 if 'coloredlogs' in sys.modules else 0)",
+            ],
+            cwd=self.tmpdir,
+            env={"PYTHONPATH": REPO},
+            capture_output=True,
+            timeout=60,
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            f"coloredlogs was imported: {result.stderr.decode()}",
+        )
+
+    def test_default_setup_logging_to_a_pipe_emits_no_escape_codes(self):
+        # C5/17 -- the only test exercising the default stream=None ->
+        # sys.stderr path. A subprocess's stderr, captured through a pipe,
+        # is a non-tty -- exactly how Docker captures the process.
+        result = subprocess.run(
+            [
+                sys.executable, "-c",
+                "import bot_ross; bot_ross.setup_logging(); "
+                "bot_ross.logger.warning('pipe smoke')",
+            ],
+            cwd=self.tmpdir,
+            env={"PYTHONPATH": REPO},
+            capture_output=True,
+            timeout=60,
+        )
+        stderr = result.stderr.decode()
+        self.assertEqual(result.returncode, 0, f"stderr was: {stderr}")
+        self.assertIn("bot_ross[", stderr)
+        self.assertIn("pipe smoke", stderr)
+        self.assertNotIn("\x1b", stderr)
 
 
 class LoadConfigDefaultsTest(unittest.TestCase):
@@ -312,6 +371,181 @@ class LoadConfigParsingTest(ConfigMutationTestCase):
         with mock.patch.dict(os.environ, {**BASE_ENV, "API_LIMIT": "7"}, clear=True):
             bot_ross.load_config()
         self.assertEqual(bot_ross.LIMIT, 7)
+
+
+class AnsiLevelFormatterTest(unittest.TestCase):
+    """Pure formatter tests -- no I/O, no tmpdir, no root-logger state."""
+
+    def test_non_color_output_has_no_escape_codes(self):
+        # 1 -- ERROR on purpose: the *most* colorable level must still be
+        # plain when color is off. This is the docker-logs guarantee at
+        # formatter level.
+        out = bot_ross.AnsiLevelFormatter(use_color=False).format(_record(logging.ERROR))
+        self.assertNotIn("\x1b", out)
+
+    def test_non_color_line_shape_keeps_milliseconds(self):
+        # 2 -- pins the full line shape: date, comma-milliseconds (the
+        # milliseconds=True coloredlogs was configured for), name[pid],
+        # levelname, message -- and, via $, that nothing else crept in
+        # (like the dropped hostname field).
+        out = bot_ross.AnsiLevelFormatter(use_color=False).format(_record(logging.INFO))
+        self.assertRegex(
+            out, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} bot_ross\[\d+\] INFO hello$"
+        )
+
+    def test_info_renders_plain_even_in_color_mode(self):
+        # 3 -- INFO is deliberately uncolored, mirroring coloredlogs' own
+        # uncolored 'info' style. Same record object both times so asctime
+        # is identical.
+        record = _record(logging.INFO)
+        self.assertEqual(
+            bot_ross.AnsiLevelFormatter(use_color=True).format(record),
+            bot_ross.AnsiLevelFormatter(use_color=False).format(record),
+        )
+
+    def test_each_colored_level_gets_its_exact_prefix(self):
+        # 4
+        cases = (
+            (logging.DEBUG, "\x1b[32m"),
+            (logging.WARNING, "\x1b[33m"),
+            (logging.ERROR, "\x1b[31m"),
+            (logging.CRITICAL, "\x1b[1;31m"),
+        )
+        for level, prefix in cases:
+            with self.subTest(level=level):
+                out = bot_ross.AnsiLevelFormatter(use_color=True).format(_record(level))
+                self.assertTrue(out.startswith(prefix))
+                self.assertTrue(out.endswith("\x1b[0m"))
+
+    def test_color_wraps_but_never_alters_the_line(self):
+        # 5 -- color is wrapping only: grep/alert tooling reading docker
+        # logs and a human on a TTY must see the same text.
+        record = _record(logging.WARNING)
+        plain = bot_ross.AnsiLevelFormatter(use_color=False).format(record)
+        colored = bot_ross.AnsiLevelFormatter(use_color=True).format(record)
+        self.assertEqual(colored, "\x1b[33m" + plain + "\x1b[0m")
+
+    def test_color_prefixes_are_pairwise_distinct(self):
+        # 6 -- every colored level renders distinctly (and INFO is distinct
+        # from all four by having no prefix at all; that's test 3).
+        colors = bot_ross.AnsiLevelFormatter.LEVEL_COLORS.values()
+        self.assertEqual(len(set(colors)), 4)
+        self.assertNotIn("", colors)
+
+    def test_unknown_levelno_renders_plain_not_keyerror(self):
+        # 7 -- bad input must degrade to plain, never raise. 25 mirrors a
+        # custom level a la coloredlogs' NOTICE.
+        out = bot_ross.AnsiLevelFormatter(use_color=True).format(_record(25))
+        self.assertNotIn("\x1b", out)
+        self.assertIn("Level 25", out)
+
+    def test_exception_block_wrapped_as_one_unit(self):
+        # 8 -- the multi-line traceback is wrapped once as a block, not
+        # reprocessed line-by-line (which would be subtly easy to get wrong).
+        try:
+            raise ValueError("boom")
+        except ValueError:
+            record = _record(logging.ERROR, exc_info=sys.exc_info())
+        out = bot_ross.AnsiLevelFormatter(use_color=True).format(record)
+        self.assertTrue(out.startswith("\x1b[31m"))
+        self.assertTrue(out.endswith("\x1b[0m"))
+        self.assertEqual(out.count("\x1b[31m"), 1)
+        self.assertEqual(out.count("\x1b[0m"), 1)
+        self.assertIn("ValueError: boom", out)
+
+
+class SetupLoggingTest(unittest.TestCase):
+    """setup_logging() mutates the root logger -- a leaked handler holding a
+    dead stream would swallow or duplicate log output for every other test
+    in this process, in whatever order unittest runs them. Snapshot/restore
+    on every test, the same reasoning as ConfigMutationTestCase."""
+
+    def setUp(self):
+        root = logging.getLogger()
+        self._handlers = root.handlers[:]
+        self._level = root.level
+
+    def tearDown(self):
+        root = logging.getLogger()
+        root.handlers[:] = self._handlers
+        root.setLevel(self._level)
+
+    def test_non_tty_stream_gets_no_escape_codes(self):
+        # 9 -- the production property: docker logs stay escape-free
+        # end-to-end, not just at the formatter. Must log at a colored
+        # level (WARNING, not INFO) -- INFO is never colored regardless of
+        # use_color, so an INFO-only assertion can't distinguish "no color
+        # because non-tty" from "no color because INFO is always plain"
+        # and would pass even if TTY detection were deleted from the wiring.
+        buf = io.StringIO()  # StringIO.isatty() really returns False
+        bot_ross.setup_logging(stream=buf)
+        logging.getLogger("bot_ross").warning("non tty check")
+        output = buf.getvalue()
+        self.assertNotIn("\x1b", output)
+        self.assertRegex(output, r"bot_ross\[\d+\] WARNING non tty check\n$")
+
+    def test_tty_stream_gets_colors(self):
+        # 10
+        tty = _TtyStringIO()
+        bot_ross.setup_logging(stream=tty)
+        logging.getLogger("bot_ross").warning("tty check")
+        output = tty.getvalue()
+        self.assertIn("\x1b[33m", output)
+        self.assertIn("\x1b[0m", output)
+
+    def test_root_wiring_matches_the_old_coloredlogs_end_state(self):
+        # 11 -- coloredlogs put its handler on root and left the bot_ross
+        # logger bare; drifting from that would double-print or orphan
+        # discord.py's logs.
+        buf = io.StringIO()
+        bot_ross.setup_logging(stream=buf)
+        root = logging.getLogger()
+        self.assertEqual(len(root.handlers), 1)
+        self.assertEqual(root.level, logging.INFO)
+        self.assertIsInstance(root.handlers[0].formatter, bot_ross.AnsiLevelFormatter)
+        self.assertIs(root.handlers[0].stream, buf)
+        self.assertEqual(logging.getLogger("bot_ross").handlers, [])
+        self.assertTrue(logging.getLogger("bot_ross").propagate)
+
+    def test_calling_twice_installs_exactly_one_handler(self):
+        # 12 -- failure mode: every line logged twice forever after any
+        # second call.
+        buf = io.StringIO()
+        bot_ross.setup_logging(stream=buf)
+        bot_ross.setup_logging(stream=buf)
+        self.assertEqual(len(logging.getLogger().handlers), 1)
+
+    def test_other_loggers_flow_through_the_root_handler(self):
+        # 13 -- pins that the single root handler still serves
+        # discord.py/aiohttp logs, as the coloredlogs root-replacement did;
+        # losing those would blind the only observability the bot has.
+        buf = io.StringIO()
+        bot_ross.setup_logging(stream=buf)
+        logging.getLogger("discord.client").info("gateway ok")
+        self.assertIn("discord.client[", buf.getvalue())
+
+    def test_debug_is_filtered_at_info(self):
+        # 14 -- same net level filtering as coloredlogs.install(level='INFO').
+        buf = io.StringIO()
+        bot_ross.setup_logging(stream=buf)
+        logging.getLogger("bot_ross").debug("hidden")
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_isatty_failure_means_no_color_not_a_crash(self):
+        # 15 -- a startup crash here would crash-loop under run.sh's
+        # --restart=unless-stopped.
+        class _RaisingIsatty:
+            def isatty(self):
+                raise ValueError("I/O operation on closed file")
+
+        cases = (
+            (_TtyStringIO(), True),
+            (object(), False),
+            (_RaisingIsatty(), False),
+        )
+        for stream, expected in cases:
+            with self.subTest(stream=type(stream).__name__):
+                self.assertEqual(bot_ross._stream_supports_color(stream), expected)
 
 
 if __name__ == "__main__":

@@ -10,11 +10,11 @@ from datetime import datetime, date, timezone
 from discord.ext import commands
 import random
 import logging
-import coloredlogs
 import base64
 import io
 import string
 import re
+import sys
 import release_image
 import magic_paint
 import macros
@@ -64,9 +64,72 @@ def _require(env, name):
     return value
 
 
-def setup_logging():
-    logging.basicConfig(level=logging.INFO)
-    coloredlogs.install(level='INFO', logger=logger, milliseconds=True)
+# %(asctime)s with datefmt=None renders "YYYY-MM-DD HH:MM:SS,mmm" -- identical
+# date + comma-millisecond shape to what coloredlogs(..., milliseconds=True)
+# produced. Do NOT add a custom datefmt here: any datefmt without a %f/msecs
+# placeholder silently drops the milliseconds.
+LOG_FORMAT = "%(asctime)s %(name)s[%(process)d] %(levelname)s %(message)s"
+
+
+class AnsiLevelFormatter(logging.Formatter):
+    """Colors a whole log line by level severity, but only when told to --
+    the formatter never probes its own stream (it doesn't have one; that's
+    setup_logging's job via _stream_supports_color). Docker captures stdout
+    without a tty, so the non-color path must emit zero escape codes: that's
+    the one place this bot is actually observed in production."""
+
+    LEVEL_COLORS = {
+        logging.DEBUG: "\x1b[32m",       # green      -- matches coloredlogs' debug style
+        logging.WARNING: "\x1b[33m",     # yellow
+        logging.ERROR: "\x1b[31m",       # red
+        logging.CRITICAL: "\x1b[1;31m",  # bold red
+    }
+    RESET = "\x1b[0m"
+
+    def __init__(self, use_color):
+        super().__init__(LOG_FORMAT)
+        self.use_color = use_color
+
+    def format(self, record):
+        line = super().format(record)
+        if not self.use_color:
+            return line
+        # INFO is deliberately absent from LEVEL_COLORS (mirrors coloredlogs'
+        # own uncolored 'info' style) -- it's the bulk of log volume, so
+        # coloring it would just be noise. .get(..., "") also means an
+        # unknown/custom levelno degrades to plain instead of KeyError.
+        prefix = self.LEVEL_COLORS.get(record.levelno, "")
+        if not prefix:
+            return line
+        return prefix + line + self.RESET
+
+
+def _stream_supports_color(stream):
+    """False whenever color can't be proven safe -- no isatty attribute, or
+    isatty() itself raising (a closed/exotic stream). Color detection must
+    never be able to crash startup: run.sh restarts this container forever,
+    so a startup crash here would just crash-loop."""
+    try:
+        return bool(stream.isatty())
+    except Exception:
+        return False
+
+
+def setup_logging(stream=None):
+    """Install a single root StreamHandler with AnsiLevelFormatter. Docker
+    captures the bot's output without a tty, and docker logs is the one
+    place this bot is observed in production, so color only ever appears on
+    a real terminal (stream.isatty()) -- never in the captured logs."""
+    stream = sys.stderr if stream is None else stream
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(AnsiLevelFormatter(use_color=_stream_supports_color(stream)))
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    # Force-replace rather than logging.basicConfig(handlers=...), which
+    # silently no-ops once root already has a handler -- that would make
+    # repeated in-process calls (e.g. across tests) order-dependent, and
+    # calling this twice in production would double-print every log line.
+    root.handlers[:] = [handler]
 
 
 def load_config(env=None):

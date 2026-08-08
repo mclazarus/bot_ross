@@ -14,10 +14,11 @@ No escape syntax for a literal `|` -- consistent with macros.py's documented sta
 `;`. A prompt that genuinely needs a pipe character in it can't have one; that's a
 deliberate simplicity trade-off, not an oversight.
 
-Naming note: this module is named pipe_chain.py, not pipes.py, specifically to avoid
-shadowing the stdlib `pipes` module -- a dependency (coloredlogs' converter submodule,
-pulled in transitively) does import and use stdlib `pipes`, and WORKDIR /app in Docker
-puts a same-named local module first on sys.path.
+Naming note: this module is named pipe_chain.py, not pipes.py. WORKDIR /app in Docker
+puts local modules first on sys.path, so a repo module must never share a name with a
+stdlib module or an installed package -- whatever imports that name (even transitively)
+would silently get ours instead. (The historical worry here, stdlib `pipes`, was
+removed from the stdlib in Python 3.13; the general rule is what still holds.)
 """
 
 from typing import NamedTuple
