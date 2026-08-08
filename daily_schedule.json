@@ -1,0 +1,33 @@
+[
+  {
+    "id": "morning",
+    "time": "07:00",
+    "type": "generate",
+    "message": "It's the image of the day for {date}",
+    "magic": false
+  },
+  {
+    "id": "lunch",
+    "time": "12:00",
+    "type": "edit",
+    "edit_prompt": "It's lunchtime!",
+    "message": "Lunch break!",
+    "magic": true
+  },
+  {
+    "id": "quitting_time",
+    "time": "17:00",
+    "type": "edit",
+    "edit_prompt": "It's quiting time at the end of the day",
+    "message": "Have a nice evening!",
+    "magic": true
+  },
+  {
+    "id": "goodnight",
+    "time": "22:00",
+    "type": "edit",
+    "edit_prompt": "Everyone is settling down for night",
+    "message": "Good night",
+    "magic": true
+  }
+]

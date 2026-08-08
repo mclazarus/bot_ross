@@ -22,9 +22,10 @@ DATA_PATH=$2
 HOST=${3:-}
 
 # Grace period for `docker stop` to let the bot drain in-flight image generations before
-# it's force-killed. Must exceed the bot's DRAIN_TIMEOUT (default 60s) so the bot exits on
-# its own first; when idle the bot closes immediately and stop returns right away.
-STOP_TIMEOUT=${STOP_TIMEOUT:-90}
+# it's force-killed. Must exceed the bot's DRAIN_TIMEOUT (default 300s -- raised so a
+# full 5-segment pipe chain, bracketed as one drain unit, has room to finish) so the bot
+# exits on its own first; when idle the bot closes immediately and stop returns right away.
+STOP_TIMEOUT=${STOP_TIMEOUT:-330}
 
 if [ -n "$HOST" ]; then
     export DOCKER_HOST="ssh://$HOST"

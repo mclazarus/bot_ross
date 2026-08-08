@@ -22,12 +22,49 @@ exercise directly.
 
 import math
 import re
+import struct
 
 # The three standard sizes both endpoints accept, reused as the orientation presets.
 SQUARE = "1024x1024"
 LANDSCAPE = "1536x1024"
 PORTRAIT = "1024x1536"
 AUTO = "auto"
+
+
+# --- PNG header parsing --------------------------------------------------------------
+#
+# Used by the daily-image scheduler (daily_schedule.py) to size a scheduled edit off
+# the retained base image's OWN dimensions, mirroring resolve_edit_size's no-flag
+# default below. The OpenAI Images API (both /v1/images/generations and
+# /v1/images/edits) always returns PNG for every call this bot makes, so PNG is the
+# only format this needs to understand -- not a reason to add Pillow as a dependency
+# for an 8-byte struct.unpack.
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+def png_dimensions(data):
+    """Parse a PNG's (width, height) straight out of its IHDR chunk header.
+
+    Returns None -- never raises -- on anything that isn't a well-formed PNG
+    header: `data` not bytes/bytearray, too short, a bad signature (rejects
+    JPEG/GIF/garbage), a first chunk that isn't IHDR (a real PNG's first
+    chunk always is), or either dimension being 0. Returning None rather
+    than raising lets the caller fall back to AUTO exactly like
+    resolve_edit_size already does when Discord reports no usable
+    dimensions for an attachment.
+    """
+    if not isinstance(data, (bytes, bytearray)):
+        return None
+    if len(data) < 24:
+        return None
+    if data[:8] != _PNG_SIGNATURE:
+        return None
+    if data[12:16] != b"IHDR":
+        return None
+    width, height = struct.unpack(">II", data[16:24])
+    if width == 0 or height == 0:
+        return None
+    return width, height
 
 
 def describe_edit_size(size):

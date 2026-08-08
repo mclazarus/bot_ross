@@ -4,7 +4,9 @@
 Run from the repo root:  python -m unittest test_image_size -v
 """
 
+import base64
 import random
+import struct
 import unittest
 
 import image_size
@@ -23,6 +25,7 @@ from image_size import (
     describe_edit_size,
     parse_resolution,
     parse_size_flags,
+    png_dimensions,
     resolve_edit_size,
     resolve_generation_size,
 )
@@ -320,6 +323,108 @@ class ResolveEditSizeTest(unittest.TestCase):
                      (1024, 0), (-100, 1024), ("abc", 1024)]:
             with self.subTest(w=w, h=h):
                 self.assertEqual(resolve_edit_size(width=w, height=h), (AUTO, None))
+
+
+class PngDimensionsTest(unittest.TestCase):
+    """png_dimensions is an 8-byte PNG-header struct.unpack, used by the daily
+    scheduler to size an edit off its retained base image's own dimensions."""
+
+    @staticmethod
+    def _png(w, h):
+        # A real PNG signature + a real IHDR chunk-length/type/dims prefix. The
+        # trailing bit-depth/color-type/etc bytes are present (a real IHDR is 13
+        # bytes) but irrelevant -- png_dimensions never reads past the WxH ints.
+        return (
+            b"\x89PNG\r\n\x1a\n"
+            + struct.pack(">I", 13)
+            + b"IHDR"
+            + struct.pack(">II", w, h)
+            + b"\x08\x06\x00\x00\x00"
+        )
+
+    def test_minimal_real_png(self):
+        self.assertEqual(png_dimensions(self._png(1, 1)), (1, 1))
+
+    def test_realistic_daily_edit_sizes(self):
+        self.assertEqual(png_dimensions(self._png(816, 1024)), (816, 1024))
+        self.assertEqual(png_dimensions(self._png(3840, 2160)), (3840, 2160))
+
+    def test_endianness_is_big_not_little(self):
+        # 257 == 0x0101 -- a little-endian misread of the same 4 bytes would
+        # still decode to *some* integer, so this pins big-endian specifically
+        # rather than just "some plausible number came out".
+        self.assertEqual(png_dimensions(self._png(257, 1)), (257, 1))
+
+    def test_jpeg_bytes_rejected(self):
+        jpeg_like = b"\xff\xd8\xff\xe0" + b"\x00" * 32
+        self.assertIsNone(png_dimensions(jpeg_like))
+
+    def test_truncated_header_rejected(self):
+        # Cuts off mid-IHDR (first 20 of the needed 24 bytes).
+        self.assertIsNone(png_dimensions(self._png(100, 100)[:20]))
+
+    def test_one_byte_short_of_full_header_rejected(self):
+        # 23 bytes is exactly one byte short of the 24-byte window png_dimensions
+        # reads (struct.unpack(">II", data[16:24])). This pins the "< 24" guard
+        # exactly: a looser bound (e.g. "< 20") would let this 23-byte buffer
+        # through and struct.unpack would raise struct.error instead of the
+        # function failing open to None -- and _pipe_edit_once calls
+        # png_dimensions unguarded, so a raise there would abort a chain segment
+        # instead of falling back to AUTO.
+        self.assertIsNone(png_dimensions(self._png(1024, 1024)[:23]))
+
+    def test_real_encoder_produced_png(self):
+        # A genuine 1x1 transparent PNG as emitted by a real encoder (not bytes
+        # laid out by our own _png() helper in the same order the parser reads
+        # them). This independently pins the IHDR width/height byte offsets --
+        # if png_dimensions and _png shared an offset mistake (e.g. both reading
+        # 20:24/24:28), every test above would still pass while every real PNG
+        # would return garbage.
+        real_png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+            "YPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+        )
+        self.assertEqual(png_dimensions(real_png), (1, 1))
+
+    def test_empty_bytes_rejected(self):
+        self.assertIsNone(png_dimensions(b""))
+
+    def test_zero_dimension_rejected(self):
+        # A zero-size "image" must fall back to AUTO in the caller, not
+        # propagate a literal "0x100" size to the API.
+        self.assertIsNone(png_dimensions(self._png(0, 100)))
+        self.assertIsNone(png_dimensions(self._png(100, 0)))
+
+    def test_valid_signature_wrong_first_chunk_rejected(self):
+        # A real PNG's first chunk is always IHDR; IDAT here means this isn't
+        # actually a well-formed PNG header even though the signature matches.
+        bogus = b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IDAT" + struct.pack(">II", 5, 5)
+        self.assertIsNone(png_dimensions(bogus))
+
+    def test_non_bytes_inputs_return_none_not_raise(self):
+        for bad in (None, "daily_image.png", 12345):
+            with self.subTest(bad=bad):
+                self.assertIsNone(png_dimensions(bad))
+
+    def test_bytearray_accepted(self):
+        self.assertEqual(png_dimensions(bytearray(self._png(10, 20))), (10, 20))
+
+    def test_wired_into_resolve_edit_size_when_dimensions_parse(self):
+        # Cross-module: a pipe chain segment sizes itself off the PREVIOUS segment's
+        # own PNG output (see bot_ross.py's _pipe_edit_once), which is exactly
+        # png_dimensions feeding straight into resolve_edit_size's no-flag default.
+        # 1024x1536 is already a valid edit size, so it's kept exactly, unchanged.
+        dims = png_dimensions(self._png(1024, 1536))
+        self.assertEqual(
+            resolve_edit_size(None, None, *dims), ("1024x1536", None)
+        )
+
+    def test_wired_into_resolve_edit_size_falls_back_to_auto_on_garbage(self):
+        # Cross-module fallback: unparseable bytes -> png_dimensions returns None ->
+        # caller falls back to (None, None) -> resolve_edit_size lands on AUTO, the
+        # exact same fallback remix already uses when Discord reports no dimensions.
+        dims = png_dimensions(b"junk") or (None, None)
+        self.assertEqual(resolve_edit_size(None, None, *dims), (AUTO, None))
 
 
 if __name__ == "__main__":
