@@ -1632,6 +1632,75 @@ async def _run_daily_slot(channel, entry, day):
         await ctx.send(FAILURE_MESSAGE)
 
 
+@bot.command(
+    name='daily_image',
+    help="Post today's image of the day. There's no catch-up, so if the scheduler was "
+         "down when the morning slot came due, this paints it on demand. If today's image "
+         "already exists it's reposted as-is rather than repainted (no monthly request spent).",
+)
+async def daily_image_cmd(ctx):
+    """Manual stand-in for a due "generate" slot, for the case the scheduler exists to
+    handle badly: the bot was down at 07:00, the slot fell outside MISS_WINDOW, and
+    (by design) nothing will ever fire it. This does that slot's work on demand.
+
+    Two deliberate differences from the scheduled path:
+
+      - It posts to the INVOKING channel, not DAILY_IMAGE_CHANNEL_ID. It's a command;
+        the requester picked where the output goes. It also means the command still
+        works with the scheduler disabled entirely (no channel configured, or
+        DAILY_IMAGE_ENABLED=false).
+      - If today's base image is already on disk it is REPOSTED verbatim -- no API
+        call, so nothing counts against API_LIMIT, and no second roll of magic paint
+        (the retained PNG already baked in whatever the first roll decided). The
+        day's prompt is deterministic, so repainting would only spend budget to get a
+        different rendering of the same idea.
+
+    The generate path is otherwise identical to _run_daily_slot's: same deterministic
+    prompt, same logged-never-posted rule, same retain-and-prune, same one-retry
+    failure handling.
+    """
+    day = datetime.now(BOT_ZONE).date()
+    base_path = _daily_image_path(day)
+    entry = daily_schedule.find_generate_entry(daily_schedule.load_schedule(DAILY_SCHEDULE_FILE))
+    # Fall back to the seed's own wording if the schedule has no (valid) generate entry
+    # -- the command shouldn't stop working just because someone hand-edited that slot
+    # out of data/daily_schedule.json.
+    template = entry["message"] if entry else "It's the image of the day for {date}"
+    message = daily_schedule.render_message(template, day)
+
+    png_bytes = _read_daily_image(base_path)
+    if png_bytes is not None:
+        logger.info(f"&daily_image by {ctx.author.name}: reposting retained {base_path}")
+        await ctx.send(f"{message}\n♻️ (repost — already painted today)")
+        await ctx.send(file=discord.File(io.BytesIO(png_bytes), daily_schedule.daily_image_filename(day)))
+        return
+
+    prompt, seed, ver = release_image.build_release_prompt(daily_schedule.seed_source_for(day))
+    logger.info(f"&daily_image by {ctx.author.name} for {day.isoformat()}: seed={seed} v{ver} prompt={prompt}")
+
+    magic = False
+    if entry and entry.get("magic"):
+        prompt, magic = maybe_apply_magic_paint(prompt)
+    if magic:
+        message += " 🖌️"
+        _bump_magic_counter()
+    await ctx.send(message)
+
+    result = await _do_the_art_with_retry(ctx, prompt, "daily_image", IMAGE_MODEL)
+    if not result:
+        await ctx.send(FAILURE_MESSAGE)
+        return
+    _save_daily_image(base_path, result.image_bytes)
+
+    # Mark the generate slot fired for today so the scheduler won't post the same
+    # image again if its slot is still inside MISS_WINDOW (running this at 06:58
+    # must not produce a second post at 07:00). Done only after a successful
+    # generate: burning the slot on a failure would defeat the point of the command.
+    if entry:
+        state = daily_schedule.load_state(DAILY_STATE_FILE)
+        daily_schedule.save_state(daily_schedule.mark_fired(state, entry["id"], day), DAILY_STATE_FILE)
+
+
 def generate_file_name(prompt):
     file_name = re.sub(r'[^0-9a-zA-Z]', '_', prompt)[:50]
     random_string = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(6))

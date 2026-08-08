@@ -476,5 +476,88 @@ class DataDirCreatedBeforeSeedingTest(unittest.TestCase):
         )
 
 
+class DailyImageRepostDoesNotRegenerateTest(unittest.TestCase):
+    """&daily_image's headline promise: if today's image was already painted, it is
+    REPOSTED, not repainted. That is what keeps a manual catch-up from silently
+    spending a monthly request (and re-rolling magic) on an image already on disk.
+
+    The whole guarantee is the early `return` in the `if png_bytes is not None:`
+    branch -- one deleted line turns every repost into a fresh generation, and no
+    test that avoids importing bot_ross could otherwise notice. So assert it
+    structurally: nothing inside that branch may reach a generation call.
+    """
+
+    GENERATION_CALLS = ("_do_the_art_with_retry", "do_the_art", "_save_daily_image")
+
+    def _repost_branch(self):
+        """The `if png_bytes is not None:` branch body of daily_image_cmd."""
+        func = _load_function("daily_image_cmd")
+        for node in ast.walk(func):
+            if not isinstance(node, ast.If):
+                continue
+            test = node.test
+            if (
+                isinstance(test, ast.Compare)
+                and isinstance(test.left, ast.Name)
+                and test.left.id == "png_bytes"
+                and any(isinstance(op, ast.IsNot) for op in test.ops)
+            ):
+                return node
+        raise AssertionError("daily_image_cmd has no `if png_bytes is not None:` branch")
+
+    def test_repost_branch_makes_no_generation_call(self):
+        branch = self._repost_branch()
+        for name in self.GENERATION_CALLS:
+            with self.subTest(call=name):
+                found = [
+                    n for n in ast.walk(ast.Module(body=branch.body, type_ignores=[]))
+                    if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Name)
+                    and n.func.id == name
+                ]
+                self.assertEqual(
+                    found, [],
+                    f"the repost path calls {name}() -- reposting must never spend a "
+                    f"generation or rewrite the retained image",
+                )
+
+    def test_repost_branch_rolls_no_magic(self):
+        # The retained PNG already baked in whatever the original roll decided; a
+        # second roll would both mis-count the `magic` stat and imply, via the 🖌️
+        # tell, that this particular image got a mixin when it may not have.
+        branch = self._repost_branch()
+        module = ast.Module(body=branch.body, type_ignores=[])
+        for name in ("maybe_apply_magic_paint", "_apply_random_magic_entry", "_bump_magic_counter"):
+            with self.subTest(call=name):
+                self.assertEqual(
+                    [n for n in ast.walk(module)
+                     if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == name],
+                    [],
+                    f"the repost path calls {name}() -- a repost must not re-roll magic",
+                )
+
+    def test_repost_branch_returns_before_the_generate_path(self):
+        branch = self._repost_branch()
+        self.assertTrue(
+            any(isinstance(n, ast.Return) for n in ast.walk(ast.Module(body=branch.body, type_ignores=[]))),
+            "the repost branch must return -- without it, execution falls through "
+            "into the generate path and repaints the image anyway",
+        )
+
+    def test_generate_path_does_still_generate(self):
+        # Guards the inverse regression: a refactor that made the whole command a
+        # no-op would pass every assertion above.
+        func = _load_function("daily_image_cmd")
+        self.assertTrue(
+            _calls_named(func, "_do_the_art_with_retry"),
+            "daily_image_cmd never generates at all",
+        )
+        self.assertTrue(
+            _calls_named(func, "_save_daily_image"),
+            "daily_image_cmd never retains what it generated, so the next run would "
+            "repaint instead of reposting",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

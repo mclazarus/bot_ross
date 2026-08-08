@@ -22,6 +22,7 @@ Bot Ross is a Discord bot that generates images using OpenAI's image models. Cha
 | `&macro_add <id> <text>` | Add a ;macro — the id is what you type as `;<id>` in a prompt |
 | `&macro_update <id> <text>` | Update a ;macro's text in place, recording you as editor |
 | `&macro_remove <id>` | Remove a ;macro by id |
+| `&daily_image` | Post today's image of the day on demand — paints it if the scheduler missed the morning slot, or reposts the retained image (no monthly request spent) if it already exists |
 | `&stats` | Show uptime, monthly request count, limit, and magic/remix/release-image/daily-image/macro/pipe activity |
 | `&ping` | Check bot latency |
 
@@ -38,6 +39,16 @@ schedule itself is editable by hand at `data/daily_schedule.json` (seeded from t
 image on first run, same working-copy pattern as the magic/macro libraries) — add,
 remove, retime, or reword a slot, or flip its `magic` flag, without a code change.
 Set `DAILY_IMAGE_ENABLED=false` to turn the whole thing off.
+
+A slot only fires if the bot is running within 10 minutes of its scheduled time —
+there is deliberately no catch-up, so a morning slot missed during an outage is
+simply lost. **`&daily_image`** covers that case: it does the morning slot's work on
+demand, posting to the channel you run it in (so it works even with the scheduler
+disabled). If today's image has already been painted it is reposted verbatim, marked
+`♻️ (repost — already painted today)`, without a second API call — the day's prompt
+is deterministic, so repainting would only spend budget on a different rendering of
+the same idea. A successful manual generate marks the morning slot fired, so running
+it at 06:58 won't produce a second post at 07:00.
 
 The shipped schedule's 4 slots/day (1 generate + 3 edits) count against the same
 monthly `API_LIMIT` as every other command — 4 × ~30 days ≈ 120 generations/month

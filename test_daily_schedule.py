@@ -35,6 +35,7 @@ from daily_schedule import (
     classify_slot_time,
     daily_image_filename,
     due_slots,
+    find_generate_entry,
     format_announcement_date,
     get_zone,
     load_schedule,
@@ -624,6 +625,64 @@ class ValidateScheduleTest(unittest.TestCase):
         good, errors = validate_schedule([with_stray_edit_prompt, with_unknown_key])
         self.assertEqual(good, [with_stray_edit_prompt, with_unknown_key])
         self.assertEqual(errors, [])
+
+
+class FindGenerateEntryTest(unittest.TestCase):
+    """&daily_image runs a due generate slot's work on demand (there is no catch-up),
+    and needs that slot's message/magic settings so a manual run announces the image
+    the same way the scheduled one would."""
+
+    GEN = {"id": "morning", "time": "07:00", "type": "generate", "message": "M {date}", "magic": False}
+    EDIT = {"id": "lunch", "time": "12:00", "type": "edit", "edit_prompt": "p", "message": "L"}
+
+    def test_finds_the_generate_entry_among_edits(self):
+        self.assertIs(find_generate_entry([self.EDIT, self.GEN, dict(self.EDIT, id="l2")]), self.GEN)
+
+    def test_returns_the_original_dict_by_reference_not_a_copy(self):
+        # The caller reads entry["message"]/entry.get("magic") off it; a copy would
+        # work too, but returning the original keeps this consistent with due_slots'
+        # documented by-reference contract.
+        entries = [self.GEN]
+        self.assertIs(find_generate_entry(entries), entries[0])
+
+    def test_none_when_schedule_has_no_generate_slot(self):
+        # The command falls back to its own default wording rather than raising.
+        self.assertIsNone(find_generate_entry([self.EDIT]))
+
+    def test_none_on_empty_and_non_list_schedules(self):
+        for entries in ([], None, "not a list", {"id": "morning"}):
+            with self.subTest(entries=entries):
+                self.assertIsNone(find_generate_entry(entries))
+
+    def test_first_accepted_generate_wins(self):
+        # Several generate slots are legal (the retained filename is date-keyed, so
+        # retention stays correct); first-wins mirrors validate_schedule's rule for
+        # duplicate ids.
+        second = dict(self.GEN, id="morning2", time="08:00")
+        self.assertIs(find_generate_entry([self.GEN, second]), self.GEN)
+
+    def test_invalid_generate_entry_is_skipped_for_the_next_valid_one(self):
+        # A hand-corrupted generate slot must not be handed back half-formed -- the
+        # command would then KeyError on entry["message"] at the worst moment.
+        broken = {"id": "bad", "time": "7am", "type": "generate", "message": "m"}
+        self.assertIs(find_generate_entry([broken, self.GEN]), self.GEN)
+
+    def test_only_invalid_generate_entries_returns_none(self):
+        no_message = {"id": "bad", "time": "07:00", "type": "generate"}
+        self.assertIsNone(find_generate_entry([no_message]))
+
+    def test_seed_schedule_has_a_generate_entry(self):
+        # If the shipped seed ever lost its generate slot, &daily_image would silently
+        # fall back to hardcoded wording instead of the schedule's.
+        entry = find_generate_entry(load_schedule(SEED_SCHEDULE_FILE))
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["id"], "morning")
+
+    def test_does_not_mutate_input(self):
+        entries = [dict(self.EDIT), dict(self.GEN)]
+        before = copy.deepcopy(entries)
+        find_generate_entry(entries)
+        self.assertEqual(entries, before)
 
 
 class ScheduleIoTest(unittest.TestCase):

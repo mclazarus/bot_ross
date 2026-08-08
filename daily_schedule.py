@@ -237,6 +237,31 @@ def validate_schedule(entries):
     return good, errors
 
 
+def find_generate_entry(entries):
+    """Return the schedule's "generate" slot -- the one that paints the day's base
+    image -- or None if the schedule has no generate entry at all.
+
+    Used by the manual &daily_image command, which does a due generate slot's work
+    on demand (there is deliberately no catch-up, so a slot missed while the bot was
+    down is simply lost). It needs that entry only for its `message` and `magic`
+    settings, so the manual run announces the image exactly the way the scheduled
+    one would rather than inventing its own wording.
+
+    Entries are validated first, so a hand-corrupted generate entry is skipped
+    rather than handed back half-formed -- the caller can then fall back to its own
+    default message instead of raising on a missing key.
+
+    If a schedule somehow defines several generate slots (allowed -- the filename is
+    date-keyed, so retention stays correct), the FIRST accepted one wins, matching
+    validate_schedule's first-wins rule for duplicate ids.
+    """
+    good, _errors = validate_schedule(entries)
+    for entry in good:
+        if entry["type"] == "generate":
+            return entry
+    return None
+
+
 # --- Time-of-slot resolution (the DST heart) ------------------------------------------
 
 def slot_instant(day, hour, minute, zone):
