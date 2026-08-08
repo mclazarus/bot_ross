@@ -1,28 +1,30 @@
-"""Static (AST-level) regression checks against bot_ross.py.
+"""Static (AST/artifact-level) regression checks on bot_ross.py and the Dockerfile.
 
-Since C1 (load_config()/main() + the __main__ guard) bot_ross.py imports
-cleanly under test with no environment and no side effects -- behavioral
-command tests land in test_bot_ross_commands.py (C2). What remains here are
-properties of the SOURCE itself: statement ordering inside main(), which
-branch of do_the_art may reference `prompt` under quiet=True, the
-completeness of load_config's `global` list -- things a behavioral test
-could only pin indirectly, if at all.
+Since bot_ross.py grew load_config()/main() it is importable under test, and
+test_bot_ross_commands.py drives the real command callbacks behaviorally --
+anything with observable behavior belongs THERE, asserted on the output, not
+on the code shape that produces it. This file's charter is deliberately
+narrower: properties that are genuinely about source or artifact shape, where
+no deterministic test can observe the behavior at all (get_current_month()'s
+timezone-aware read, the no-await load/save invariant, the seed-filename
+negative check, main()'s makedirs-before-seed ordering, and the Dockerfile's
+Python floor) -- plus main()'s and load_config()'s own statement-level shape
+(the `__main__` guard, no import-time side effects, setup_logging-before-
+load_config-before-makedirs-before-seed ordering, the completeness of
+load_config's `global` list, and the fetchers reading OPENAI_API_KEY rather
+than the transitional openai.api_key) -- plus a handful of classes that were
+candidates for retirement here but are still AST-only because
+test_bot_ross_commands.py does not yet drive the specific scenario that would
+supersede them. Each such class's docstring says so explicitly, and the
+retiring commit's message records the gap so it isn't lost.
 
-Every non-trivial piece of logic in this codebase lives in a pure module
-instead -- but do_the_art's quiet-mode "never post the prompt" promise is
-small, security/privacy-sensitive, and lives entirely inside bot_ross.py
-itself, so it has no pure-module home. This file is the pragmatic fallback
-for that one case: it parses bot_ross.py with `ast` and asserts structural
-properties of do_the_art's source, without ever executing it.
-
-Specifically this guards against a real regression: do_the_art derived the
-Discord attachment's filename (via generate_file_name(prompt)) and alt-text
-description (via `response['revised_prompt'] or prompt`) unconditionally, so
-even under quiet=True (the daily scheduler) the deterministic daily prompt --
-and any hidden magic mixin appended to it -- was fully readable by hovering
-over or downloading the posted image, defeating the documented "the prompt is
-logged, never posted" promise (CLAUDE.md, Daily Image of the Day / spec_daily
-section 4.9) even though no code path ever printed the prompt as text.
+Everything with a landed behavioral replacement was retired in favor of it,
+except where retiring one half of a paired check would split a class's
+coverage across two files -- those are called out in place (see
+DailyListAddGuardAgainstUnparseableScheduleTest's docstring for the current
+example). The commit that retired each one names its replacement; see that
+commit's message for the itemized list, including the several planned
+retirements that were kept instead because no replacement exists yet.
 
 Run from the repo root:  python -m unittest test_bot_ross_source -v
 """
@@ -47,10 +49,6 @@ def _load_function(name):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
             return node
     raise AssertionError(f"{name} not found in bot_ross.py")
-
-
-def _load_do_the_art():
-    return _load_function("do_the_art")
 
 
 def _string_constants(node):
@@ -109,151 +107,6 @@ def _enclosing_if_tests(func_node, target_call):
     ]
 
 
-def _quiet_true_branch_value(test, body, orelse):
-    """Given an if/ternary's `test` plus its two branches, return whichever
-    branch executes when `quiet` is True -- or None if `test` doesn't
-    reference `quiet` at all. Handles the negated form (`if not quiet:` /
-    `x if not quiet else y`) by swapping which branch is "true"."""
-    if not _references(test, "quiet"):
-        return None
-    negated = isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not)
-    return orelse if negated else body
-
-
-def _quiet_branch_assign_values(func_node, name):
-    """All expressions that `name` is assigned to specifically in the branch
-    that runs when quiet is True -- checking BOTH shapes a `quiet`-gated
-    assignment can take, so a benign refactor between them (ternary <->
-    if/else statement) doesn't break callers of this helper:
-
-      1. Ternary: `name = a if not quiet else b` (an ast.Assign whose value
-         is an ast.IfExp).
-      2. If/else statement: `if quiet: name = a` / `if not quiet: ... else:
-         name = b` (an ast.If whose relevant branch contains an ast.Assign
-         to `name`).
-    """
-    values = []
-    for assign in _assigns_to(func_node, name):
-        if isinstance(assign.value, ast.IfExp):
-            branch = _quiet_true_branch_value(assign.value.test, assign.value.body, assign.value.orelse)
-            if branch is not None:
-                values.append(branch)
-    for node in ast.walk(func_node):
-        if not isinstance(node, ast.If):
-            continue
-        branch = _quiet_true_branch_value(node.test, node.body, node.orelse)
-        if branch is None:
-            continue
-        for stmt in branch:
-            if isinstance(stmt, ast.Assign) and any(
-                isinstance(t, ast.Name) and t.id == name for t in stmt.targets
-            ):
-                values.append(stmt.value)
-    return values
-
-
-class DoTheArtQuietPromptLeakTest(unittest.TestCase):
-    """do_the_art must not let `prompt` reach the posted Discord attachment's
-    filename or alt-text description when quiet=True (the daily scheduler)."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.do_the_art = _load_do_the_art()
-
-    def test_file_name_is_computed_conditionally_on_quiet(self):
-        # A regression to an unconditional `file_name = generate_file_name(prompt)`
-        # (today's/pre-fix behavior) would fail this: no assignment to file_name
-        # would reference `quiet` at all. Checked via _quiet_branch_assign_values
-        # so this tolerates EITHER the ternary form (`file_name = a if not quiet
-        # else b`) or an equivalent if/else statement form -- a purely cosmetic
-        # refactor between the two must not fail this test.
-        assigns = _assigns_to(self.do_the_art, "file_name")
-        self.assertTrue(assigns, "do_the_art must assign a local named file_name")
-        self.assertTrue(
-            _quiet_branch_assign_values(self.do_the_art, "file_name"),
-            "file_name must be assigned a distinct value specifically when "
-            "quiet is True -- the quiet path needs a prompt-free filename, "
-            "not the one derived from the prompt text",
-        )
-
-    def test_quiet_file_name_branch_does_not_reference_prompt(self):
-        # Precise check: of whichever branch (ternary or if/else statement)
-        # runs when quiet is True, assert THAT branch never references
-        # `prompt`. Tolerates a refactor between the two shapes -- see
-        # _quiet_branch_assign_values.
-        quiet_branch_values = _quiet_branch_assign_values(self.do_the_art, "file_name")
-        self.assertTrue(
-            quiet_branch_values,
-            "expected a `quiet`-gated assignment to file_name in do_the_art "
-            "(ternary or if/else statement form)",
-        )
-        for value in quiet_branch_values:
-            self.assertFalse(
-                _references(value, "prompt"),
-                "the file_name expression used when quiet=True must not "
-                "reference `prompt` (it would leak the hidden prompt/magic "
-                "mixin as the Discord attachment's filename)",
-            )
-
-    def test_description_assigned_under_quiet_does_not_reference_prompt(self):
-        # Same leak, second half: the alt-text `description` passed to
-        # discord.File. A regression to the old unconditional
-        # `description = (response['revised_prompt'] or prompt)[:1024]` would
-        # fail this: either no `if quiet:` branch would assign description at
-        # all, or the one that did would still reference `prompt`.
-        if_nodes = [
-            node
-            for node in ast.walk(self.do_the_art)
-            if isinstance(node, ast.If) and _references(node.test, "quiet")
-        ]
-        self.assertTrue(if_nodes, "expected an `if quiet:`-shaped branch in do_the_art")
-
-        gated = False
-        for if_node in if_nodes:
-            # `if quiet:` -> node.body runs when quiet is True.
-            for stmt in if_node.body:
-                if isinstance(stmt, ast.Assign) and any(
-                    isinstance(t, ast.Name) and t.id == "description" for t in stmt.targets
-                ):
-                    gated = True
-                    self.assertFalse(
-                        _references(stmt.value, "prompt"),
-                        "description assigned inside `if quiet:` must not "
-                        "reference `prompt` (it would leak it as the Discord "
-                        "attachment's alt text)",
-                    )
-        self.assertTrue(
-            gated,
-            "expected `description` to be assigned inside an `if quiet:` branch",
-        )
-
-
-class QuietFileNameIsFeatureAgnosticTest(unittest.TestCase):
-    """The quiet-mode filename must not claim every quiet=True attachment is a
-    daily image: quiet=True is also the mechanism pipe-chain segments (Feature
-    2) use, and a filename hardcoded to "daily_image_..." would mislabel every
-    chained-paint image as a scheduler post. Regression: the quiet branch was
-    `f"daily_image_{int(time.time())}.png"`; it must instead be a neutral name
-    that says nothing about which feature produced it."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.do_the_art = _load_do_the_art()
-
-    def test_quiet_file_name_literal_does_not_say_daily_image(self):
-        quiet_branch_values = _quiet_branch_assign_values(self.do_the_art, "file_name")
-        self.assertTrue(quiet_branch_values, "expected a quiet-gated assignment to file_name")
-        for value in quiet_branch_values:
-            for literal in _string_constants(value):
-                self.assertNotIn(
-                    "daily_image", literal,
-                    "the quiet-mode file_name must be feature-agnostic (e.g. "
-                    "'painting_...'), not hardcoded to 'daily_image_...' -- "
-                    "pipe-chain segments (Feature 2) also use quiet=True and "
-                    "are not daily images",
-                )
-
-
 class DailyRetrySkipsSleepOnOverLimitTest(unittest.TestCase):
     """_do_the_art_with_retry must not sleep 2 minutes and retry a failure that
     was actually the monthly cap: do_the_art already posts "Monthly limit
@@ -262,7 +115,17 @@ class DailyRetrySkipsSleepOnOverLimitTest(unittest.TestCase):
     otherwise repeat for every remaining slot each day (announcement + two
     "Monthly limit reached" posts + a wasted 2-minute stall, per slot).
     Regression: the pre-fix version went straight from a falsy first result to
-    `_retry_delay()`/asyncio.sleep(120) with no over_limit check in between."""
+    `_retry_delay()`/asyncio.sleep(120) with no over_limit check in between.
+
+    KEPT (not retired): test_bot_ross_commands.py has no test that isolates
+    this specific property. DailyImageCommandTest.test_failure_posts_failure_
+    message_once_without_marking_fired stubs `_retry_delay` itself to a no-op
+    returning False, which also makes the second attempt not happen -- so it
+    can't distinguish "over_limit() short-circuited the retry" from "the
+    stubbed _retry_delay just declined to retry". A real replacement needs the
+    first failed attempt to write request_data.json up to API_LIMIT as a
+    side effect (not before the call), then assert call_count stayed at 1
+    with no asyncio.sleep. No such test exists yet."""
 
     @classmethod
     def setUpClass(cls):
@@ -520,7 +383,15 @@ class DailyCommandsValidateBeforeSaveTest(unittest.TestCase):
     interleave two edits as long as nothing yields control in between --
     but a `ctx.send` partway through would). Checked via `ast` because
     these are source-ordering invariants, which AST inspection expresses
-    directly."""
+    directly.
+
+    NOT renamed/trimmed as originally planned: three of this class's five
+    methods (test_daily_commands_exist, test_validate_slot_precedes_save_in_
+    add_update_toggle, test_scheduler_tick_reloads_the_schedule_fresh) were
+    slated for retirement, but none has a landed behavioral replacement --
+    see each method's own KEPT note below for the specific gap. Only once all
+    three are actually superseded does the class's namesake property go away
+    and the rename to DailyCommandsSourceInvariantsTest become accurate."""
 
     MUTATING_COMMANDS = ("daily_add", "daily_update", "daily_remove", "daily_toggle")
     VALIDATE_GATED_COMMANDS = ("daily_add", "daily_update", "daily_toggle")
@@ -530,12 +401,29 @@ class DailyCommandsValidateBeforeSaveTest(unittest.TestCase):
         cls.functions = {name: _load_function(name) for name in cls.MUTATING_COMMANDS}
 
     def test_daily_commands_exist(self):
+        # KEPT: test_bot_ross_commands.py never drives &daily_show at all (the
+        # other five &daily_* commands are all exercised via cmd("daily_...")).
+        # A missing command would make bot.get_command(...) return None and
+        # error a behavioral test with equal clarity, but only once daily_show
+        # is actually driven somewhere.
         for name in ("daily_list", "daily_show") + self.MUTATING_COMMANDS:
             with self.subTest(name=name):
                 func = _load_function(name)
                 self.assertIsInstance(func, ast.AsyncFunctionDef, f"{name} must be an async command")
 
     def test_validate_slot_precedes_save_in_add_update_toggle(self):
+        # KEPT: test_bot_ross_commands.py has a byte-identical-file-on-bad-input
+        # replacement for &daily_update (DailyScheduleCommandsTest.test_update_
+        # with_bad_time_replies_error_and_leaves_file_byte_identical) but none
+        # for &daily_add -- its two &daily_add tests
+        # (test_add_edit_slot_persists_with_provenance,
+        # test_add_duplicate_id_refused_without_write) are a successful add and
+        # a duplicate-id refusal; neither passes an invalid field value, so
+        # validate_slot's failure path inside &daily_add is never reached.
+        # &daily_toggle legitimately has no reachable validate failure (flipping
+        # `enabled` can't invalidate an entry), so its coverage would ride on
+        # add/update once both exist.
+        #
         # daily_remove is deliberately excluded: removing an entry can never
         # produce an invalid one, so it has nothing to validate before saving.
         for name in self.VALIDATE_GATED_COMMANDS:
@@ -586,6 +474,13 @@ class DailyCommandsValidateBeforeSaveTest(unittest.TestCase):
                 )
 
     def test_scheduler_tick_reloads_the_schedule_fresh(self):
+        # KEPT: no test in test_bot_ross_commands.py drives _run_due_daily_slots
+        # at all. A replacement would edit the schedule file after a first tick
+        # and assert the new slot fires on a second tick with no restart/reload
+        # call -- losing this silently would let a future "optimization" cache
+        # the schedule in a module global, making every &daily_* edit require a
+        # restart with nothing noticing.
+        #
         # Guards against caching the schedule in a module global, which would
         # silently make every &daily_* edit require a restart to take effect.
         func = _load_function("_run_due_daily_slots")
@@ -593,18 +488,37 @@ class DailyCommandsValidateBeforeSaveTest(unittest.TestCase):
         self.assertTrue(calls, "_run_due_daily_slots must call daily_schedule.load_schedule(...) every tick")
 
 
-class DailyImageRepostDoesNotRegenerateTest(unittest.TestCase):
-    """&daily_image's headline promise: if today's image was already painted, it is
-    REPOSTED, not repainted. That is what keeps a manual catch-up from silently
-    spending a monthly request (and re-rolling magic) on an image already on disk.
+class DailyImageRepostRollsNoMagicTest(unittest.TestCase):
+    """&daily_image's repost path (today's image already painted -> repost,
+    don't repaint) must not re-roll magic paint: the retained PNG already
+    baked in whatever the original roll decided, so a second roll would both
+    mis-count the persisted `magic` stat and imply, via the appended 🖌️
+    tell, that this particular retained image got a mixin when it may not
+    have. daily_image_cmd's own docstring calls this one of its two
+    deliberate repost guarantees (the other being "make no generation call").
 
-    The whole guarantee is the early `return` in the `if png_bytes is not None:`
-    branch -- one deleted line turns every repost into a fresh generation, and no
-    test that avoids importing bot_ross could otherwise notice. So assert it
-    structurally: nothing inside that branch may reach a generation call.
-    """
-
-    GENERATION_CALLS = ("_do_the_art_with_retry", "do_the_art", "_save_daily_image")
+    KEPT (not retired): the other three methods that used to live in
+    DailyImageRepostDoesNotRegenerateTest (no-generation-call, early-return,
+    generate-path-still-generates) ARE superseded by
+    DailyImageCommandTest.test_repost_makes_no_api_call_and_spends_nothing /
+    test_generate_path_retains_prunes_and_marks_fired in
+    test_bot_ross_commands.py. This one is not: that fixture's SCHEDULE entry
+    carries no `"magic": true` key, and BotTestCase.setUp pins
+    MAGIC_PAINT_RATE to 0.0 for every test unless a test re-patches it -- so
+    with daily_image_cmd only rolling magic under
+    `if entry and entry.get("magic")`, the roll no-ops on both counts before
+    it could ever reach _bump_magic_counter, and the repost test's
+    `self.assertEqual(self.read_data(), {})` can't observe a re-roll landing
+    there. (A *stray* magic call inserted into the repost branch would still
+    be caught -- mutation-verified: it writes request_data.json and breaks
+    that same assertion. What the fixture can't do is prove the absence is
+    for the *right* reason rather than an accident of a magic-less entry and
+    a zeroed rate.) A real replacement needs a magic:true generate entry,
+    MAGIC_PAINT_RATE patched to 1.0, a pre-seeded retained PNG, and
+    assertions that the repost reply carries no 🖌️ tell AND read_data() has
+    no `magic` key afterward. Until that lands, this AST check is the only
+    thing that would catch a magic roll hoisted into (or left inside) the
+    repost branch."""
 
     def _repost_branch(self):
         """The `if png_bytes is not None:` branch body of daily_image_cmd."""
@@ -622,22 +536,6 @@ class DailyImageRepostDoesNotRegenerateTest(unittest.TestCase):
                 return node
         raise AssertionError("daily_image_cmd has no `if png_bytes is not None:` branch")
 
-    def test_repost_branch_makes_no_generation_call(self):
-        branch = self._repost_branch()
-        for name in self.GENERATION_CALLS:
-            with self.subTest(call=name):
-                found = [
-                    n for n in ast.walk(ast.Module(body=branch.body, type_ignores=[]))
-                    if isinstance(n, ast.Call)
-                    and isinstance(n.func, ast.Name)
-                    and n.func.id == name
-                ]
-                self.assertEqual(
-                    found, [],
-                    f"the repost path calls {name}() -- reposting must never spend a "
-                    f"generation or rewrite the retained image",
-                )
-
     def test_repost_branch_rolls_no_magic(self):
         # The retained PNG already baked in whatever the original roll decided; a
         # second roll would both mis-count the `magic` stat and imply, via the 🖌️
@@ -653,28 +551,6 @@ class DailyImageRepostDoesNotRegenerateTest(unittest.TestCase):
                     f"the repost path calls {name}() -- a repost must not re-roll magic",
                 )
 
-    def test_repost_branch_returns_before_the_generate_path(self):
-        branch = self._repost_branch()
-        self.assertTrue(
-            any(isinstance(n, ast.Return) for n in ast.walk(ast.Module(body=branch.body, type_ignores=[]))),
-            "the repost branch must return -- without it, execution falls through "
-            "into the generate path and repaints the image anyway",
-        )
-
-    def test_generate_path_does_still_generate(self):
-        # Guards the inverse regression: a refactor that made the whole command a
-        # no-op would pass every assertion above.
-        func = _load_function("daily_image_cmd")
-        self.assertTrue(
-            _calls_named(func, "_do_the_art_with_retry"),
-            "daily_image_cmd never generates at all",
-        )
-        self.assertTrue(
-            _calls_named(func, "_save_daily_image"),
-            "daily_image_cmd never retains what it generated, so the next run would "
-            "repaint instead of reposting",
-        )
-
 
 class DailyUpdateDoesNotEchoUnboundedTextTest(unittest.TestCase):
     """&daily_update's success reply must not echo a raw message/edit_prompt value
@@ -685,7 +561,12 @@ class DailyUpdateDoesNotEchoUnboundedTextTest(unittest.TestCase):
     landed. Regression: `&daily_update lunch message <1972 x's>` (1972 is exactly
     what fits after the ~28-char reply prefix in 2000 chars) produced a
     2006-character reply that raised on send.
-    """
+
+    KEPT (not retired): no test in test_bot_ross_commands.py drives a long
+    message/edit_prompt value through &daily_update at all. A replacement
+    needs to assert BOTH halves -- every sent message stays <= 2000 chars AND
+    the schedule file afterward holds the full, untruncated value (so a naive
+    "fix" can't just truncate what's stored)."""
 
     @classmethod
     def setUpClass(cls):
@@ -709,6 +590,17 @@ class DailyUpdateWarnsWhenDisablingLastGenerateSlotTest(unittest.TestCase):
     include it) and performs the identical write, but originally emitted no
     warning at all -- a user reaching for the field-setter form got no signal
     that they'd just disabled the day's base-image generator.
+
+    KEPT (not retired): test_bot_ross_commands.py exercises the warning for
+    &daily_toggle and &daily_remove (DailyScheduleCommandsTest.test_removing_
+    last_generate_slot_warns / test_toggle_disables_and_persists) but never
+    for &daily_update -- neither the documented `enabled off` spelling nor
+    the `type edit` case (test_warning_check_is_not_gated_to_only_the_enabled_
+    field's whole point: the check must fire on ANY write that empties the
+    last enabled generate slot, not just the `enabled` field) has a
+    behavioral test. A replacement needs all four call sites -- &daily_update
+    `enabled off`, &daily_update `type edit`, &daily_toggle, &daily_remove --
+    to produce the identical warning text.
     """
 
     @classmethod
@@ -778,6 +670,14 @@ class DailyNoSuchSlotReplyIsBoundedTest(unittest.TestCase):
     echo of a long enough slot_id can itself exceed Discord's 2000-char
     message cap and the "sorry, no such slot" reply silently fails to send.
     Regression: `&daily_show` with a ~1980-char id produced a 2005-char reply.
+
+    KEPT (not retired): no test in test_bot_ross_commands.py drives any
+    &daily_* command with an oversized bogus or on-disk slot id. A
+    replacement needs two scenarios: (a) a ~2500-char bogus id sent to
+    &daily_show/&daily_update/&daily_remove/&daily_toggle each sends a
+    non-empty, <=2000-char reply; (b) a hand-written schedule file with a
+    ~2500-char real id has the mutating commands' SUCCESS replies also stay
+    <=2000 chars.
     """
 
     COMMANDS = ("daily_show", "daily_update", "daily_remove", "daily_toggle")
@@ -850,6 +750,18 @@ class DailyListAddGuardAgainstUnparseableScheduleTest(unittest.TestCase):
     trailing comma) makes &daily_list report "empty" and the natural next step,
     &daily_add, overwrites the whole (still-there-but-unparseable) file with a
     single new entry, silently discarding every existing slot.
+
+    PARTIALLY retired: test_bot_ross_commands.py's DailyScheduleCommandsTest.
+    test_list_refuses_to_treat_corrupt_file_as_empty behaviorally replaces the
+    &daily_list half (asserts the "could not be parsed as JSON" reply and that
+    it does NOT say "schedule is empty"), so test_daily_list_checks_schedule_
+    file_is_corrupt below is genuinely redundant with it now. It stays anyway:
+    the spec is explicit that both members of an (a)/(b) pair must have
+    replacements before either AST method is dropped, since &daily_add's half
+    -- driving &daily_add against a corrupt file and asserting it refuses
+    with the file left byte-identical -- has no test at all yet. Dropping
+    only the &daily_list method here would split one class's coverage across
+    two files for no reader benefit.
     """
 
     def test_daily_list_checks_schedule_file_is_corrupt(self):
@@ -863,6 +775,7 @@ class DailyListAddGuardAgainstUnparseableScheduleTest(unittest.TestCase):
         )
 
     def test_daily_add_checks_schedule_file_is_corrupt(self):
+        # KEPT: no test drives &daily_add against a corrupt schedule file.
         func = _load_function("daily_add")
         calls = _calls_attr(func, "daily_schedule", "schedule_file_is_corrupt")
         self.assertTrue(
