@@ -73,7 +73,29 @@ if _tz_error:
 # DAILY_IMAGE_ENABLED=false -- see on_ready. Both are parsed leniently (never raise) so a
 # typo'd env var can't crash the bot at import.
 DAILY_IMAGE_ENABLED = daily_schedule.parse_bool(os.environ.get('DAILY_IMAGE_ENABLED'), True)
-DAILY_IMAGE_CHANNEL_ID = daily_schedule.parse_channel_id(os.environ.get('DAILY_IMAGE_CHANNEL_ID'))
+_raw_daily_channel = os.environ.get('DAILY_IMAGE_CHANNEL_ID')
+DAILY_IMAGE_CHANNEL_ID = daily_schedule.parse_channel_id(_raw_daily_channel)
+# Distinguish "not configured" from "configured but unparseable". Both yield None, but
+# reporting them the same way is how a set-but-malformed channel id got read as
+# "no channel configured" for a full day -- see the inline-comment check below.
+DAILY_CHANNEL_MISCONFIGURED = DAILY_IMAGE_CHANNEL_ID is None and bool(
+    (_raw_daily_channel or "").strip()
+)
+
+# `docker run --env-file` takes everything after the first "=" as the value, comment
+# included, so a .env written with trailing `# ...` comments silently poisons every
+# value it touches. Each parser above then falls back to its default without saying
+# why. Check the raw values once at startup and name the variable, so this shows up as
+# one obvious log line instead of a scheduler that quietly never runs.
+for _name in ('BOT_TIMEZONE', 'DAILY_IMAGE_CHANNEL_ID', 'DAILY_IMAGE_ENABLED',
+              'DRAIN_TIMEOUT', 'API_LIMIT', 'IMAGE_MODEL', 'IMAGE_MODERATION',
+              'MEME_MODEL', 'MAGIC_PAINT_RATE'):
+    if daily_schedule.looks_like_inline_comment(os.environ.get(_name)):
+        logger.warning(
+            f"{_name} looks like it contains an inline `# comment` -- docker --env-file "
+            f"does not strip those, so the comment is part of the value and this "
+            f"setting is being ignored. Put comments on their own line in .env."
+        )
 
 # The working library lives on the persistent data/ volume so user-added mixins survive
 # redeploys; DEFAULT_MAGIC_PROMPTS_FILE is the seed baked into the image (see _seed_magic_library).
@@ -389,6 +411,16 @@ async def on_ready():
     # guards the signal handlers above.
     if not DAILY_IMAGE_ENABLED:
         logger.info("Daily image scheduler disabled (DAILY_IMAGE_ENABLED is false).")
+    elif DAILY_CHANNEL_MISCONFIGURED:
+        # Set but unparseable is a MISCONFIGURATION, not a choice to leave the feature
+        # off -- warn, and say what the value actually was, rather than reporting it as
+        # "not set" (which reads as "working as configured" and hides the real problem).
+        logger.warning(
+            f"Daily image scheduler disabled: DAILY_IMAGE_CHANNEL_ID is set but isn't a "
+            f"channel id: {_raw_daily_channel!r}. Expected digits only (a `<#123>` mention "
+            f"also works); note that docker --env-file keeps trailing `# comments` as part "
+            f"of the value."
+        )
     elif DAILY_IMAGE_CHANNEL_ID is None:
         logger.info("Daily image scheduler disabled: no DAILY_IMAGE_CHANNEL_ID set.")
     elif _daily_task is None or _daily_task.done():

@@ -108,6 +108,31 @@ def parse_channel_id(value):
     return channel_id if channel_id > 0 else None
 
 
+def looks_like_inline_comment(value):
+    """Whether an env-var value looks like it swallowed a trailing `# comment`.
+
+    `docker run --env-file` does NOT support inline comments: it splits each line
+    on the first "=" and takes the entire remainder as the value, `#` and all. So
+    a .env line written as
+
+        BOT_TIMEZONE=America/New_York  # default: America/New_York
+
+    reaches the process as the literal value "America/New_York  # default: ...",
+    which every parser here then rejects -- correctly, but the *reason* is far
+    from obvious, and the lenient never-raise parsing that keeps a typo from
+    crashing the bot also keeps this silent. This shipped once and cost a day of
+    daily images: the channel id parsed to None and the scheduler simply logged
+    that no channel was configured, when in fact one was.
+
+    Detects " #" (whitespace then hash) rather than a bare "#", so a legitimate
+    value that merely contains a hash -- a URL fragment, a Discord channel name
+    like "#general" -- isn't flagged. Non-str input returns False.
+    """
+    if not isinstance(value, str):
+        return False
+    return bool(re.search(r"\s#", value))
+
+
 def get_zone(name, fallback="UTC"):
     """Resolve an IANA timezone name to a ZoneInfo, without ever raising.
 

@@ -179,7 +179,18 @@ python bot_ross.py
 
 ## Configuration
 
-All options are set via environment variables (see `env.example`):
+All options are set via environment variables (see `env.example`).
+
+> **Never put a comment on the same line as a value in `.env`.** `run.sh` passes the
+> file to `docker run --env-file`, which splits each line on the first `=` and takes
+> the entire remainder as the value — `#` and everything after it included. So
+> `BOT_TIMEZONE=America/New_York  # my zone` sets the timezone to the literal string
+> `America/New_York  # my zone`, which isn't a valid zone, and the bot falls back to
+> UTC. Every setting is parsed leniently (a bad value falls back to its default rather
+> than crashing), so this fails *silently* — a poisoned `DAILY_IMAGE_CHANNEL_ID` just
+> leaves the scheduler switched off. Keep comments on their own lines. Since v-current
+> the bot logs a warning at startup naming any variable whose value looks like it
+> swallowed a comment.
 
 | Variable | Default | Description |
 |---|---|---|

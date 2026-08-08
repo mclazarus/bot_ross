@@ -51,6 +51,7 @@ from daily_schedule import (
     is_valid_slot_id,
     load_schedule,
     load_state,
+    looks_like_inline_comment,
     mark_fired,
     normalize_slot_id,
     parse_add_fields,
@@ -987,6 +988,100 @@ class ParseChannelIdTest(unittest.TestCase):
         for bad in (None, "", "abc", "12a3", "-5", "0", "<#>"):
             with self.subTest(bad=bad):
                 self.assertIsNone(parse_channel_id(bad))
+
+
+class LooksLikeInlineCommentTest(unittest.TestCase):
+    """`docker run --env-file` keeps a trailing `# comment` as part of the value.
+    Every parser here is deliberately lenient (falls back rather than raising), so a
+    poisoned value fails silently -- this detector exists to make it loud."""
+
+    def test_flags_real_world_poisoned_values(self):
+        # These are verbatim from the .env that actually broke a deployment.
+        for value in (
+            "America/New_York  # default: America/New_York | IANA zone the schedule uses",
+            "1125788287068541031      # default: unset | channel id the daily image posts to",
+            "300            # default: 300 | seconds to let in-flight generations finish",
+            "true     # default: true | set false to disable the scheduler outright",
+        ):
+            with self.subTest(value=value[:30]):
+                self.assertTrue(looks_like_inline_comment(value))
+
+    def test_single_space_before_hash_is_enough(self):
+        self.assertTrue(looks_like_inline_comment("value #comment"))
+        self.assertTrue(looks_like_inline_comment("value\t#comment"))
+
+    def test_clean_values_are_not_flagged(self):
+        for value in ("America/New_York", "1125788287068541031", "300", "true",
+                      "gpt-image-2-low", "0.05", "", "   "):
+            with self.subTest(value=value):
+                self.assertFalse(looks_like_inline_comment(value))
+
+    def test_hash_without_leading_whitespace_is_not_flagged(self):
+        # A legitimate value may simply contain a hash -- a Discord channel name, a URL
+        # fragment, a hex color. Flagging those would cry wolf on every startup, and a
+        # warning nobody trusts is worse than no warning.
+        for value in ("#general", "https://example.com/x#frag", "#ff8800", "a#b"):
+            with self.subTest(value=value):
+                self.assertFalse(looks_like_inline_comment(value))
+
+    def test_non_string_input_returns_false(self):
+        # os.environ.get(...) returns None for an unset variable; that is not a
+        # misconfiguration and must not warn.
+        for value in (None, 300, 0.05, True, ["x"]):
+            with self.subTest(value=value):
+                self.assertFalse(looks_like_inline_comment(value))
+
+    def test_a_poisoned_value_is_rejected_by_the_parser_it_feeds(self):
+        # Ties the detector to the actual failure: each of these parsers silently falls
+        # back, which is exactly why the detector has to speak up.
+        self.assertIsNone(parse_channel_id("1125788287068541031   # channel id"))
+        self.assertTrue(parse_bool("true   # default: true", default=True))
+        self.assertFalse(parse_bool("false   # turn it off", default=False))
+        _zone, error = get_zone("America/New_York  # default: America/New_York")
+        self.assertIsNotNone(error)
+
+
+class EnvExampleHasNoInlineCommentsTest(unittest.TestCase):
+    """env.example is copied to .env and handed to `docker run --env-file`, so an
+    inline comment in it is not a documentation nit -- it silently disables whatever
+    setting it annotates. This shipped once and cost a day of daily images."""
+
+    ENV_EXAMPLE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "env.example")
+
+    def test_no_value_line_carries_a_trailing_comment(self):
+        with open(self.ENV_EXAMPLE, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        offenders = []
+        for number, line in enumerate(lines, start=1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            _name, _sep, value = stripped.partition("=")
+            if looks_like_inline_comment(value):
+                offenders.append(f"line {number}: {line}")
+        self.assertEqual(
+            offenders, [],
+            "env.example has inline `# comments` on value lines. docker --env-file "
+            "keeps them as part of the value, silently breaking those settings. Move "
+            "the comments onto their own lines:\n" + "\n".join(offenders),
+        )
+
+    def test_the_check_would_catch_a_regression(self):
+        # Mutation guard: prove the parsing above actually inspects value lines rather
+        # than skipping everything (a bug that would make the test vacuously green).
+        poisoned = "BOT_TIMEZONE=America/New_York  # default: America/New_York"
+        _name, _sep, value = poisoned.partition("=")
+        self.assertTrue(looks_like_inline_comment(value))
+
+    def test_every_documented_variable_is_present_and_clean(self):
+        with open(self.ENV_EXAMPLE, "r", encoding="utf-8") as f:
+            text = f.read()
+        for name in ("OPENAI_API_KEY", "DISCORD_BOT_TOKEN", "API_LIMIT", "IMAGE_MODEL",
+                     "IMAGE_MODERATION", "MEME_MODEL", "MAGIC_PAINT_RATE",
+                     "DRAIN_TIMEOUT", "BOT_TIMEZONE", "DAILY_IMAGE_CHANNEL_ID",
+                     "DAILY_IMAGE_ENABLED"):
+            with self.subTest(name=name):
+                self.assertRegex(text, rf"(?m)^{name}=")
 
 
 class GetZoneTest(unittest.TestCase):
