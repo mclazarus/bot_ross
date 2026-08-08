@@ -23,6 +23,8 @@ Run from the repo root:  python -m unittest test_bot_ross_source -v
 
 import ast
 import os
+import re
+import sys
 import unittest
 
 BOT_ROSS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_ross.py")
@@ -863,92 +865,55 @@ class DailyListAddGuardAgainstUnparseableScheduleTest(unittest.TestCase):
         )
 
 
-class NoNestedFStringsTest(unittest.TestCase):
-    """Every .py file in the repo must parse under Python 3.10, the Docker base image.
+class DockerfilePythonVersionTest(unittest.TestCase):
+    """The Docker base image must not be older than the Python this code is
+    developed and tested on.
 
-    A nested f-string that reuses the outer quote character --
-    f"...{', '.join(f'{e['id']}' for e in xs)}..." -- is PEP 701 syntax accepted only
-    on 3.12+. Development happens on 3.12, so it parses locally, passes the whole test
-    suite, and then raises SyntaxError at container start. `ast.parse(...,
-    feature_version=(3, 10))` does NOT catch it (verified: feature_version doesn't
-    downgrade the f-string tokenizer), and there is no CI running a real 3.10, so
-    nothing else in this repo would.
+    Version skew here is uniquely nasty: it produces a failure that passes every
+    local check -- the full test suite, ast.parse, a manual read -- and then
+    SyntaxErrors at container start, where the only symptom is a crash-looping
+    container. It has already happened once, with a PEP 701 nested f-string
+    (f"...{f'{e['id']}'}...") that 3.12 accepts and 3.10 rejects.
 
-    Rather than try to detect quote reuse precisely, this forbids f-string nesting
-    outright: it's the only common route to the bug, it's unreadable anyway, and the
-    fix is always the same one-line extraction. Caught this in review once, on the
-    scheduler's startup log line.
+    ast.parse(..., feature_version=(3, 10)) does NOT catch that class of bug --
+    verified: feature_version does not downgrade the f-string tokenizer -- and there
+    is no CI running the older interpreter, so nothing else here would notice.
+    Keeping the image at or above the development version removes the whole category
+    rather than policing individual syntax features.
     """
 
-    def _python_files(self):
-        here = os.path.dirname(os.path.abspath(__file__))
-        return [
-            os.path.join(here, name)
-            for name in sorted(os.listdir(here))
-            if name.endswith(".py")
-        ]
+    # Bump only alongside the development environment (.venv), never below it.
+    MINIMUM = (3, 12)
+    DOCKERFILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Dockerfile")
 
-    def test_no_python_file_nests_an_fstring(self):
-        offenders = []
-        for path in self._python_files():
-            with open(path, "r", encoding="utf-8") as f:
-                tree = ast.parse(f.read())
-            for node in ast.walk(tree):
-                if not isinstance(node, ast.JoinedStr):
-                    continue
-                # Any JoinedStr inside this one's interpolated expressions is a nest.
-                for value in node.values:
-                    if not isinstance(value, ast.FormattedValue):
-                        continue
-                    # Walk the interpolated EXPRESSION only, never the whole
-                    # FormattedValue: its .format_spec is itself a JoinedStr, so
-                    # walking the parent flags every ordinary format spec
-                    # ({seconds:.1f}, {local:%H:%M}) as a nested f-string. Those are
-                    # harmless and parse fine on 3.10 -- the danger is exclusively a
-                    # nested f-string inside the expression.
-                    if any(isinstance(inner, ast.JoinedStr) for inner in ast.walk(value.value)):
-                        offenders.append(f"{os.path.basename(path)}:{node.lineno}")
-        self.assertEqual(
-            sorted(set(offenders)), [],
-            "nested f-string(s) found. If the inner one reuses the outer quote "
-            "character this is 3.12-only syntax and will SyntaxError on the 3.10 "
-            "container. Extract the inner expression to its own line:\n"
-            + "\n".join(sorted(set(offenders))),
+    def _base_version(self):
+        with open(self.DOCKERFILE, "r", encoding="utf-8") as f:
+            for line in f:
+                match = re.match(r"\s*FROM\s+python:(\d+)\.(\d+)", line)
+                if match:
+                    return int(match.group(1)), int(match.group(2))
+        raise AssertionError("Dockerfile has no `FROM python:X.Y` line to check")
+
+    def test_base_image_is_not_older_than_the_dev_interpreter(self):
+        version = self._base_version()
+        self.assertGreaterEqual(
+            version, self.MINIMUM,
+            f"Dockerfile pins python:{version[0]}.{version[1]} but this code is "
+            f"developed and tested on {self.MINIMUM[0]}.{self.MINIMUM[1]}. Newer "
+            "syntax would pass every local check and then SyntaxError at container "
+            "start. Audit the source for newer-than-target syntax before lowering "
+            "this, and lower MINIMUM here deliberately.",
         )
 
-    def test_the_check_would_catch_a_regression(self):
-        # Mutation guard: prove the walk actually flags a nest, so a bug that made it
-        # scan nothing wouldn't leave this test vacuously green.
-        tree = ast.parse('x = f"a {b} {[f\'{c}\' for c in d]} e"')
-        found = [
-            node for node in ast.walk(tree)
-            if isinstance(node, ast.JoinedStr)
-            and any(
-                isinstance(v, ast.FormattedValue)
-                and any(isinstance(i, ast.JoinedStr) for i in ast.walk(v.value))
-                for v in node.values
-            )
-        ]
-        self.assertTrue(found, "the nested-f-string detector failed to flag a known nest")
-
-    def test_an_ordinary_format_spec_is_not_flagged(self):
-        # The false positive this detector shipped with for about a minute:
-        # FormattedValue.format_spec is itself a JoinedStr, so walking the parent
-        # flagged f"{x:.1f}" and f"{d:%H:%M}" as nested. Both are fine on 3.10, and a
-        # check that fires on them would be turned off within a day.
-        for source in ('x = f"{seconds:.1f}s"', 'x = f"{local:%H:%M %Z}"', 'x = f"{n:>{width}}"'):
-            with self.subTest(source=source):
-                tree = ast.parse(source)
-                flagged = [
-                    node for node in ast.walk(tree)
-                    if isinstance(node, ast.JoinedStr)
-                    and any(
-                        isinstance(v, ast.FormattedValue)
-                        and any(isinstance(i, ast.JoinedStr) for i in ast.walk(v.value))
-                        for v in node.values
-                    )
-                ]
-                self.assertEqual(flagged, [], f"false positive on {source}")
+    def test_minimum_is_not_ahead_of_the_running_interpreter(self):
+        # The other direction: if MINIMUM were bumped past what anyone actually runs
+        # the tests on, this file would be asserting a guarantee nothing verifies.
+        self.assertLessEqual(
+            self.MINIMUM, sys.version_info[:2],
+            f"MINIMUM is {self.MINIMUM} but the tests are running on "
+            f"{sys.version_info[0]}.{sys.version_info[1]}; the version claim is "
+            "unverified by this suite.",
+        )
 
 
 if __name__ == "__main__":

@@ -204,6 +204,7 @@ To add a new image model: add an entry to `MODEL_CONFIGS` with its supported par
 
 ## Key Dependencies
 
+- **Python 3.12** (`FROM python:3.12`), matching the development `.venv`. This parity is load-bearing, not incidental: the base image was 3.10 while development happened on 3.12, and a PEP 701 nested f-string (`f"...{f'{e['id']}'}..."`) passed the entire test suite, `ast.parse`, and review, then `SyntaxError`ed at container start. `ast.parse(..., feature_version=(3, 10))` does **not** catch that — `feature_version` doesn't downgrade the f-string tokenizer — and there's no CI on the older interpreter. `DockerfilePythonVersionTest` (`test_bot_ross_source.py`) pins `FROM python:X.Y` at ≥ 3.12 and additionally asserts that floor isn't ahead of the interpreter actually running the tests, so the claim stays verified from both sides. Lowering it means auditing the source for newer syntax first.
 - `discord.py ~2.3.2` — bot framework
 - `openai ~0.27.2` — legacy SDK (pre-1.0, uses `openai.ChatCompletion.create`)
 - `aiohttp` — direct HTTP calls to the image generation endpoint
