@@ -13,6 +13,7 @@ COPY macros.py .
 COPY image_size.py .
 COPY daily_schedule.py .
 COPY pipes.py .
+COPY message_links.py .
 # Seed library only. At startup bot_ross copies this to data/magic_prompts.json (the
 # persistent volume) if that file is absent, so user-added mixins survive redeploys.
 COPY magic_prompts.json .

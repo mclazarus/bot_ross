@@ -22,6 +22,7 @@ import macros
 import image_size
 import daily_schedule
 import pipes
+import message_links
 from magic_paint import parse_magic_rate, format_magic_rate
 
 logging.basicConfig(level=logging.INFO)
@@ -496,11 +497,174 @@ async def _dpaint_once(ctx, raw):
     return await do_the_art(ctx, prompt, "dpaint", "dall-e-3")
 
 
+async def _resolve_linked_images(ctx, links):
+    """Resolve pasted Discord message links (see message_links.py) to their image
+    attachments for &remix. Returns (linked_attachments, note_lines).
+
+    SECURITY: message_links.classify_link only compares ids found in the pasted
+    URL text, which is attacker-controlled -- it is a cheap pre-filter, nothing
+    more. The URL's guild segment and channel segment are independent fields a
+    user can set to anything, and Discord routes a message by channel id, not by
+    whatever guild id happened to be in the link, so a link can *claim* the
+    current server while actually pointing at a channel in a different one. The
+    two checks below are the real authorization, and both run against the
+    RESOLVED objects, never the URL:
+      (a) the resolved channel's `guild.id` equals `ctx.guild.id`.
+      (b) the INVOKING user (`ctx.author`, not the bot) has `view_channel` AND
+          `read_message_history` on that resolved channel.
+    Skipping (b) would turn &remix into an image-exfiltration tool: the bot's own
+    permissions are frequently broader than a given requester's, so without this
+    check anyone could paste a link into a private channel they can't see and
+    have the bot fetch its image for them anyway.
+
+    Every failure is soft and bucketed into one of six fixed notices (S1-S6, sent
+    as a single joined message by the caller) -- S3 deliberately does NOT say
+    *why* a link failed (channel not found vs. no bot access vs. no requester
+    access vs. deleted message all look identical to the channel), so &remix
+    can't be used as an oracle to probe which private channels/messages exist.
+    The real reason is logged (never posted) for each S3-bucketed link.
+    """
+    if not links:
+        return [], []
+
+    current_guild_id = ctx.guild.id if ctx.guild else None
+    if current_guild_id is None:
+        # Outside a guild the checks above can't run at all -- refuse every link
+        # rather than silently let permission checking be a no-op.
+        logger.info(f"{ctx.author.name}: &remix invoked outside a guild, skipping {len(links)} message link(s)")
+        return [], [f"Message links only work in a server channel — skipping {len(links)} link(s)."]
+
+    ok_links = []
+    outside_count = 0
+    for link in links:
+        # classify_link is the cheap pre-filter (see its docstring) -- "dm" and
+        # "cross_guild" are combined into one S2 bucket here; the authoritative
+        # guild check still runs again below against the RESOLVED channel.
+        if message_links.classify_link(link, current_guild_id) == "ok":
+            ok_links.append(link)
+        else:
+            outside_count += 1
+
+    # The cap is applied here, BEFORE any network work, per spec -- but the S5
+    # notice line itself is deferred and assembled (along with S2-S4/S6) after the
+    # resolution loop below, via message_links.format_skip_notes, so the final
+    # note order is S2 -> S3 -> S4 -> S5 -> S6 regardless of the order these
+    # counts are computed in.
+    kept, dropped = message_links.limit_links(ok_links)
+
+    linked_attachments = []
+    unfetchable = 0
+    no_image = 0
+    truncated = False
+    for link in kept:
+        try:
+            channel = bot.get_channel(link.channel_id)
+            if channel is None:
+                try:
+                    channel = await bot.fetch_channel(link.channel_id)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+                    logger.warning(f"&remix link {link.raw}: couldn't resolve channel {link.channel_id}: {e!r}")
+                    unfetchable += 1
+                    continue
+
+            # Authoritative check (a) -- re-derive the guild from the RESOLVED
+            # channel object, never from the URL (see the docstring above).
+            guild = getattr(channel, "guild", None)
+            same_guild = guild is not None and guild.id == ctx.guild.id
+            if not same_guild:
+                logger.warning(f"&remix link {link.raw}: resolved channel {link.channel_id}'s guild != invoking guild")
+                unfetchable += 1
+                continue
+
+            # Authoritative check (b) -- the INVOKING user's own permissions on
+            # the resolved channel, not the bot's. view_channel is required
+            # alongside read_message_history because Discord's own semantics
+            # make history unreadable without view, and checking both fails
+            # closed if either is denied via a permission override.
+            perms = channel.permissions_for(ctx.author)
+            if not (perms.view_channel and perms.read_message_history):
+                logger.warning(
+                    f"&remix link {link.raw}: {ctx.author.name} lacks view_channel/"
+                    f"read_message_history on channel {link.channel_id}"
+                )
+                unfetchable += 1
+                continue
+
+            # discord.py's Thread.permissions_for ignores private-thread
+            # membership entirely (it just delegates to the parent channel), so
+            # the check above is not authoritative for a private thread -- see
+            # message_links.needs_thread_membership_check's docstring. Close that
+            # gap with an explicit membership fetch before trusting `perms`.
+            is_private_thread = isinstance(channel, discord.Thread) and channel.is_private()
+            if message_links.needs_thread_membership_check(is_private_thread, perms.manage_threads):
+                try:
+                    await channel.fetch_member(ctx.author.id)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+                    logger.warning(
+                        f"&remix link {link.raw}: {ctx.author.name} is not a member of "
+                        f"private thread {link.channel_id}: {e!r}"
+                    )
+                    unfetchable += 1
+                    continue
+
+            try:
+                msg = await channel.fetch_message(link.message_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+                logger.warning(f"&remix link {link.raw}: couldn't fetch message {link.message_id}: {e!r}")
+                unfetchable += 1
+                continue
+
+            images = [a for a in msg.attachments if (a.content_type or "").startswith("image/")]
+            if not images:
+                no_image += 1
+                continue
+            for a in images:
+                if len(linked_attachments) >= message_links.MAX_LINKS:
+                    truncated = True
+                    break
+                linked_attachments.append(a)
+        except Exception as e:
+            # One bad link must never crash &remix -- bucket it the same as any
+            # other unresolvable link; S3 deliberately doesn't distinguish why.
+            logger.warning(f"&remix link {link.raw}: unexpected error resolving it: {e!r}")
+            unfetchable += 1
+
+    notes = message_links.format_skip_notes(
+        outside_guild=outside_count,
+        unfetchable=unfetchable,
+        no_image=no_image,
+        kept=len(kept),
+        over_cap=len(dropped),
+        truncated=truncated,
+    )
+
+    logger.info(
+        f"{ctx.author.name}: &remix message links found={len(links)} kept={len(kept)} "
+        f"images={len(linked_attachments)} outside_guild={outside_count} "
+        f"over_cap={len(dropped)} unfetchable={unfetchable} no_image={no_image}"
+    )
+    return linked_attachments, notes
+
+
 async def _remix_once(ctx, raw):
-    """&remix's body, verbatim -- flags are parsed here rather than via the shared
+    """&remix's body -- flags are parsed here rather than via the shared
     _prep_generation_size because remix's size resolution differs by which path it
     ends up on below (edit vs. generation-fallback), and it must still work with no
-    prompt at all (image-only remix, `raw` is None)."""
+    prompt at all (image-only remix, `raw` is None).
+
+    Pasted Discord message links are stripped out of `raw` FIRST, before size
+    flags/macros/magic ever see the text (see message_links.strip_message_links) --
+    their images are resolved and appended to `attachments` LAST, after own
+    attachments and reply-image attachments, so a directly attached image stays
+    attachments[0] and keeps driving the edit size below (a pasted link must never
+    silently change the output size of a remix whose subject was the user's own
+    attachment). See _resolve_linked_images for the two authoritative security
+    checks a linked image must pass before its bytes are ever fetched."""
+    links = []
+    if raw:
+        raw, links = message_links.strip_message_links(raw)
+        raw = raw or None
+
     prompt = raw
     orientation, res_wh = None, None
     if prompt:
@@ -532,6 +696,14 @@ async def _remix_once(ctx, raw):
             attachments += [a for a in ref_msg.attachments if (a.content_type or "").startswith("image/")]
         except (discord.NotFound, discord.HTTPException):
             pass
+
+    # Linked images are resolved (and all their network fetching completed) here,
+    # BEFORE send_quote runs on either branch below -- the requester isn't left
+    # staring at a quote while &remix is still off fetching messages.
+    linked, notes = await _resolve_linked_images(ctx, links)
+    if notes:
+        await ctx.send("\n".join(notes))
+    attachments += linked
 
     if not attachments:
         if not prompt:
@@ -781,7 +953,7 @@ async def xpaint(ctx, *, prompt):
                  "xpaint", IMAGE_MODEL, "always")
 
 
-@bot.command(name='remix', help='Remix an image with a prompt. Attach an image, reply to one, or do both — and add a prompt to guide the transformation. Flags: --landscape/--portrait/--square, --res WxH (coerced to a valid size, same as &paint). Falls back to painting if no image is found. Monthly limit applies. Chain follow-up edits with | (up to 5 steps).')
+@bot.command(name='remix', help='Remix an image with a prompt. Attach an image, reply to one, paste a message link from this server, or any mix — and add a prompt to guide the transformation. Flags: --landscape/--portrait/--square, --res WxH (coerced to a valid size, same as &paint). Falls back to painting if no image is found. Monthly limit applies. Chain follow-up edits with | (up to 5 steps).')
 async def remix(ctx, *, prompt=None):
     await _piped(ctx, prompt, _remix_once, "remix", IMAGE_MODEL, "roll")
 

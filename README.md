@@ -9,7 +9,7 @@ Bot Ross is a Discord bot that generates images using OpenAI's image models. Cha
 | `&paint <prompt>` | Generate an image with gpt-image-2 (or `IMAGE_MODEL`). Flags: `--landscape`/`--portrait`/`--square`, `--res WxH` (coerced to the nearest valid generation size). Chain follow-up edits with `\|` (up to 5 steps) |
 | `&dpaint <prompt>` | Generate an image with DALL-E 3. Chain follow-up edits with `\|` (up to 5 steps) |
 | `&meme [idea]` | GPT generates a meme prompt, then paints it |
-| `&remix [prompt]` | Remix attached image(s) — or the image in a message you reply to — with a prompt, or paint a prompt if none is attached. Output size matches the first image's own dimensions as closely as possible by default; override with `--landscape`/`--portrait`/`--square`/`--res WxH` (coerced to a valid size, same as `&paint`). Chain follow-up edits with `\|` (up to 5 steps) |
+| `&remix [prompt]` | Remix attached image(s), the image in a message you reply to, and/or images from Discord message links pasted in the prompt (same server only) — or paint a prompt if none is found. Output size matches the first image's own dimensions as closely as possible by default; override with `--landscape`/`--portrait`/`--square`/`--res WxH` (coerced to a valid size, same as `&paint`). Chain follow-up edits with `\|` (up to 5 steps) |
 | `&release_image <git-hash-or-text> [--george] [--vN]` | Mint a deterministic release avatar: the input is hashed to pick a mad-libs image prompt, so the same input always yields the same prompt. `--george` reimagines the subject as George Costanza; `--vN` selects an algorithm version. Not subject to magic paint. Chain follow-up edits with `\|` (up to 5 steps) |
 | `&magic_list` | List the magic mixins (id, truncated text, author, date) |
 | `&magic_show <id>` | Show the full text of a magic mixin |
@@ -93,6 +93,23 @@ too, so a remix keeps your ultrawide/tall aspect instead of collapsing it to a s
 size. (`&remix` with no size flag matches the first attachment's own dimensions as
 closely as a valid size allows.) `--res` wins if you give both an orientation flag and
 `--res`.
+
+## Message links
+
+`&remix` also accepts Discord message links pasted anywhere in the prompt:
+
+    &remix https://discord.com/channels/<guild>/<channel>/<message> make it neon
+
+Each link is stripped out of the prompt text and its image attachments are added to
+the remix, up to 4 images total — after any image you attached directly and after
+the message you replied to, so those still drive the output size by default. Only
+links to messages **in the same server** are honored, and only when **you** (not
+just the bot) can read that channel's history; anything else is skipped with a
+plain notice instead of failing the whole command. Links from another server, a DM,
+or a channel you can't see are refused for the same reason: without that check,
+`&remix` could be used to pull images out of private channels you don't have access
+to. Up to 4 unique links are used per command (duplicates collapse into one); extras
+beyond that are dropped with a note.
 
 ## Setup
 
