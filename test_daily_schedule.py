@@ -53,6 +53,7 @@ from daily_schedule import (
     load_state,
     looks_like_inline_comment,
     mark_fired,
+    next_slot,
     normalize_slot_id,
     parse_add_fields,
     parse_bool,
@@ -394,6 +395,106 @@ class DueSlotsTest(unittest.TestCase):
         state = {"lunch": "2026-08-07"}
         now = datetime(2026, 8, 7, 7, 0, 0, tzinfo=_ny_offset(-4))
         self.assertEqual(due_slots(now, [SLOT_0700], state, NY), [(SLOT_0700, date(2026, 8, 7))])
+
+
+class NextSlotTest(unittest.TestCase):
+    """Purely informational -- it exists so the scheduler's startup log can say what
+    it's waiting for. Before it, the SUCCESS path was the only one that logged
+    nothing, so a running scheduler and one that died before its first tick looked
+    identical in `docker logs`."""
+
+    NY = ZoneInfo("America/New_York")
+    SEED = [
+        {"id": "morning", "time": "07:00", "type": "generate", "message": "m"},
+        {"id": "lunch", "time": "12:00", "type": "edit", "edit_prompt": "p", "message": "L"},
+        {"id": "quitting_time", "time": "17:00", "type": "edit", "edit_prompt": "p", "message": "Q"},
+        {"id": "goodnight", "time": "22:00", "type": "edit", "edit_prompt": "p", "message": "G"},
+    ]
+
+    def _next_id(self, now, entries=None):
+        result = next_slot(now, entries if entries is not None else self.SEED, self.NY)
+        return None if result is None else result[0]["id"]
+
+    def test_picks_the_next_slot_later_today(self):
+        # The exact question that prompted this: restarted at 12:47 EDT -- does 17:00
+        # still fire today?
+        now = datetime(2026, 8, 8, 12, 47, tzinfo=self.NY)
+        entry, instant = next_slot(now, self.SEED, self.NY)
+        self.assertEqual(entry["id"], "quitting_time")
+        self.assertEqual(instant.astimezone(self.NY).isoformat(), "2026-08-08T17:00:00-04:00")
+
+    def test_wraps_to_tomorrow_after_the_last_slot(self):
+        now = datetime(2026, 8, 8, 23, 30, tzinfo=self.NY)
+        entry, instant = next_slot(now, self.SEED, self.NY)
+        self.assertEqual(entry["id"], "morning")
+        self.assertEqual(instant.astimezone(self.NY).date(), date(2026, 8, 9))
+
+    def test_accepts_a_utc_now_and_answers_in_local_terms(self):
+        # The container passes UTC; 16:47Z is 12:47 EDT, so the answer must match the
+        # local-time case above rather than reading 16:47 as a local wall time.
+        now = datetime(2026, 8, 8, 16, 47, tzinfo=timezone.utc)
+        self.assertEqual(self._next_id(now), "quitting_time")
+
+    def test_utc_midnight_while_still_the_previous_local_day(self):
+        # 2026-08-09T02:00Z is 2026-08-08 22:00 EDT -- goodnight is due right now, so
+        # the NEXT one is tomorrow morning, not today's already-passed morning.
+        now = datetime(2026, 8, 9, 2, 30, tzinfo=timezone.utc)
+        entry, instant = next_slot(now, self.SEED, self.NY)
+        self.assertEqual(entry["id"], "morning")
+        self.assertEqual(instant.astimezone(self.NY).date(), date(2026, 8, 9))
+
+    def test_strictly_after_now_never_the_current_instant(self):
+        # A slot exactly at `now` is due (due_slots' job), not upcoming. Reporting it
+        # as "next" would read as "hasn't happened yet" while it fires.
+        now = slot_instant(date(2026, 8, 8), 17, 0, self.NY)
+        self.assertEqual(self._next_id(now), "goodnight")
+
+    def test_disabled_slots_are_skipped(self):
+        entries = [dict(e) for e in self.SEED]
+        entries[2]["enabled"] = False       # quitting_time off
+        now = datetime(2026, 8, 8, 12, 47, tzinfo=self.NY)
+        self.assertEqual(self._next_id(now, entries), "goodnight")
+
+    def test_returns_none_when_nothing_is_enabled(self):
+        entries = [dict(e, enabled=False) for e in self.SEED]
+        self.assertIsNone(next_slot(datetime(2026, 8, 8, 12, 0, tzinfo=self.NY), entries, self.NY))
+        self.assertIsNone(next_slot(datetime(2026, 8, 8, 12, 0, tzinfo=self.NY), [], self.NY))
+
+    def test_invalid_entries_are_skipped_not_raised(self):
+        # A hand-corrupted row must not take down a startup log line.
+        entries = [{"id": "bad", "time": "25:00", "type": "generate", "message": "m"}] + self.SEED
+        self.assertEqual(self._next_id(datetime(2026, 8, 8, 12, 47, tzinfo=self.NY), entries),
+                         "quitting_time")
+
+    def test_naive_now_raises(self):
+        with self.assertRaises(ValueError):
+            next_slot(datetime(2026, 8, 8, 12, 0), self.SEED, self.NY)
+
+    def test_dst_spring_forward_gap_slot(self):
+        # A 02:30 slot doesn't exist on 2026-03-08; it normalizes to 03:30 EDT, and
+        # next_slot must report that real instant, not the wall time that never occurs.
+        entries = [{"id": "gap", "time": "02:30", "type": "generate", "message": "m"}]
+        now = datetime(2026, 3, 8, 1, 0, tzinfo=self.NY)
+        _entry, instant = next_slot(now, entries, self.NY)
+        self.assertEqual(instant.astimezone(self.NY).isoformat(), "2026-03-08T03:30:00-04:00")
+
+    def test_does_not_mutate_inputs(self):
+        entries = [dict(e) for e in self.SEED]
+        before = copy.deepcopy(entries)
+        next_slot(datetime(2026, 8, 8, 12, 47, tzinfo=self.NY), entries, self.NY)
+        self.assertEqual(entries, before)
+
+    def test_ties_keep_entry_order(self):
+        entries = [
+            {"id": "first", "time": "09:00", "type": "generate", "message": "m"},
+            {"id": "second", "time": "09:00", "type": "generate", "message": "m"},
+        ]
+        self.assertEqual(self._next_id(datetime(2026, 8, 8, 8, 0, tzinfo=self.NY), entries), "first")
+
+    def test_agrees_with_the_shipped_seed(self):
+        entry, _instant = next_slot(datetime(2026, 8, 8, 12, 47, tzinfo=self.NY),
+                                    load_schedule(SEED_SCHEDULE_FILE), self.NY)
+        self.assertEqual(entry["id"], "quitting_time")
 
 
 class MarkFiredTest(unittest.TestCase):

@@ -1495,7 +1495,41 @@ async def _daily_scheduler_loop():
     """Per-minute tick. Sleeps to the next wall-clock minute boundary (recomputed from
     BOT_ZONE's current time every iteration, so it self-corrects after an NTP step or
     host suspend within one minute), then runs whatever slots are due. One bad tick
-    must never kill the heartbeat, so the tick body has its own try/except."""
+    must never kill the heartbeat, so the tick body has its own try/except.
+
+    Announces itself once on start. Until this existed the success path was the ONLY
+    path that logged nothing -- disabled, misconfigured and unset all logged, so a
+    running scheduler and a scheduler that died before its first tick looked
+    identical in `docker logs`, and confirming "will it post at 5?" meant reading the
+    source. Logged from inside the task rather than beside create_task() so the line
+    is evidence the coroutine actually started, not just that it was scheduled."""
+    try:
+        entries = daily_schedule.load_schedule(DAILY_SCHEDULE_FILE)
+        good, _errors = daily_schedule.validate_schedule(entries)
+        enabled = [e for e in good if daily_schedule.slot_is_enabled(e)]
+        upcoming = daily_schedule.next_slot(datetime.now(timezone.utc), good, BOT_ZONE)
+        if upcoming is None:
+            when = "nothing scheduled"
+        else:
+            entry, instant = upcoming
+            local = instant.astimezone(BOT_ZONE)
+            countdown = format_duration((instant - datetime.now(timezone.utc)).total_seconds())
+            slot_id = entry["id"]
+            when = f"next: {slot_id} at {local:%H:%M %Z} on {local:%Y-%m-%d} (in {countdown})"
+        # Built on its own line, not inlined into the f-string below: a nested
+        # same-quoted f-string (f"...{','.join(f'{e['id']}' ...)}...") is PEP 701
+        # syntax that only parses on 3.12+, and the container runs 3.10 -- so it would
+        # pass every local check and then crash on deploy. See NoNestedFStringsTest.
+        slot_list = ", ".join([e["id"] + " " + e["time"] for e in enabled])
+        logger.info(
+            f"Daily image scheduler started: zone={BOT_ZONE}, channel={DAILY_IMAGE_CHANNEL_ID}, "
+            f"{len(enabled)} enabled slot(s) [{slot_list}]; {when}"
+        )
+    except Exception:
+        # A broken schedule must not stop the heartbeat before it starts -- the tick
+        # loop below re-reads and re-validates it every minute anyway.
+        logger.exception("Daily scheduler: couldn't summarize the schedule at startup")
+
     while not draining:
         await asyncio.sleep(daily_schedule.seconds_to_next_minute(datetime.now(BOT_ZONE)))
         if draining:

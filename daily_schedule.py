@@ -908,6 +908,50 @@ def due_slots(now, entries, state, zone):
     return [(entry, day) for _instant, entry, day in candidates]
 
 
+def next_slot(now, entries, zone):
+    """The soonest slot scheduled strictly after `now`, as (entry, instant), or None
+    if the schedule has no enabled slots at all.
+
+    Purely informational -- due_slots, not this, decides what actually fires. It
+    exists so the scheduler can say what it's waiting for at startup: "the scheduler
+    is running" is not a claim an operator should have to take on faith, and the
+    absence of a log line is indistinguishable from a scheduler that never started.
+
+    `now` must be aware (a naive `now` raises ValueError, same contract as due_slots
+    and for the same reason: treating it as local time would silently shift every
+    slot by the zone's offset). Entries are validated first, so a hand-corrupted row
+    is skipped rather than crashing a startup log line. Disabled slots are skipped --
+    reporting one as "next" would be actively misleading.
+
+    Candidate days are today and tomorrow in `zone`: a slot whose time has already
+    passed today recurs tomorrow, and MISS_WINDOW is far under 24h, so no slot can be
+    more than one local day out. Ties (two slots at the same minute) keep `entries`'
+    order, matching due_slots.
+    """
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError(f"next_slot requires an aware `now`, got naive: {now!r}")
+
+    now = now.astimezone(timezone.utc)
+    good, _errors = validate_schedule(entries)
+    local_date = now.astimezone(zone).date()
+
+    upcoming = []
+    for entry in good:
+        if not slot_is_enabled(entry):
+            continue
+        hour, minute = parse_slot_time(entry["time"])
+        for day in (local_date, local_date + timedelta(days=1)):
+            instant = slot_instant(day, hour, minute, zone)
+            if instant > now:
+                upcoming.append((instant, entry))
+                break  # today's occurrence beats tomorrow's for this entry
+
+    if not upcoming:
+        return None
+    instant, entry = min(upcoming, key=lambda pair: pair[0])
+    return entry, instant
+
+
 def mark_fired(state, slot_id, day):
     """Return a NEW dict: a shallow copy of `state` with slot_id marked fired
     for `day`. Never mutates `state` -- aliasing the in-memory state with the

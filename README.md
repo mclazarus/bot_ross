@@ -54,6 +54,19 @@ valid can never be saved into an invalid state by these commands — a bad edit 
 rejected with an explanation instead. Set `DAILY_IMAGE_ENABLED=false` to turn the
 whole scheduler off (the manage commands still work; `&daily_image` still works too).
 
+On startup the bot logs one line confirming what the scheduler will do, so you can
+tell at a glance whether it's armed and what's next:
+
+```
+Daily image scheduler started: zone=America/New_York, channel=1125788287068541031,
+4 enabled slot(s) [morning 07:00, lunch 12:00, quitting_time 17:00, goodnight 22:00];
+next: quitting_time at 17:00 EDT on 2026-08-08 (in 253m 0s)
+```
+
+If the scheduler is off you get an explicit reason instead — `DAILY_IMAGE_ENABLED is
+false`, `no DAILY_IMAGE_CHANNEL_ID set`, or a warning that the channel id is set but
+unparseable (which echoes the offending value).
+
 A slot only fires if the bot is running within 10 minutes of its scheduled time —
 there is deliberately no catch-up, so a morning slot missed during an outage is
 simply lost. **`&daily_image`** covers that case: it does the morning slot's work on

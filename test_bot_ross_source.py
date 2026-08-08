@@ -863,5 +863,93 @@ class DailyListAddGuardAgainstUnparseableScheduleTest(unittest.TestCase):
         )
 
 
+class NoNestedFStringsTest(unittest.TestCase):
+    """Every .py file in the repo must parse under Python 3.10, the Docker base image.
+
+    A nested f-string that reuses the outer quote character --
+    f"...{', '.join(f'{e['id']}' for e in xs)}..." -- is PEP 701 syntax accepted only
+    on 3.12+. Development happens on 3.12, so it parses locally, passes the whole test
+    suite, and then raises SyntaxError at container start. `ast.parse(...,
+    feature_version=(3, 10))` does NOT catch it (verified: feature_version doesn't
+    downgrade the f-string tokenizer), and there is no CI running a real 3.10, so
+    nothing else in this repo would.
+
+    Rather than try to detect quote reuse precisely, this forbids f-string nesting
+    outright: it's the only common route to the bug, it's unreadable anyway, and the
+    fix is always the same one-line extraction. Caught this in review once, on the
+    scheduler's startup log line.
+    """
+
+    def _python_files(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        return [
+            os.path.join(here, name)
+            for name in sorted(os.listdir(here))
+            if name.endswith(".py")
+        ]
+
+    def test_no_python_file_nests_an_fstring(self):
+        offenders = []
+        for path in self._python_files():
+            with open(path, "r", encoding="utf-8") as f:
+                tree = ast.parse(f.read())
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.JoinedStr):
+                    continue
+                # Any JoinedStr inside this one's interpolated expressions is a nest.
+                for value in node.values:
+                    if not isinstance(value, ast.FormattedValue):
+                        continue
+                    # Walk the interpolated EXPRESSION only, never the whole
+                    # FormattedValue: its .format_spec is itself a JoinedStr, so
+                    # walking the parent flags every ordinary format spec
+                    # ({seconds:.1f}, {local:%H:%M}) as a nested f-string. Those are
+                    # harmless and parse fine on 3.10 -- the danger is exclusively a
+                    # nested f-string inside the expression.
+                    if any(isinstance(inner, ast.JoinedStr) for inner in ast.walk(value.value)):
+                        offenders.append(f"{os.path.basename(path)}:{node.lineno}")
+        self.assertEqual(
+            sorted(set(offenders)), [],
+            "nested f-string(s) found. If the inner one reuses the outer quote "
+            "character this is 3.12-only syntax and will SyntaxError on the 3.10 "
+            "container. Extract the inner expression to its own line:\n"
+            + "\n".join(sorted(set(offenders))),
+        )
+
+    def test_the_check_would_catch_a_regression(self):
+        # Mutation guard: prove the walk actually flags a nest, so a bug that made it
+        # scan nothing wouldn't leave this test vacuously green.
+        tree = ast.parse('x = f"a {b} {[f\'{c}\' for c in d]} e"')
+        found = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.JoinedStr)
+            and any(
+                isinstance(v, ast.FormattedValue)
+                and any(isinstance(i, ast.JoinedStr) for i in ast.walk(v.value))
+                for v in node.values
+            )
+        ]
+        self.assertTrue(found, "the nested-f-string detector failed to flag a known nest")
+
+    def test_an_ordinary_format_spec_is_not_flagged(self):
+        # The false positive this detector shipped with for about a minute:
+        # FormattedValue.format_spec is itself a JoinedStr, so walking the parent
+        # flagged f"{x:.1f}" and f"{d:%H:%M}" as nested. Both are fine on 3.10, and a
+        # check that fires on them would be turned off within a day.
+        for source in ('x = f"{seconds:.1f}s"', 'x = f"{local:%H:%M %Z}"', 'x = f"{n:>{width}}"'):
+            with self.subTest(source=source):
+                tree = ast.parse(source)
+                flagged = [
+                    node for node in ast.walk(tree)
+                    if isinstance(node, ast.JoinedStr)
+                    and any(
+                        isinstance(v, ast.FormattedValue)
+                        and any(isinstance(i, ast.JoinedStr) for i in ast.walk(v.value))
+                        for v in node.values
+                    )
+                ]
+                self.assertEqual(flagged, [], f"false positive on {source}")
+
+
 if __name__ == "__main__":
     unittest.main()
