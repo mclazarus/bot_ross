@@ -1,13 +1,19 @@
 """Static (AST-level) regression checks against bot_ross.py.
 
-bot_ross.py ends in bot.run(...) at module scope, so it can NEVER be imported
-under test (importing it starts the bot). Every non-trivial piece of logic in
-this codebase lives in a pure module instead -- but do_the_art's quiet-mode
-"never post the prompt" promise is small, security/privacy-sensitive, and
-lives entirely inside bot_ross.py itself, so it has no pure-module home. This
-file is the pragmatic fallback for that one case: it parses bot_ross.py with
-`ast` and asserts structural properties of do_the_art's source, without ever
-executing it.
+Since C1 (load_config()/main() + the __main__ guard) bot_ross.py imports
+cleanly under test with no environment and no side effects -- behavioral
+command tests land in test_bot_ross_commands.py (C2). What remains here are
+properties of the SOURCE itself: statement ordering inside main(), which
+branch of do_the_art may reference `prompt` under quiet=True, the
+completeness of load_config's `global` list -- things a behavioral test
+could only pin indirectly, if at all.
+
+Every non-trivial piece of logic in this codebase lives in a pure module
+instead -- but do_the_art's quiet-mode "never post the prompt" promise is
+small, security/privacy-sensitive, and lives entirely inside bot_ross.py
+itself, so it has no pure-module home. This file is the pragmatic fallback
+for that one case: it parses bot_ross.py with `ast` and asserts structural
+properties of do_the_art's source, without ever executing it.
 
 Specifically this guards against a real regression: do_the_art derived the
 Discord attachment's filename (via generate_file_name(prompt)) and alt-text
@@ -380,33 +386,31 @@ class DataDirCreatedBeforeSeedingTest(unittest.TestCase):
     data/ yet, seeding before the directory exists silently no-ops every
     library on the first run -- they only actually seed on the second start.
 
+    Since C1, all four calls live inside main() rather than at module scope
+    (bot_ross.py no longer does filesystem writes at import time), so the
+    real assertions below walk main()'s body instead of the module's.
+
     Regression: bot_ross.py originally called the three _seed_* functions
     first, and only then os.makedirs(DAILY_IMAGES_DIR, exist_ok=True) at the
     very bottom of the module. Since os.makedirs creates every missing
     intermediate directory, that call is also what creates data/ itself, so
     it has to run first."""
 
-    @classmethod
-    def setUpClass(cls):
-        with open(BOT_ROSS_PATH, "r", encoding="utf-8") as f:
-            source = f.read()
-        cls.tree = ast.parse(source)
-
-    def _module_level_makedirs_calls(self, tree=None):
-        # os.makedirs(...) as a bare top-level statement (an ast.Expr whose
-        # value is the Call) -- deliberately restricted to MODULE scope (not
-        # ast.walk, which would also match a makedirs call nested inside some
+    def _module_level_makedirs_calls(self, body):
+        # os.makedirs(...) as a bare top-level statement of the given
+        # statement list (an ast.Expr whose value is the Call) --
+        # deliberately restricted to a flat statement list (not ast.walk,
+        # which would also match a makedirs call nested inside some
         # unrelated function) since ordering only means something among
-        # statements that actually run in source order at import time.
+        # statements that actually run in source order within that scope.
         #
         # Further restricted to the call that actually creates the data
         # directory -- os.makedirs(DAILY_IMAGES_DIR, ...) (or a literal
-        # "data/..." string) -- so an unrelated module-level os.makedirs(...)
-        # added above the seed calls in the future can't make this test pass
-        # while the real DAILY_IMAGES_DIR call still regresses below them.
-        tree = tree if tree is not None else self.tree
+        # "data/..." string) -- so an unrelated makedirs(...) added above
+        # the seed calls in the future can't make this test pass while the
+        # real DAILY_IMAGES_DIR call still regresses below them.
         calls = []
-        for stmt in tree.body:
+        for stmt in body:
             if not isinstance(stmt, ast.Expr):
                 continue
             call = stmt.value
@@ -431,11 +435,10 @@ class DataDirCreatedBeforeSeedingTest(unittest.TestCase):
                 calls.append(call)
         return calls
 
-    def _module_level_seed_call_linenos(self, tree=None):
-        tree = tree if tree is not None else self.tree
+    def _module_level_seed_call_linenos(self, body):
         seed_names = {"_seed_magic_library", "_seed_macro_library", "_seed_daily_schedule"}
         linenos = []
-        for stmt in tree.body:
+        for stmt in body:
             if not isinstance(stmt, ast.Expr):
                 continue
             call = stmt.value
@@ -444,17 +447,20 @@ class DataDirCreatedBeforeSeedingTest(unittest.TestCase):
         return linenos
 
     def test_makedirs_precedes_first_seed_call(self):
-        makedirs_calls = self._module_level_makedirs_calls()
+        # Since C1 all four calls live inside main(), not at module scope --
+        # see main()'s body directly rather than the whole module's tree.
+        main_body = _load_function("main").body
+        makedirs_calls = self._module_level_makedirs_calls(main_body)
         self.assertTrue(
             makedirs_calls,
-            "expected a module-level os.makedirs(...) call that creates data/ "
+            "expected an os.makedirs(...) call in main() that creates data/ "
             "at startup",
         )
-        seed_linenos = self._module_level_seed_call_linenos()
+        seed_linenos = self._module_level_seed_call_linenos(main_body)
         self.assertEqual(
             len(seed_linenos), 3,
             "expected all three of _seed_magic_library()/_seed_macro_library()/"
-            "_seed_daily_schedule() to be called at module scope",
+            "_seed_daily_schedule() to be called inside main()",
         )
         earliest_makedirs_lineno = min(c.lineno for c in makedirs_calls)
         self.assertLess(
@@ -485,7 +491,7 @@ class DataDirCreatedBeforeSeedingTest(unittest.TestCase):
         )
         tree = ast.parse(source)
 
-        makedirs_calls = self._module_level_makedirs_calls(tree)
+        makedirs_calls = self._module_level_makedirs_calls(tree.body)
         self.assertEqual(
             len(makedirs_calls), 1,
             "the unrelated os.makedirs('logs', ...) call must be filtered "
@@ -493,7 +499,7 @@ class DataDirCreatedBeforeSeedingTest(unittest.TestCase):
             "directory",
         )
 
-        seed_linenos = self._module_level_seed_call_linenos(tree)
+        seed_linenos = self._module_level_seed_call_linenos(tree.body)
         earliest_makedirs_lineno = min(c.lineno for c in makedirs_calls)
         self.assertGreater(
             earliest_makedirs_lineno, min(seed_linenos),
@@ -512,8 +518,9 @@ class DailyCommandsValidateBeforeSaveTest(unittest.TestCase):
     notes): a write must be validated before it's saved, and no `await` may
     separate the load from the save (a single-threaded event loop can't
     interleave two edits as long as nothing yields control in between --
-    but a `ctx.send` partway through would). Checked purely via `ast` since
-    bot_ross.py can never be imported under test."""
+    but a `ctx.send` partway through would). Checked via `ast` because
+    these are source-ordering invariants, which AST inspection expresses
+    directly."""
 
     MUTATING_COMMANDS = ("daily_add", "daily_update", "daily_remove", "daily_toggle")
     VALIDATE_GATED_COMMANDS = ("daily_add", "daily_update", "daily_toggle")
@@ -914,6 +921,264 @@ class DockerfilePythonVersionTest(unittest.TestCase):
             f"{sys.version_info[0]}.{sys.version_info[1]}; the version claim is "
             "unverified by this suite.",
         )
+
+
+class NoImportTimeSideEffectsTest(unittest.TestCase):
+    """Complement of DataDirCreatedBeforeSeedingTest's C1 retarget: those tests
+    prove the four calls are correctly ORDERED inside main(), but say nothing
+    about whether a regression duplicated them back onto the module body while
+    leaving main() untouched. A behavioral import-with-no-environment test
+    (test_bot_ross_config.py's ImportSafetyTest, M1) would catch most such a
+    regression too, but only as long as the developer's own environment
+    doesn't happen to satisfy whatever got duplicated -- this test names each
+    offending call precisely in its failure message instead, unconditionally."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(BOT_ROSS_PATH, "r", encoding="utf-8") as f:
+            source = f.read()
+        cls.tree = ast.parse(source)
+
+    def _module_level_expr_calls(self):
+        # Bare top-level statements only (ast.Expr wrapping a Call) -- a call
+        # nested inside main() or any other function is fine and expected;
+        # only module-SCOPE calls run at import time.
+        calls = []
+        for stmt in self.tree.body:
+            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+                calls.append(stmt.value)
+        return calls
+
+    def test_no_bot_run_at_module_scope(self):
+        offenders = [
+            c for c in self._module_level_expr_calls()
+            if isinstance(c.func, ast.Attribute) and c.func.attr == "run"
+            and isinstance(c.func.value, ast.Name) and c.func.value.id == "bot"
+        ]
+        self.assertEqual(
+            offenders, [],
+            "bot.run(...) must only be called from inside main(), gated by "
+            "the `if __name__ == \"__main__\":` guard -- a module-scope call "
+            "starts the bot on every `import bot_ross`, which is the whole "
+            "thing C1 exists to prevent",
+        )
+
+    def test_no_makedirs_at_module_scope(self):
+        offenders = [
+            c for c in self._module_level_expr_calls()
+            if isinstance(c.func, ast.Attribute) and c.func.attr == "makedirs"
+            and isinstance(c.func.value, ast.Name) and c.func.value.id == "os"
+        ]
+        self.assertEqual(
+            offenders, [],
+            "os.makedirs(...) must only run from inside main() -- a "
+            "module-scope call writes to the filesystem on every "
+            "`import bot_ross`, which ImportSafetyTest's tmpdir-listdir "
+            "check (M1) exists to catch, but this names the call directly",
+        )
+
+    def test_no_seed_calls_at_module_scope(self):
+        seed_names = {"_seed_magic_library", "_seed_macro_library", "_seed_daily_schedule"}
+        offenders = [
+            c for c in self._module_level_expr_calls()
+            if isinstance(c.func, ast.Name) and c.func.id in seed_names
+        ]
+        self.assertEqual(
+            offenders, [],
+            "the three _seed_*() calls must only run from inside main() -- "
+            "a module-scope call writes the working library/schedule copies "
+            "to data/... on every `import bot_ross`",
+        )
+
+
+class MainGuardTest(unittest.TestCase):
+    """Without `if __name__ == \"__main__\": main()`, `CMD ["python",
+    "bot_ross.py"]` imports the module, does nothing, and exits 0 --
+    and run.sh's `--restart=unless-stopped` then spins the container
+    silently forever, with no error to grep for."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(BOT_ROSS_PATH, "r", encoding="utf-8") as f:
+            source = f.read()
+        cls.tree = ast.parse(source)
+
+    def test_main_guard_calls_main(self):
+        guards = [
+            stmt for stmt in self.tree.body
+            if isinstance(stmt, ast.If)
+            and isinstance(stmt.test, ast.Compare)
+            and isinstance(stmt.test.left, ast.Name) and stmt.test.left.id == "__name__"
+            and any(isinstance(op, ast.Eq) for op in stmt.test.ops)
+            and any(
+                isinstance(c, ast.Constant) and c.value == "__main__"
+                for c in stmt.test.comparators
+            )
+        ]
+        self.assertTrue(guards, "expected an `if __name__ == \"__main__\":` block")
+        calls_main = any(
+            isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "main"
+            for guard in guards
+            for n in ast.walk(guard)
+            if n is not guard  # only inspect the guard's body, not itself
+        )
+        self.assertTrue(
+            calls_main,
+            "the `if __name__ == \"__main__\":` block must call main() -- "
+            "without it the container imports, does nothing, and exits 0",
+        )
+
+
+class MainBodyOrderingTest(unittest.TestCase):
+    """Statement ordering inside main() -- each comparison's failure mode is
+    named individually, since these are exactly the three orderings C1's
+    spec calls out as load-bearing (vanished warnings, writes before secret
+    validation, bot serving traffic before its libraries are seeded)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.main = _load_function("main")
+
+    def _first_call_lineno(self, name):
+        for stmt in self.main.body:
+            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+                call = stmt.value
+                if isinstance(call.func, ast.Name) and call.func.id == name:
+                    return call.lineno
+        raise AssertionError(f"main() has no top-level call to {name}()")
+
+    def test_setup_logging_precedes_load_config(self):
+        self.assertLess(
+            self._first_call_lineno("setup_logging"),
+            self._first_call_lineno("load_config"),
+            "setup_logging() must run before load_config() -- otherwise the "
+            "BOT_TIMEZONE warning and the nine inline-comment warnings log "
+            "against a handler-less logger and vanish",
+        )
+
+    def test_load_config_precedes_makedirs(self):
+        makedirs_calls = [
+            stmt.value for stmt in self.main.body
+            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
+            and isinstance(stmt.value.func, ast.Attribute) and stmt.value.func.attr == "makedirs"
+            and isinstance(stmt.value.func.value, ast.Name) and stmt.value.func.value.id == "os"
+        ]
+        self.assertTrue(makedirs_calls, "expected an os.makedirs(...) call in main()")
+        self.assertLess(
+            self._first_call_lineno("load_config"),
+            min(c.lineno for c in makedirs_calls),
+            "load_config() must run before the filesystem writes -- a "
+            "mis-started container (missing secret) should exit before "
+            "touching the data/ volume",
+        )
+
+    def test_bot_run_follows_all_seed_calls(self):
+        seed_names = ("_seed_magic_library", "_seed_macro_library", "_seed_daily_schedule")
+        seed_linenos = [self._first_call_lineno(n) for n in seed_names]
+        run_calls = [
+            stmt.value for stmt in self.main.body
+            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
+            and isinstance(stmt.value.func, ast.Attribute) and stmt.value.func.attr == "run"
+            and isinstance(stmt.value.func.value, ast.Name) and stmt.value.func.value.id == "bot"
+        ]
+        self.assertTrue(run_calls, "expected a bot.run(...) call in main()")
+        self.assertGreater(
+            min(c.lineno for c in run_calls), max(seed_linenos),
+            "bot.run(...) must follow all three _seed_*() calls -- otherwise "
+            "the bot can start serving commands against unseeded libraries",
+        )
+
+
+class LoadConfigGlobalListTest(unittest.TestCase):
+    """A name omitted from load_config's `global` statement whose test value
+    happens to equal the module default passes every behavioral check --
+    reassignment silently becomes a function-local instead of updating the
+    module global. Enumerating the `global` statement's names directly
+    catches the omission unconditionally, regardless of what any test
+    happens to assert it to."""
+
+    REQUIRED_GLOBALS = {
+        "OPENAI_API_KEY", "DISCORD_BOT_TOKEN", "LIMIT", "IMAGE_MODEL", "IMAGE_MODERATION",
+        "MEME_MODEL", "MAGIC_PAINT_RATE", "DRAIN_TIMEOUT", "BOT_TIMEZONE", "BOT_ZONE",
+        "DAILY_IMAGE_ENABLED", "_raw_daily_channel", "DAILY_IMAGE_CHANNEL_ID",
+        "DAILY_CHANNEL_MISCONFIGURED",
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        cls.load_config = _load_function("load_config")
+
+    def _globaled_names(self):
+        names = set()
+        for node in ast.walk(self.load_config):
+            if isinstance(node, ast.Global):
+                names.update(node.names)
+        return names
+
+    def test_global_statement_covers_every_required_name(self):
+        globaled = self._globaled_names()
+        missing = self.REQUIRED_GLOBALS - globaled
+        self.assertEqual(
+            missing, set(),
+            f"load_config() must declare {sorted(missing)} in its `global` "
+            "statement, or reassigning them inside the function creates a "
+            "function-local shadow instead of updating the module config",
+        )
+
+    def test_raw_daily_channel_specifically_is_globaled(self):
+        # Dedicated assertion, called out by name: omitting _raw_daily_channel
+        # from the `global` list makes the assignment a function local, so
+        # on_ready reads the module default (None) instead, silently
+        # regressing the "set but unparseable vs. unset" distinction --
+        # the exact bug that already cost a day of daily images in
+        # production (see CLAUDE.md's Daily Image of the Day notes).
+        self.assertIn(
+            "_raw_daily_channel", self._globaled_names(),
+            "_raw_daily_channel missing from load_config()'s `global` "
+            "statement -- this is the production day-of-lost-daily-images "
+            "regression, not a cosmetic omission",
+        )
+
+
+class FetchFunctionsUseOpenAIKeyConstantTest(unittest.TestCase):
+    """fetch_image and fetch_image_edit must authenticate via the module-level
+    OPENAI_API_KEY constant, not the legacy `openai.api_key` SDK global --
+    the two are kept in sync only transitionally (see load_config's
+    `# transitional` comment) until C4 removes the SDK entirely. Left half of
+    each test prevents the C4 time bomb: if a header were still reading
+    openai.api_key, deleting `import openai` in C4 would break both image
+    endpoints outright."""
+
+    def _asserts_no_openai_api_key_attr(self, func_node, label):
+        offenders = [
+            n for n in ast.walk(func_node)
+            if isinstance(n, ast.Attribute) and n.attr == "api_key"
+            and isinstance(n.value, ast.Name) and n.value.id == "openai"
+        ]
+        self.assertEqual(
+            offenders, [],
+            f"{label} must not reference openai.api_key -- it's the "
+            "transitional SDK global assigned in load_config for "
+            "get_meme_prompt's benefit; a header still reading it would "
+            "break outright once C4 deletes `import openai`",
+        )
+
+    def _assert_references_openai_api_key_name(self, func_node, label):
+        self.assertTrue(
+            _references(func_node, "OPENAI_API_KEY"),
+            f"{label} must authenticate via the module-level OPENAI_API_KEY "
+            "constant set by load_config()",
+        )
+
+    def test_fetch_image(self):
+        node = _load_function("fetch_image")
+        self._asserts_no_openai_api_key_attr(node, "fetch_image")
+        self._assert_references_openai_api_key_name(node, "fetch_image")
+
+    def test_fetch_image_edit(self):
+        node = _load_function("fetch_image_edit")
+        self._asserts_no_openai_api_key_attr(node, "fetch_image_edit")
+        self._assert_references_openai_api_key_name(node, "fetch_image_edit")
 
 
 if __name__ == "__main__":

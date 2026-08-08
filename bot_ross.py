@@ -25,77 +25,135 @@ import pipe_chain
 import message_links
 from magic_paint import parse_magic_rate, format_magic_rate
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bot_ross")
-coloredlogs.install(level='INFO', logger=logger, milliseconds=True)
 
-# Load OpenAI API key and Discord bot token from environment variables
-openai.api_key = os.environ['OPENAI_API_KEY']
-DISCORD_BOT_TOKEN = os.environ['DISCORD_BOT_TOKEN']
+# Import-safe defaults: load_config() reassigns all of these from the environment
+# at startup (see main()); under test the module imports with these values and
+# tests override individual globals directly.
+OPENAI_API_KEY = None
+DISCORD_BOT_TOKEN = None
+LIMIT = 100
+IMAGE_MODEL = 'gpt-image-2-low'
+IMAGE_MODERATION = 'low'
+MEME_MODEL = 'gpt-5.4-mini'
+MAGIC_PAINT_RATE = 0.05
+DRAIN_TIMEOUT = 300.0
+BOT_TIMEZONE = daily_schedule.DEFAULT_TIMEZONE
+BOT_ZONE, _ = daily_schedule.get_zone(BOT_TIMEZONE)   # never raises; America/New_York
+DAILY_IMAGE_ENABLED = True
+_raw_daily_channel = None
+DAILY_IMAGE_CHANNEL_ID = None
+DAILY_CHANNEL_MISCONFIGURED = False
 
-# Configuration
-LIMIT            = int(os.environ.get('API_LIMIT', 100))
-IMAGE_MODEL      = os.environ.get('IMAGE_MODEL', 'gpt-image-2-low')
-IMAGE_MODERATION = os.environ.get('IMAGE_MODERATION', 'low')
-MEME_MODEL       = os.environ.get('MEME_MODEL', 'gpt-5.4-mini')
-DATA_FILE        = "data/request_data.json"
+DATA_FILE = "data/request_data.json"
 
-try:
-    MAGIC_PAINT_RATE = float(os.environ.get('MAGIC_PAINT_RATE', 0.05))
-    if not (0.0 <= MAGIC_PAINT_RATE <= 1.0):
-        raise ValueError
-except (TypeError, ValueError):
-    MAGIC_PAINT_RATE = 0.05
 
-# On SIGTERM/SIGINT the bot stops accepting new commands and waits up to DRAIN_TIMEOUT
-# seconds for in-flight image generations to finish before closing (see
-# _graceful_shutdown). Raised from 60 to 300: a pipe chain now brackets its WHOLE
-# run (up to 5 sequential image calls) with active_requests, and a 5-segment chain
-# routinely takes well over a minute -- run.sh's STOP_TIMEOUT must stay above this.
-try:
-    DRAIN_TIMEOUT = float(os.environ.get('DRAIN_TIMEOUT', 300))
-    if DRAIN_TIMEOUT < 0:
-        raise ValueError
-except (TypeError, ValueError):
-    DRAIN_TIMEOUT = 300.0
-
-# The bot's single wall-clock timezone for the daily-image scheduler (see
-# _daily_scheduler_loop below) -- all slot times in daily_schedule.json are wall-clock
-# in THIS zone, regardless of the container's own (UTC) clock. A bad/unknown
-# BOT_TIMEZONE falls back to UTC rather than crashing at import; get_zone() reports
-# the problem back as a string so we can still log it loudly here.
-BOT_TIMEZONE = os.environ.get('BOT_TIMEZONE', daily_schedule.DEFAULT_TIMEZONE)
-BOT_ZONE, _tz_error = daily_schedule.get_zone(BOT_TIMEZONE)
-if _tz_error:
-    logger.warning(f"BOT_TIMEZONE problem, falling back to UTC: {_tz_error}")
-
-# DAILY_IMAGE_CHANNEL_ID unset (None) disables the scheduler entirely, same as
-# DAILY_IMAGE_ENABLED=false -- see on_ready. Both are parsed leniently (never raise) so a
-# typo'd env var can't crash the bot at import.
-DAILY_IMAGE_ENABLED = daily_schedule.parse_bool(os.environ.get('DAILY_IMAGE_ENABLED'), True)
-_raw_daily_channel = os.environ.get('DAILY_IMAGE_CHANNEL_ID')
-DAILY_IMAGE_CHANNEL_ID = daily_schedule.parse_channel_id(_raw_daily_channel)
-# Distinguish "not configured" from "configured but unparseable". Both yield None, but
-# reporting them the same way is how a set-but-malformed channel id got read as
-# "no channel configured" for a full day -- see the inline-comment check below.
-DAILY_CHANNEL_MISCONFIGURED = DAILY_IMAGE_CHANNEL_ID is None and bool(
-    (_raw_daily_channel or "").strip()
-)
-
-# `docker run --env-file` takes everything after the first "=" as the value, comment
-# included, so a .env written with trailing `# ...` comments silently poisons every
-# value it touches. Each parser above then falls back to its default without saying
-# why. Check the raw values once at startup and name the variable, so this shows up as
-# one obvious log line instead of a scheduler that quietly never runs.
-for _name in ('BOT_TIMEZONE', 'DAILY_IMAGE_CHANNEL_ID', 'DAILY_IMAGE_ENABLED',
-              'DRAIN_TIMEOUT', 'API_LIMIT', 'IMAGE_MODEL', 'IMAGE_MODERATION',
-              'MEME_MODEL', 'MAGIC_PAINT_RATE'):
-    if daily_schedule.looks_like_inline_comment(os.environ.get(_name)):
-        logger.warning(
-            f"{_name} looks like it contains an inline `# comment` -- docker --env-file "
-            f"does not strip those, so the comment is part of the value and this "
-            f"setting is being ignored. Put comments on their own line in .env."
+def _require(env, name):
+    """Return env[name] if it's a non-empty, non-whitespace-only string;
+    otherwise exit with a legible message. run.sh runs the container
+    --restart=unless-stopped, so a startup failure is an infinite crash-loop --
+    each iteration should print one legible line naming the missing variable
+    instead of a bare KeyError traceback. Empty/whitespace-only counts as
+    missing too: `docker --env-file` turns a line `OPENAI_API_KEY=` into an
+    empty string, which today boots "successfully" and then 401s on the
+    first paint with no hint why."""
+    value = env.get(name)
+    if value is None or not str(value).strip():
+        raise SystemExit(
+            f"Required environment variable {name} is missing or empty (see env.example)."
         )
+    return value
+
+
+def setup_logging():
+    logging.basicConfig(level=logging.INFO)
+    coloredlogs.install(level='INFO', logger=logger, milliseconds=True)
+
+
+def load_config(env=None):
+    """Parse configuration out of `env` (any mapping; env=None means
+    os.environ) and reassign the module-scope config globals. Config stays
+    module globals, not a Config object: &magic_rate mutates MAGIC_PAINT_RATE
+    via `global` at runtime, and ~40 call sites (including lambdas, which
+    close over the global rather than capturing it) read these names at call
+    time, so reassignment is picked up with zero call-site changes."""
+    global OPENAI_API_KEY, DISCORD_BOT_TOKEN, LIMIT, IMAGE_MODEL, IMAGE_MODERATION, \
+        MEME_MODEL, MAGIC_PAINT_RATE, DRAIN_TIMEOUT, BOT_TIMEZONE, BOT_ZONE, \
+        DAILY_IMAGE_ENABLED, _raw_daily_channel, DAILY_IMAGE_CHANNEL_ID, \
+        DAILY_CHANNEL_MISCONFIGURED
+
+    if env is None:
+        env = os.environ
+
+    # Load OpenAI API key and Discord bot token from environment variables
+    OPENAI_API_KEY = _require(env, 'OPENAI_API_KEY')
+    DISCORD_BOT_TOKEN = _require(env, 'DISCORD_BOT_TOKEN')
+    # transitional: get_meme_prompt still authenticates via the v0.27 SDK global; removed in C4
+    openai.api_key = OPENAI_API_KEY
+
+    # Configuration
+    LIMIT            = int(env.get('API_LIMIT', 100))
+    IMAGE_MODEL      = env.get('IMAGE_MODEL', 'gpt-image-2-low')
+    IMAGE_MODERATION = env.get('IMAGE_MODERATION', 'low')
+    MEME_MODEL       = env.get('MEME_MODEL', 'gpt-5.4-mini')
+
+    try:
+        MAGIC_PAINT_RATE = float(env.get('MAGIC_PAINT_RATE', 0.05))
+        if not (0.0 <= MAGIC_PAINT_RATE <= 1.0):
+            raise ValueError
+    except (TypeError, ValueError):
+        MAGIC_PAINT_RATE = 0.05
+
+    # On SIGTERM/SIGINT the bot stops accepting new commands and waits up to DRAIN_TIMEOUT
+    # seconds for in-flight image generations to finish before closing (see
+    # _graceful_shutdown). Raised from 60 to 300: a pipe chain now brackets its WHOLE
+    # run (up to 5 sequential image calls) with active_requests, and a 5-segment chain
+    # routinely takes well over a minute -- run.sh's STOP_TIMEOUT must stay above this.
+    try:
+        DRAIN_TIMEOUT = float(env.get('DRAIN_TIMEOUT', 300))
+        if DRAIN_TIMEOUT < 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        DRAIN_TIMEOUT = 300.0
+
+    # The bot's single wall-clock timezone for the daily-image scheduler (see
+    # _daily_scheduler_loop below) -- all slot times in daily_schedule.json are wall-clock
+    # in THIS zone, regardless of the container's own (UTC) clock. A bad/unknown
+    # BOT_TIMEZONE falls back to UTC rather than crashing at import; get_zone() reports
+    # the problem back as a string so we can still log it loudly here.
+    BOT_TIMEZONE = env.get('BOT_TIMEZONE', daily_schedule.DEFAULT_TIMEZONE)
+    BOT_ZONE, _tz_error = daily_schedule.get_zone(BOT_TIMEZONE)
+    if _tz_error:
+        logger.warning(f"BOT_TIMEZONE problem, falling back to UTC: {_tz_error}")
+
+    # DAILY_IMAGE_CHANNEL_ID unset (None) disables the scheduler entirely, same as
+    # DAILY_IMAGE_ENABLED=false -- see on_ready. Both are parsed leniently (never raise) so a
+    # typo'd env var can't crash the bot at import.
+    DAILY_IMAGE_ENABLED = daily_schedule.parse_bool(env.get('DAILY_IMAGE_ENABLED'), True)
+    _raw_daily_channel = env.get('DAILY_IMAGE_CHANNEL_ID')
+    DAILY_IMAGE_CHANNEL_ID = daily_schedule.parse_channel_id(_raw_daily_channel)
+    # Distinguish "not configured" from "configured but unparseable". Both yield None, but
+    # reporting them the same way is how a set-but-malformed channel id got read as
+    # "no channel configured" for a full day -- see the inline-comment check below.
+    DAILY_CHANNEL_MISCONFIGURED = DAILY_IMAGE_CHANNEL_ID is None and bool(
+        (_raw_daily_channel or "").strip()
+    )
+
+    # `docker run --env-file` takes everything after the first "=" as the value, comment
+    # included, so a .env written with trailing `# ...` comments silently poisons every
+    # value it touches. Each parser above then falls back to its default without saying
+    # why. Check the raw values once at startup and name the variable, so this shows up as
+    # one obvious log line instead of a scheduler that quietly never runs.
+    for _name in ('BOT_TIMEZONE', 'DAILY_IMAGE_CHANNEL_ID', 'DAILY_IMAGE_ENABLED',
+                  'DRAIN_TIMEOUT', 'API_LIMIT', 'IMAGE_MODEL', 'IMAGE_MODERATION',
+                  'MEME_MODEL', 'MAGIC_PAINT_RATE'):
+        if daily_schedule.looks_like_inline_comment(env.get(_name)):
+            logger.warning(
+                f"{_name} looks like it contains an inline `# comment` -- docker --env-file "
+                f"does not strip those, so the comment is part of the value and this "
+                f"setting is being ignored. Put comments on their own line in .env."
+            )
+
 
 # The working library lives on the persistent data/ volume so user-added mixins survive
 # redeploys; DEFAULT_MAGIC_PROMPTS_FILE is the seed baked into the image (see _seed_magic_library).
@@ -1381,7 +1439,7 @@ async def fetch_image(prompt, model, size=None):
             async with session.post(
                     "https://api.openai.com/v1/images/generations",
                     headers={
-                        "Authorization": f"Bearer {openai.api_key}",
+                        "Authorization": f"Bearer {OPENAI_API_KEY}",
                         "Content-Type": "application/json"
                     },
                     json=payload,
@@ -1435,7 +1493,7 @@ async def fetch_image_edit(prompt, model, images, size=None):
 
             async with session.post(
                     "https://api.openai.com/v1/images/edits",
-                    headers={"Authorization": f"Bearer {openai.api_key}"},
+                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
                     data=form,
             ) as response:
                 if response.status == 200:
@@ -1454,12 +1512,11 @@ async def fetch_image_edit(prompt, model, images, size=None):
 
 # --- Daily image-of-the-day scheduler -------------------------------------------------
 #
-# Thin wrappers around daily_schedule.py's pure logic, deliberately untested (the loop
-# itself can't be imported/exercised under test since bot_ross.py ends in bot.run() at
-# module scope; everything testable about time/DST/retention lives in daily_schedule.py
-# instead -- see test_daily_schedule.py). Every actual image call still funnels through
-# do_the_art, so the scheduler inherits over_limit, the monthly counter, safety-trip
-# accounting, and the active_requests drain bracket for free.
+# Thin wrappers around daily_schedule.py's pure logic. The loop wiring here is
+# deliberately thin; everything testable about time/DST/retention lives in
+# daily_schedule.py (see test_daily_schedule.py). Every actual image call still funnels
+# through do_the_art, so the scheduler inherits over_limit, the monthly counter,
+# safety-trip accounting, and the active_requests drain bracket for free.
 
 FAILURE_MESSAGE = "My paint brush hit me with a :circlegame: sorry nothing to see here"
 
@@ -2209,17 +2266,25 @@ def get_random_bob_ross_quote():
     return random.choice(quotes)
 
 
-# The Dockerfile's `mkdir -p /app/data/daily_images` is masked once data/ is a bind
-# mount (run.sh mounts the host data dir over /app/data), so ensure the retained-
-# image directory exists here too, at startup, every time. os.makedirs creates every
-# missing intermediate directory, so this one call also creates data/ itself -- which
-# is why it MUST run before the three _seed_* calls below, not after: each of them
-# writes its working copy straight to a data/... path, and json_library.seed_library
-# fails open (catches OSError, logs "Failed to seed ...") rather than raising, so on a
-# fresh checkout with no data/ yet, seeding after would silently no-op every library
-# on the first run and only actually seed on the second.
-os.makedirs(DAILY_IMAGES_DIR, exist_ok=True)
-_seed_magic_library()
-_seed_macro_library()
-_seed_daily_schedule()
-bot.run(DISCORD_BOT_TOKEN)
+def main():
+    setup_logging()
+    load_config()
+
+    # The Dockerfile's `mkdir -p /app/data/daily_images` is masked once data/ is a bind
+    # mount (run.sh mounts the host data dir over /app/data), so ensure the retained-
+    # image directory exists here too, at startup, every time. os.makedirs creates every
+    # missing intermediate directory, so this one call also creates data/ itself -- which
+    # is why it MUST run before the three _seed_* calls below, not after: each of them
+    # writes its working copy straight to a data/... path, and json_library.seed_library
+    # fails open (catches OSError, logs "Failed to seed ...") rather than raising, so on a
+    # fresh checkout with no data/ yet, seeding after would silently no-op every library
+    # on the first run and only actually seed on the second.
+    os.makedirs(DAILY_IMAGES_DIR, exist_ok=True)
+    _seed_magic_library()
+    _seed_macro_library()
+    _seed_daily_schedule()
+    bot.run(DISCORD_BOT_TOKEN)
+
+
+if __name__ == "__main__":
+    main()
