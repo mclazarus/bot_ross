@@ -196,6 +196,23 @@ def _seed_daily_schedule():
     daily_schedule.seed_schedule(DAILY_SCHEDULE_FILE, DEFAULT_DAILY_SCHEDULE_FILE)
 
 
+# Thin wrappers binding daily_schedule.py's I/O to DAILY_SCHEDULE_FILE, used by the
+# &daily_* management commands below. The scheduler tick (_run_due_daily_slots) and
+# &daily_image call daily_schedule.load_schedule(DAILY_SCHEDULE_FILE) directly instead
+# (test_bot_ross_source.py's test_scheduler_tick_reloads_the_schedule_fresh asserts
+# that exact attribute-call shape) -- so if you "tidy up" those two call sites to use
+# _load_daily_schedule() instead, update that test alongside it. Either way, nothing
+# here is cached: every caller reads/writes the working copy on the data/ volume
+# fresh, so a &daily_* edit takes effect on the very next scheduler tick (at most
+# ~60s later) with no restart required.
+def _load_daily_schedule():
+    return daily_schedule.load_schedule(DAILY_SCHEDULE_FILE)
+
+
+def _save_daily_schedule(entries):
+    daily_schedule.save_schedule(entries, DAILY_SCHEDULE_FILE)
+
+
 def format_rate_change_time(iso_str):
     """Render a stored rate-change timestamp as 'YYYY-MM-DD HH:MM:SS ±HHMM'.
     Legacy naive timestamps recorded before timezones were tracked render without the offset."""
@@ -1699,6 +1716,281 @@ async def daily_image_cmd(ctx):
     if entry:
         state = daily_schedule.load_state(DAILY_STATE_FILE)
         daily_schedule.save_state(daily_schedule.mark_fired(state, entry["id"], day), DAILY_STATE_FILE)
+
+
+# --- &daily_* schedule-management commands ------------------------------------------
+#
+# The only way to retime a slot, reword its announcement, or change an edit prompt
+# used to be hand-editing data/daily_schedule.json on the volume. These commands are
+# open to everyone, no permission checks -- same shape as &macro_*/&magic_* above.
+# All the actual logic (parsing, validation, id/time canonicalization, formatting)
+# lives in daily_schedule.py; these bodies are thin glue, same division of labor as
+# every other command family in this file.
+#
+# Every mutating command (&daily_add/&daily_update/&daily_remove/&daily_toggle) does
+# load -> validate -> save with NO await in between (see daily_schedule.py's module
+# docstring §0.2): a single-threaded event loop can't interleave two edits as long as
+# nothing yields control between the read and the write, so each command computes its
+# reply into a local `message` string and sends it exactly once, at the end -- never
+# an early `await ctx.send(...)` partway through a mutation. Because
+# _run_due_daily_slots() reloads the schedule fresh every tick (never cached), a
+# saved edit here takes effect within at most ~60s, no restart required.
+
+# One literal shared by every write path that can leave the schedule with no
+# enabled `generate` slot -- &daily_remove, &daily_toggle, and &daily_update
+# (checked unconditionally after every successful save, since either an
+# `enabled` flip OR a `type` change to "edit" can be the write that empties
+# the last one) -- a single constant so the call sites can't drift into
+# slightly different wording over time.
+NO_ENABLED_GENERATE_WARNING = (
+    "\n⚠️ No enabled `generate` slot is left — edit slots will silently repaint the "
+    "day's base image themselves."
+)
+
+
+@bot.command(
+    name='daily_list',
+    help='List the daily image schedule slots. Use &daily_show to see one in full, &daily_update to change it.',
+)
+async def daily_list(ctx):
+    entries = _load_daily_schedule()
+    if not entries:
+        # load_schedule fails OPEN on a syntax-broken data/daily_schedule.json --
+        # it returns [] exactly the same as a genuinely empty/absent file. Without
+        # this check that reads as "empty, add away", and the next &daily_add
+        # would overwrite the whole (unparseable-but-still-there) file with a
+        # single new entry -- silently discarding every existing slot.
+        if daily_schedule.schedule_file_is_corrupt(DAILY_SCHEDULE_FILE):
+            await ctx.send(
+                f"`{DAILY_SCHEDULE_FILE}` exists but could not be parsed as JSON — fix it by hand. "
+                "`&daily_add` won't touch it until it parses, to avoid overwriting whatever's still in there."
+            )
+        else:
+            await ctx.send("The daily schedule is empty. Add a slot with `&daily_add <id> <HH:MM> <generate|edit> <message>`.")
+        return
+    lines = [
+        "Use `&daily_show <id>` for the full detail, `&daily_update <id> <field> <value>` to change one, "
+        "`&daily_toggle <id>` to switch it off."
+    ]
+    lines.extend(daily_schedule.format_schedule_lines(entries))
+    # At most one trailing note -- there's no point curating a schedule that can
+    # never actually post.
+    if not DAILY_IMAGE_ENABLED:
+        lines.append("Note: `DAILY_IMAGE_ENABLED` is false — nothing on this schedule will fire.")
+    elif not DAILY_IMAGE_CHANNEL_ID:
+        lines.append("Note: no `DAILY_IMAGE_CHANNEL_ID` is configured — nothing on this schedule will fire.")
+    await send_long(ctx, "\n".join(lines))
+
+
+@bot.command(name='daily_show', help='Show one daily schedule slot in full by id (see &daily_list).')
+async def daily_show(ctx, slot_id=None):
+    if not slot_id:
+        await ctx.send("Which one? `&daily_show <id>` — see `&daily_list` for ids.")
+        return
+    entries = _load_daily_schedule()
+    entry = daily_schedule.find_slot(entries, slot_id)
+    if entry is None:
+        await ctx.send(f"No daily slot with id `{daily_schedule.truncate_text(daily_schedule.normalize_slot_id(slot_id))}`.")
+        return
+    lines = []
+    error = daily_schedule.validate_slot(entry)
+    if error is not None:
+        lines.append(f"⚠️ {error}")
+    lines.append(daily_schedule.format_slot_detail(entry))
+    await send_long(ctx, "\n".join(lines))
+
+
+@bot.command(
+    name='daily_add',
+    help='Add a daily schedule slot. &daily_add <id> <HH:MM> <generate|edit> <message> — for an edit slot append " :: <edit prompt>".',
+)
+async def daily_add(ctx, slot_id=None, slot_time=None, slot_type=None, *, rest=None):
+    if not slot_id or not slot_time or not slot_type or not rest:
+        await ctx.send(
+            "Usage: `&daily_add <id> <HH:MM> <generate|edit> <message>` — for an edit slot add "
+            "` :: <edit prompt>`, e.g. `&daily_add teatime 15:30 edit Tea time! :: everyone stops for tea`"
+        )
+        return
+
+    normalized_id = daily_schedule.normalize_slot_id(slot_id)
+    if not daily_schedule.is_valid_slot_id(normalized_id):
+        await ctx.send("Daily slot ids must be 1-32 characters: lowercase letters, digits, `_`, or `-`.")
+        return
+
+    entries = _load_daily_schedule()
+    if not entries and daily_schedule.schedule_file_is_corrupt(DAILY_SCHEDULE_FILE):
+        # See daily_list's identical check: load_schedule fails open to [] on a
+        # syntax-broken file, indistinguishable from a genuinely empty schedule.
+        # Refuse the add rather than writing a single-entry file over whatever's
+        # actually still in data/daily_schedule.json.
+        message = (
+            f"`{DAILY_SCHEDULE_FILE}` exists but could not be parsed as JSON — fix it by hand first. "
+            "Adding a slot now would overwrite it with just this one entry."
+        )
+    elif daily_schedule.find_slot(entries, normalized_id) is not None:
+        # find_slot matches broken rows too, not just validated ones -- otherwise
+        # adding a second `lunch` next to a corrupted `lunch` would look like it
+        # succeeded (validate_schedule would silently drop one as a duplicate) while
+        # actually doing nothing.
+        message = (
+            f"`{normalized_id}` already exists. Use `&daily_update {normalized_id} <field> <value>` to "
+            f"change it, or `&daily_remove {normalized_id}` first."
+        )
+    else:
+        add_message, edit_prompt, error = daily_schedule.parse_add_fields(rest)
+        if error is not None:
+            message = f"Couldn't add that slot: {error}"
+        else:
+            entry, error = daily_schedule.build_slot_entry(
+                normalized_id, slot_time, slot_type, add_message, edit_prompt=edit_prompt,
+                author=ctx.author.name, added=date.today().isoformat(),
+            )
+            if error is not None:
+                message = f"Couldn't add that slot: {error}"
+            else:
+                # Belt-and-suspenders: build_slot_entry already enforces every rule
+                # validate_schedule would, but routing the final check through
+                # validate_slot means every rule added there in the future
+                # automatically gates this write too, with one wording per rule.
+                check_error = daily_schedule.validate_slot(entry)
+                if check_error is not None:
+                    message = f"Couldn't add that slot: {check_error}"
+                else:
+                    entries.append(entry)
+                    _save_daily_schedule(entries)
+                    message = (
+                        f"Added daily slot `{entry['id']}` — {entry['time']} {entry['type']}. Switch it off "
+                        f"with `&daily_toggle {entry['id']}`, remove it with `&daily_remove {entry['id']}`."
+                    )
+    await ctx.send(message)
+
+
+@bot.command(
+    name='daily_update',
+    help="Change one field of a daily schedule slot: &daily_update <id> <field> <value>. Fields: time, type, message, edit_prompt, magic, enabled.",
+)
+async def daily_update(ctx, slot_id=None, field=None, *, value=None):
+    if not slot_id or not field or value is None:
+        await ctx.send(
+            "Usage: `&daily_update <id> <field> <value>` — fields: `time`, `type`, `message`, `edit_prompt`, "
+            "`magic`, `enabled`. e.g. `&daily_update lunch time 12:30`"
+        )
+        return
+
+    entries = _load_daily_schedule()
+    entry = daily_schedule.find_slot(entries, slot_id)
+    if entry is None:
+        message = f"No daily slot with id `{daily_schedule.truncate_text(daily_schedule.normalize_slot_id(slot_id))}`."
+    else:
+        sid = daily_schedule.slot_entry_id(entry)
+        new_entry, error = daily_schedule.apply_slot_update(
+            entry, field, value, editor=ctx.author.name, edited=date.today().isoformat(),
+        )
+        if error is not None:
+            message = f"Couldn't update `{sid}`: {error}"
+        else:
+            # The write invariant: a slot that's currently VALID can never be made
+            # invalid by a command (refuse, and say why) -- but a slot that's
+            # currently INVALID can always be edited, or a row broken in two
+            # fields could never be repaired (fixing either field alone would
+            # still fail validation). If it's still invalid after the edit, the
+            # write is saved anyway and a heads-up is appended.
+            was_valid = daily_schedule.validate_slot(entry) is None
+            still_error = daily_schedule.validate_slot(new_entry)
+            if was_valid and still_error is not None:
+                message = f"Couldn't update `{sid}`: {still_error}"
+            else:
+                for i, existing in enumerate(entries):
+                    if existing is entry:
+                        entries[i] = new_entry
+                        break
+                _save_daily_schedule(entries)
+
+                normalized_field = field.strip().lower()
+                if normalized_field in ("magic", "enabled"):
+                    display = daily_schedule.format_flag(new_entry.get(normalized_field))
+                elif normalized_field in ("message", "edit_prompt"):
+                    # Never echo the raw value: it's free-text and can be
+                    # arbitrarily long (a `message`/`edit_prompt` up to Discord's
+                    # own limits), and a bare ctx.send with the full text can
+                    # exceed Discord's 2000-char message cap -- the write would
+                    # have already happened, but the confirmation would silently
+                    # fail to send. Truncate the same way &daily_list's preview
+                    # does, and point at &daily_show for the untruncated text.
+                    display = daily_schedule.truncate_text(new_entry.get(normalized_field))
+                else:
+                    display = new_entry.get(normalized_field)
+                message = f"Updated `{sid}` — {normalized_field} is now {display}."
+                if normalized_field in ("message", "edit_prompt"):
+                    message += f" (`&daily_show {sid}` for the full text.)"
+                # Checked unconditionally, not just when normalized_field == "enabled":
+                # `&daily_update <id> type edit` on the last enabled generate slot
+                # leaves the schedule with zero enabled generate slots exactly the
+                # same as disabling it would, and the warning must fire either way.
+                # has_enabled_generate_slot is cheap (one pass over `entries`), so
+                # there is no reason to special-case which field triggers the check.
+                if entries and not daily_schedule.has_enabled_generate_slot(entries):
+                    message += NO_ENABLED_GENERATE_WARNING
+                if still_error is not None:
+                    message += f"\n⚠️ Heads up: `{sid}` still won't fire — {still_error}"
+    await ctx.send(message)
+
+
+@bot.command(name='daily_remove', help='Remove a daily schedule slot by id (see &daily_list).')
+async def daily_remove(ctx, slot_id=None):
+    if not slot_id:
+        await ctx.send("Which one? `&daily_remove <id>` — see `&daily_list` for ids.")
+        return
+
+    entries = _load_daily_schedule()
+    entry = daily_schedule.find_slot(entries, slot_id)
+    if entry is None:
+        message = f"No daily slot with id `{daily_schedule.truncate_text(daily_schedule.normalize_slot_id(slot_id))}`."
+    else:
+        sid = daily_schedule.slot_entry_id(entry)
+        remaining = [e for e in entries if e is not entry]
+        _save_daily_schedule(remaining)
+        message = f"Removed daily slot `{sid}`."
+        if not remaining:
+            message += " The schedule is now empty — nothing will post until you add a slot."
+        elif not daily_schedule.has_enabled_generate_slot(remaining):
+            message += NO_ENABLED_GENERATE_WARNING
+    await ctx.send(message)
+
+
+@bot.command(name='daily_toggle', help="Enable or disable a daily schedule slot without deleting it (see &daily_list).")
+async def daily_toggle(ctx, slot_id=None):
+    if not slot_id:
+        await ctx.send("Which one? `&daily_toggle <id>` — see `&daily_list` for ids.")
+        return
+
+    entries = _load_daily_schedule()
+    entry = daily_schedule.find_slot(entries, slot_id)
+    if entry is None:
+        message = f"No daily slot with id `{daily_schedule.truncate_text(daily_schedule.normalize_slot_id(slot_id))}`."
+    else:
+        sid = daily_schedule.slot_entry_id(entry)
+        new_entry = daily_schedule.toggle_slot(entry, editor=ctx.author.name, edited=date.today().isoformat())
+        # Informational only -- flipping `enabled` can never invalidate an
+        # otherwise-valid entry (no other field changes), and a broken entry must
+        # always still be switchable off, so &daily_toggle never refuses a write.
+        still_error = daily_schedule.validate_slot(new_entry)
+
+        for i, existing in enumerate(entries):
+            if existing is entry:
+                entries[i] = new_entry
+                break
+        _save_daily_schedule(entries)
+
+        if daily_schedule.slot_is_enabled(new_entry):
+            message = f"Daily slot `{sid}` is now **enabled**."
+        else:
+            message = f"Daily slot `{sid}` is now **disabled** — it stays in the schedule but won't fire."
+            if not daily_schedule.has_enabled_generate_slot(entries):
+                message += NO_ENABLED_GENERATE_WARNING
+        if still_error is not None:
+            message += f"\n⚠️ Heads up: `{sid}` still won't fire — {still_error}"
+    await ctx.send(message)
 
 
 def generate_file_name(prompt):

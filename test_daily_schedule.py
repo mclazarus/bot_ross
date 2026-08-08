@@ -31,29 +31,49 @@ from daily_schedule import (
     DAILY_IMAGE_RETENTION,
     MISS_WINDOW,
     MONTHS,
+    UPDATABLE_FIELDS,
     WEEKDAYS,
+    apply_slot_update,
+    build_slot_entry,
     classify_slot_time,
     daily_image_filename,
     due_slots,
     find_generate_entry,
+    find_slot,
     format_announcement_date,
+    format_flag,
+    format_schedule_lines,
+    format_slot_detail,
+    format_slot_summary,
+    format_slot_time,
     get_zone,
+    has_enabled_generate_slot,
+    is_valid_slot_id,
     load_schedule,
     load_state,
     mark_fired,
+    normalize_slot_id,
+    parse_add_fields,
     parse_bool,
     parse_channel_id,
     parse_daily_image_date,
+    parse_flag_value,
     parse_slot_time,
     render_message,
     save_schedule,
     save_state,
+    schedule_file_is_corrupt,
     seconds_to_next_minute,
     seed_schedule,
     seed_source_for,
     select_images_to_prune,
+    slot_entry_id,
     slot_instant,
+    slot_is_enabled,
+    toggle_slot,
+    truncate_text,
     validate_schedule,
+    validate_slot,
 )
 
 SEED_SCHEDULE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "daily_schedule.json")
@@ -1009,6 +1029,956 @@ class SeedScheduleDataTest(unittest.TestCase):
         good, errors = validate_schedule(self.entries)
         self.assertEqual(len(good), 4)
         self.assertEqual(errors, [])
+
+
+# --- &daily_* command-surface pure logic ------------------------------------------
+#
+# Backs &daily_list/&daily_show/&daily_add/&daily_update/&daily_remove/&daily_toggle
+# (bot_ross.py keeps thin wrappers -- see test_bot_ross_source.py's
+# DailyCommandsValidateBeforeSaveTest for the AST-level checks on those wrappers,
+# since bot_ross.py itself can never be imported under test).
+
+class ParseFlagValueTest(unittest.TestCase):
+    """Strict sibling of parse_bool: raises rather than falling back to a
+    default, since a command typo must not silently write the OPPOSITE of
+    what was asked."""
+
+    def test_truthy_strings(self):
+        for value in ("true", "True", " TRUE ", "1", "yes", "on"):
+            with self.subTest(value=value):
+                self.assertIs(parse_flag_value(value), True)
+
+    def test_falsy_strings(self):
+        for value in ("false", "0", "no", "off", "OFF", " false "):
+            with self.subTest(value=value):
+                self.assertIs(parse_flag_value(value), False)
+
+    def test_unrecognized_values_raise_naming_the_value(self):
+        for value in ("ture", "", "   ", None, "2", "yes please", 42):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError) as cm:
+                    parse_flag_value(value)
+                self.assertIn(repr(value), str(cm.exception))
+
+    def test_strict_vs_lenient_split_is_deliberate(self):
+        # parse_bool falls back to its default on the very same typo that
+        # parse_flag_value must reject outright -- the two exist for
+        # different failure modes (a bad env var vs. a bad command arg).
+        self.assertIs(parse_bool("ture", True), True)
+        with self.assertRaises(ValueError):
+            parse_flag_value("ture")
+
+
+class SlotIdTest(unittest.TestCase):
+    def test_normalize(self):
+        self.assertEqual(normalize_slot_id("  Morning "), "morning")
+        self.assertEqual(normalize_slot_id("QUITTING_TIME"), "quitting_time")
+        self.assertEqual(normalize_slot_id(None), "")
+
+    def test_is_valid_slot_id_accepts(self):
+        for name in ("morning", "quitting_time", "a", "x-1", "a" * 32):
+            with self.subTest(name=name):
+                self.assertTrue(is_valid_slot_id(name))
+
+    def test_is_valid_slot_id_rejects(self):
+        for name in ("", " ", "Morning", "has space", "a" * 33, "tea🖌", ";tok", 42):
+            with self.subTest(name=name):
+                self.assertFalse(is_valid_slot_id(name))
+
+    def test_every_seed_id_is_addressable_by_command(self):
+        for entry in load_schedule(SEED_SCHEDULE_FILE):
+            with self.subTest(entry_id=entry["id"]):
+                self.assertTrue(is_valid_slot_id(normalize_slot_id(entry["id"])))
+
+
+class FormatSlotTimeTest(unittest.TestCase):
+    def test_basic_cases(self):
+        self.assertEqual(format_slot_time(7, 0), "07:00")
+        self.assertEqual(format_slot_time(0, 0), "00:00")
+        self.assertEqual(format_slot_time(23, 59), "23:59")
+        self.assertEqual(format_slot_time(17, 5), "17:05")
+
+    def test_round_trip_seed_times_stay_canonical(self):
+        for time_str in ("07:00", "12:00", "17:00", "22:00"):
+            with self.subTest(time_str=time_str):
+                self.assertEqual(format_slot_time(*parse_slot_time(time_str)), time_str)
+
+    def test_single_digit_hour_canonicalizes(self):
+        # So the file can't accumulate mixed "7:00"/"07:00" formats across
+        # repeated &daily_update edits.
+        self.assertEqual(format_slot_time(*parse_slot_time("7:00")), "07:00")
+
+
+class SlotLookupTest(unittest.TestCase):
+    def setUp(self):
+        self.seed = load_schedule(SEED_SCHEDULE_FILE)
+
+    def test_find_by_reference(self):
+        morning = next(e for e in self.seed if e["id"] == "morning")
+        self.assertIs(find_slot(self.seed, "MORNING"), morning)
+
+    def test_find_normalizes_whitespace(self):
+        lunch = next(e for e in self.seed if e["id"] == "lunch")
+        self.assertIs(find_slot(self.seed, "  lunch "), lunch)
+
+    def test_not_found_and_non_list_entries(self):
+        self.assertIsNone(find_slot(self.seed, "nope"))
+        self.assertIsNone(find_slot(None, "x"))
+
+    def test_broken_rows_stay_addressable_and_skippable(self):
+        ok = {"id": "ok", "time": "07:00", "type": "generate", "message": "m"}
+        entries = [42, None, {"no": "id"}, ok]
+        self.assertIs(find_slot(entries, "ok"), ok)
+
+    def test_slot_entry_id(self):
+        self.assertEqual(slot_entry_id({"id": " Morning "}), "morning")
+        self.assertIsNone(slot_entry_id(42))
+        self.assertIsNone(slot_entry_id({"id": ""}))
+        self.assertIsNone(slot_entry_id({"id": 7}))
+
+
+class EnabledSchemaTest(unittest.TestCase):
+    """validate_schedule's `enabled` rule -- must not disturb a schedule
+    (including the shipped seed) that predates this field."""
+
+    def test_seed_still_validates_with_no_enabled_key(self):
+        entries = load_schedule(SEED_SCHEDULE_FILE)
+        good, errors = validate_schedule(entries)
+        self.assertEqual(good, entries)
+        self.assertEqual(errors, [])
+        for entry in entries:
+            self.assertNotIn("enabled", entry)
+
+    def test_bool_enabled_accepted_both_ways(self):
+        for value in (True, False):
+            with self.subTest(value=value):
+                entry = {"id": "x", "time": "07:00", "type": "generate", "message": "m", "enabled": value}
+                good, errors = validate_schedule([entry])
+                # A disabled slot is a VALID entry -- it's skipped at fire
+                # time (due_slots), not rejected here.
+                self.assertEqual(good, [entry])
+                self.assertEqual(errors, [])
+
+    def test_non_bool_enabled_rejected_naming_the_id(self):
+        for bad_value in ("false", "true", 0, 1, None, []):
+            with self.subTest(bad_value=bad_value):
+                entry = {"id": "x", "time": "07:00", "type": "generate", "message": "m", "enabled": bad_value}
+                good, errors = validate_schedule([entry])
+                self.assertEqual(good, [])
+                self.assertEqual(len(errors), 1)
+                self.assertIn("x", errors[0])
+                self.assertIn("enabled", errors[0])
+
+    def test_one_bad_enabled_row_does_not_take_down_the_schedule(self):
+        valid = {"id": "ok", "time": "07:00", "type": "generate", "message": "m"}
+        broken = {"id": "bad", "time": "07:00", "type": "generate", "message": "m", "enabled": "false"}
+        good, errors = validate_schedule([valid, broken])
+        self.assertEqual(good, [valid])
+        self.assertEqual(len(errors), 1)
+
+    def test_unknown_extra_keys_still_tolerated_alongside_enabled(self):
+        entry = {
+            "id": "x", "time": "07:00", "type": "generate", "message": "m",
+            "enabled": True, "future_key": "x",
+        }
+        good, errors = validate_schedule([entry])
+        self.assertEqual(good, [entry])
+        self.assertEqual(errors, [])
+
+
+class SlotIsEnabledTest(unittest.TestCase):
+    def test_absent_means_enabled(self):
+        # The entire backward-compat contract for the enabled schema change.
+        self.assertIs(slot_is_enabled({}), True)
+
+    def test_explicit_bool(self):
+        self.assertIs(slot_is_enabled({"enabled": True}), True)
+        self.assertIs(slot_is_enabled({"enabled": False}), False)
+
+    def test_only_literal_false_disables(self):
+        # Garbage values read as enabled here -- such rows are dropped by
+        # validate_schedule before due_slots ever calls this, so the failure
+        # direction is always "doesn't fire", never "fires anyway".
+        self.assertIs(slot_is_enabled({"enabled": "false"}), True)
+        self.assertIs(slot_is_enabled(42), True)
+
+
+class DueSlotsEnabledTest(unittest.TestCase):
+    """A disabled slot must never fire -- the highest-risk part of this change."""
+
+    def test_disabled_slot_never_due_at_its_instant(self):
+        entry = dict(SLOT_0700, enabled=False)
+        instant = slot_instant(date(2026, 8, 7), 7, 0, NY)
+        self.assertEqual(due_slots(instant, [entry], {}, NY), [])
+
+    def test_disabled_slot_never_due_anywhere_in_the_miss_window(self):
+        entry = dict(SLOT_0700, enabled=False)
+        instant = slot_instant(date(2026, 8, 7), 7, 0, NY)
+        for delta in (timedelta(0), timedelta(seconds=1), timedelta(minutes=1), timedelta(minutes=5), MISS_WINDOW):
+            with self.subTest(delta=delta):
+                self.assertEqual(due_slots(instant + delta, [entry], {}, NY), [])
+
+    def test_backward_compat_absent_enabled_key_fires_as_before(self):
+        instant = slot_instant(date(2026, 8, 7), 7, 0, NY)
+        self.assertEqual(due_slots(instant, [SLOT_0700], {}, NY), [(SLOT_0700, date(2026, 8, 7))])
+
+    def test_explicit_enabled_true_behaves_like_absent(self):
+        entry = dict(SLOT_0700, enabled=True)
+        instant = slot_instant(date(2026, 8, 7), 7, 0, NY)
+        self.assertEqual(due_slots(instant, [entry], {}, NY), [(entry, date(2026, 8, 7))])
+
+    def test_mixed_schedule_only_the_enabled_slot_fires(self):
+        morning = dict(SLOT_0700, enabled=False)
+        lunch = SLOT_1200
+        lunch_instant = slot_instant(date(2026, 8, 7), 12, 0, NY)
+        morning_instant = slot_instant(date(2026, 8, 7), 7, 0, NY)
+        self.assertEqual(due_slots(lunch_instant, [morning, lunch], {}, NY), [(lunch, date(2026, 8, 7))])
+        self.assertEqual(due_slots(morning_instant, [morning, lunch], {}, NY), [])
+
+    def test_purity_disabled_entry_mutates_neither_entries_nor_state(self):
+        entry = dict(SLOT_0700, enabled=False)
+        entries = [entry]
+        state = {}
+        before_entries = copy.deepcopy(entries)
+        before_state = copy.deepcopy(state)
+        instant = slot_instant(date(2026, 8, 7), 7, 0, NY)
+        due_slots(instant, entries, state, NY)
+        self.assertEqual(entries, before_entries)
+        self.assertEqual(state, before_state)
+
+    def test_garbage_enabled_value_fails_safe_to_not_firing(self):
+        # validate_schedule drops the entry outright (non-bool enabled) --
+        # the failure direction is "doesn't fire", never "fires anyway".
+        entry = dict(SLOT_0700, enabled="false")
+        instant = slot_instant(date(2026, 8, 7), 7, 0, NY)
+        self.assertEqual(due_slots(instant, [entry], {}, NY), [])
+
+    def test_disabled_slot_near_the_local_midnight_boundary_never_fires(self):
+        # now = 2026-08-08T04:03Z = local 00:03 EDT on the 8th, so local_date
+        # is Aug 8 -- a 23:58 slot is a YESTERDAY-candidate-day match (mirrors
+        # test_midnight_straddle_yesterdays_slot above), not a today-candidate
+        # one. This specific straddle is what actually exercises the branch
+        # the disabled skip needs to cover: the skip sits BEFORE due_slots'
+        # candidate-day loop, so it must suppress the slot on the yesterday
+        # candidate too, not just the (far more common, and separately
+        # covered by every other test in this class) today candidate.
+        entry = {"id": "late", "time": "23:58", "type": "generate", "message": "m", "enabled": False}
+        now = datetime(2026, 8, 8, 4, 3, tzinfo=timezone.utc)
+        self.assertEqual(due_slots(now, [entry], {}, NY), [])
+
+        # Sibling assertion on the ENABLED twin: proves this really is the
+        # yesterday-candidate branch (day == 2026-08-07, not 08-08) rather
+        # than a case that happens to return [] for some other reason -- so a
+        # future refactor that moved the disabled skip inside (or after) the
+        # day loop, and thereby stopped covering this branch, can't leave this
+        # test silently drifted back into an already-covered today-day case.
+        enabled_twin = dict(entry, enabled=True)
+        self.assertEqual(due_slots(now, [enabled_twin], {}, NY), [(enabled_twin, date(2026, 8, 7))])
+
+    def test_re_enable_round_trip_fires_again(self):
+        disabled = dict(SLOT_0700, enabled=False)
+        instant = slot_instant(date(2026, 8, 7), 7, 0, NY)
+        self.assertEqual(due_slots(instant, [disabled], {}, NY), [])
+        enabled = dict(disabled, enabled=True)
+        self.assertEqual(due_slots(instant, [enabled], {}, NY), [(enabled, date(2026, 8, 7))])
+
+
+class ValidateSlotTest(unittest.TestCase):
+    def test_valid_entry_returns_none(self):
+        entry = {"id": "x", "time": "07:00", "type": "generate", "message": "m"}
+        self.assertIsNone(validate_slot(entry))
+
+    def test_bad_time_returns_string_naming_time(self):
+        entry = {"id": "x", "time": "25:00", "type": "generate", "message": "m"}
+        error = validate_slot(entry)
+        self.assertIsInstance(error, str)
+        self.assertIn("time", error)
+
+    def test_missing_edit_prompt_returns_string_naming_it(self):
+        entry = {"id": "e", "time": "07:00", "type": "edit", "message": "m"}
+        error = validate_slot(entry)
+        self.assertIsInstance(error, str)
+        self.assertIn("edit_prompt", error)
+
+    def test_non_dict_input_returns_string_without_raising(self):
+        self.assertIsInstance(validate_slot(42), str)
+        self.assertIsInstance(validate_slot(None), str)
+
+    def test_single_source_of_truth_against_validate_schedule(self):
+        entries = [
+            {"id": "ok", "time": "07:00", "type": "generate", "message": "m"},
+            {"id": "bad_time", "time": "7am", "type": "generate", "message": "m"},
+            {"id": "bad_type", "time": "07:00", "type": "paint", "message": "m"},
+            {"id": "no_msg", "time": "07:00", "type": "generate"},
+            {"id": "edit_no_prompt", "time": "07:00", "type": "edit", "message": "m"},
+            {"id": "bad_magic", "time": "07:00", "type": "generate", "message": "m", "magic": "true"},
+            {"id": "bad_enabled", "time": "07:00", "type": "generate", "message": "m", "enabled": "false"},
+            {"id": "ok_edit", "time": "07:00", "type": "edit", "message": "m", "edit_prompt": "p"},
+        ]
+        for entry in entries:
+            with self.subTest(entry_id=entry["id"]):
+                good, errors = validate_schedule([entry])
+                self.assertEqual(validate_slot(entry) is None, bool(good) and not errors)
+
+
+class BuildSlotEntryTest(unittest.TestCase):
+    def test_generate_entry_exact_shape(self):
+        entry, error = build_slot_entry("teatime", "15:30", "generate", "Tea time!", author="kev", added="2026-08-08")
+        self.assertIsNone(error)
+        self.assertEqual(entry, {
+            "id": "teatime", "time": "15:30", "type": "generate", "message": "Tea time!",
+            "magic": False, "enabled": True, "author": "kev", "added": "2026-08-08",
+        })
+
+    def test_edit_entry_has_prompt_and_validates(self):
+        entry, error = build_slot_entry(
+            "teatime", "15:30", "edit", "Tea time!", edit_prompt="everyone stops for tea",
+        )
+        self.assertIsNone(error)
+        self.assertEqual(entry["edit_prompt"], "everyone stops for tea")
+        self.assertIsNone(validate_slot(entry))
+
+    def test_single_digit_hour_canonicalized_and_bad_minute_rejected(self):
+        entry, error = build_slot_entry("t", "7:30", "generate", "m")
+        self.assertIsNone(error)
+        self.assertEqual(entry["time"], "07:30")
+
+        entry, error = build_slot_entry("t", "7:5", "generate", "m")
+        self.assertIsNone(entry)
+        self.assertIsNotNone(error)
+
+    def test_edit_without_prompt_rejected(self):
+        entry, error = build_slot_entry("t", "07:00", "edit", "m")
+        self.assertIsNone(entry)
+        self.assertEqual(
+            error,
+            "an 'edit' slot needs an edit prompt — add ` :: <edit prompt>` after the message.",
+        )
+
+    def test_generate_with_prompt_rejected(self):
+        # Stricter than validate_schedule's file-level tolerance for a stray
+        # edit_prompt on a generate entry -- at add time it's much more
+        # likely a mistaken ` :: ` than a deliberate no-op field.
+        entry, error = build_slot_entry("t", "07:00", "generate", "m", edit_prompt="p")
+        self.assertIsNone(entry)
+        self.assertEqual(
+            error,
+            "a 'generate' slot doesn't take an edit prompt — drop the ` :: ...` part.",
+        )
+
+    def test_various_invalid_inputs(self):
+        cases = [
+            ("Tea!", "07:00", "generate", "m", None),
+            ("a" * 33, "07:00", "generate", "m", None),
+            ("t", "07:00", "paint", "m", None),
+            ("t", "07:00", "generate", "   ", None),
+            ("t", "25:00", "generate", "m", None),
+        ]
+        for sid, t, ty, msg, ep in cases:
+            with self.subTest(sid=sid, t=t, ty=ty, msg=msg):
+                entry, error = build_slot_entry(sid, t, ty, msg, edit_prompt=ep)
+                self.assertIsNone(entry)
+                self.assertIsNotNone(error)
+
+    def test_type_case_insensitive_and_text_stripped(self):
+        entry, error = build_slot_entry("t", "07:00", "EDIT", "  Tea time!  ", edit_prompt="  drink tea  ")
+        self.assertIsNone(error)
+        self.assertEqual(entry["type"], "edit")
+        self.assertEqual(entry["message"], "Tea time!")
+        self.assertEqual(entry["edit_prompt"], "drink tea")
+
+    def test_no_author_added_when_omitted(self):
+        entry, error = build_slot_entry("t", "07:00", "generate", "m")
+        self.assertIsNone(error)
+        self.assertNotIn("author", entry)
+        self.assertNotIn("added", entry)
+
+    def test_every_success_case_validates(self):
+        cases = [
+            ("morningish", "07:00", "generate", None),
+            ("teatime", "15:30", "edit", "p"),
+        ]
+        for sid, t, ty, ep in cases:
+            with self.subTest(sid=sid):
+                entry, error = build_slot_entry(sid, t, ty, "message text", edit_prompt=ep)
+                self.assertIsNone(error)
+                self.assertIsNone(validate_slot(entry))
+
+
+SEED_LUNCH = {
+    "id": "lunch", "time": "12:00", "type": "edit",
+    "edit_prompt": "It's lunchtime!", "message": "Lunch break!", "magic": True,
+}
+
+
+class ApplySlotUpdateTest(unittest.TestCase):
+    def test_time_update_is_pure(self):
+        new, error = apply_slot_update(SEED_LUNCH, "time", " 12:30 ")
+        self.assertIsNone(error)
+        self.assertEqual(new["time"], "12:30")
+        self.assertEqual(SEED_LUNCH["time"], "12:00")  # input untouched
+
+    def test_message_stored_verbatim_no_operator_is_special(self):
+        text = "Lunch | dinner :: not really ;rhe --res 1x1"
+        new, error = apply_slot_update(SEED_LUNCH, "message", text)
+        self.assertIsNone(error)
+        self.assertEqual(new["message"], text)
+
+    def test_edit_prompt_stripped_and_stored(self):
+        new, error = apply_slot_update(SEED_LUNCH, "edit_prompt", "  new prompt  ")
+        self.assertIsNone(error)
+        self.assertEqual(new["edit_prompt"], "new prompt")
+
+    def test_magic_off_is_a_real_bool(self):
+        new, error = apply_slot_update(SEED_LUNCH, "magic", "off")
+        self.assertIsNone(error)
+        self.assertIs(new["magic"], False)  # assertIs -- the string "False" must fail this
+
+    def test_enabled_no_is_a_real_bool(self):
+        new, error = apply_slot_update(SEED_LUNCH, "enabled", "no")
+        self.assertIsNone(error)
+        self.assertIs(new["enabled"], False)
+
+    def test_field_name_stripped_and_lowercased(self):
+        new, error = apply_slot_update(SEED_LUNCH, " Time ", "13:00")
+        self.assertIsNone(error)
+        self.assertEqual(new["time"], "13:00")
+
+    def test_unknown_field_rejected(self):
+        new, error = apply_slot_update(SEED_LUNCH, "colour", "blue")
+        self.assertIsNone(new)
+        self.assertEqual(
+            error,
+            f"unknown field 'colour' — pick one of: {', '.join(UPDATABLE_FIELDS)}.",
+        )
+
+    def test_id_field_rejected_with_dedicated_message(self):
+        # Guards the data/daily_state.json key-orphaning re-fire risk: a
+        # rename would leave the fired-state key pointing at an id that no
+        # longer exists, and a slot still inside MISS_WINDOW could then fire
+        # a second time under its new id the same day.
+        new, error = apply_slot_update(SEED_LUNCH, "id", "brunch")
+        self.assertIsNone(new)
+        self.assertIn("id can't be changed", error)
+        self.assertIn("lunch", error)
+
+    def test_bad_values_name_the_offending_value(self):
+        cases = [("time", "7am"), ("magic", "ture"), ("type", "paint")]
+        for field, value in cases:
+            with self.subTest(field=field, value=value):
+                new, error = apply_slot_update(SEED_LUNCH, field, value)
+                self.assertIsNone(new)
+                self.assertIn(value, error)
+
+    def test_blank_message_rejected(self):
+        new, error = apply_slot_update(SEED_LUNCH, "message", "   ")
+        self.assertIsNone(new)
+        self.assertEqual(error, "the message can't be blank.")
+
+    def test_provenance_set_only_when_both_supplied(self):
+        # The fixture MUST already carry author/added -- SEED_LUNCH (which
+        # never had them) can only prove they're absent from the INPUT, which
+        # is true either way and says nothing about whether an update
+        # preserves or overwrites them. Building a fixture WITH creation
+        # provenance and asserting on the RESULT is what actually pins "an
+        # update sets editor/edited while leaving author/added untouched" --
+        # the same edited-vs-created split &magic_update/&macro_update make.
+        with_provenance = dict(SEED_LUNCH, author="original", added="2026-01-01")
+        new, error = apply_slot_update(with_provenance, "time", "12:30", editor="kev", edited="2026-08-08")
+        self.assertIsNone(error)
+        self.assertEqual(new["author"], "original")
+        self.assertEqual(new["added"], "2026-01-01")
+        self.assertEqual(new["editor"], "kev")
+        self.assertEqual(new["edited"], "2026-08-08")
+        # Input untouched by the update, provenance included.
+        self.assertEqual(with_provenance["author"], "original")
+        self.assertNotIn("editor", with_provenance)
+
+        # Neither editor/edited key appears at all when omitted entirely.
+        new2, error2 = apply_slot_update(with_provenance, "time", "12:30")
+        self.assertIsNone(error2)
+        self.assertEqual(new2["author"], "original")
+        self.assertNotIn("editor", new2)
+        self.assertNotIn("edited", new2)
+
+        # apply_slot_update requires BOTH editor and edited -- supplying only
+        # one is the same as supplying neither (no partial provenance write).
+        new3, error3 = apply_slot_update(with_provenance, "time", "12:30", editor="kev")
+        self.assertIsNone(error3)
+        self.assertNotIn("editor", new3)
+        self.assertNotIn("edited", new3)
+
+        new4, error4 = apply_slot_update(with_provenance, "time", "12:30", edited="2026-08-08")
+        self.assertIsNone(error4)
+        self.assertNotIn("editor", new4)
+        self.assertNotIn("edited", new4)
+
+    def test_invariant_matrix_every_single_field_update_stays_valid_except_one(self):
+        # For a fully-valid entry, changing any ONE field to a reasonable
+        # value must keep it valid -- EXCEPT type generate->edit on an entry
+        # with no edit_prompt, which is the one case §1.4's write-invariant
+        # exists to catch (apply_slot_update itself doesn't refuse it --
+        # that's the caller's job in bot_ross.py -- but the resulting entry
+        # IS rejectable, which is what the caller checks before saving).
+        base = {"id": "x", "time": "07:00", "type": "generate", "message": "m"}
+        self.assertIsNone(validate_slot(base))
+
+        for field, value in (("time", "08:00"), ("message", "new message"), ("magic", "on"), ("enabled", "off")):
+            with self.subTest(field=field):
+                new, error = apply_slot_update(base, field, value)
+                self.assertIsNone(error)
+                self.assertIsNone(validate_slot(new))
+
+        new, error = apply_slot_update(base, "type", "edit")
+        self.assertIsNone(error)                    # apply_slot_update itself doesn't refuse
+        self.assertIsNotNone(validate_slot(new))     # but the result is invalid -- caller must catch it
+
+        # Changing `time` cannot cause a same-day re-fire: data/daily_state.json
+        # is keyed by id + local day, so state["x"] == today already blocks a
+        # second fire that day regardless of what time is now stored.
+
+
+class ApplySlotUpdateErrorTruncationTest(unittest.TestCase):
+    """apply_slot_update's rejection messages echo the caller-supplied `field`/
+    `value` back into the error string, and bot_ross.py sends that string to
+    Discord verbatim (`f"Couldn't update `{sid}`: {error}"`). These are REJECT
+    paths -- nothing is written -- but an untruncated echo of a long enough
+    `field`/`value` can itself exceed Discord's 2000-char message cap, so the
+    write's rejection reply silently fails to send (discord.HTTPException) and
+    the user gets no feedback at all: the exact silent-failure mode
+    truncate_text was introduced (on the success path) to prevent. Regression:
+    `apply_slot_update(SEED_LUNCH, "type", "x" * 1975)` produced a
+    56-plus-1975 == 2031-char error string before this fix.
+    """
+
+    LONG = "x" * 1975  # comfortably past any reply prefix bot_ross.py could add
+
+    def test_unknown_field_error_is_bounded(self):
+        new, error = apply_slot_update(SEED_LUNCH, self.LONG, "blue")
+        self.assertIsNone(new)
+        # truncate_text's default limit is 60 chars + "…"; the rest of the
+        # message (the "unknown field ... — pick one of: ..." scaffolding) is
+        # itself short and fixed, so the whole string must stay well under
+        # Discord's 2000-char cap regardless of how long `field` was.
+        self.assertLess(len(error), 200)
+        self.assertIn(truncate_text(self.LONG), error)
+        self.assertNotIn(self.LONG, error)  # the untruncated 1975-char value must not appear
+
+    def test_bad_type_value_error_is_bounded(self):
+        new, error = apply_slot_update(SEED_LUNCH, "type", self.LONG)
+        self.assertIsNone(new)
+        self.assertLess(len(error), 200)
+        self.assertIn(truncate_text(self.LONG), error)
+        self.assertNotIn(self.LONG, error)
+
+    def test_bad_bool_value_error_is_bounded(self):
+        new, error = apply_slot_update(SEED_LUNCH, "magic", self.LONG)
+        self.assertIsNone(new)
+        self.assertLess(len(error), 200)
+        self.assertIn(truncate_text(self.LONG), error)
+        self.assertNotIn(self.LONG, error)
+
+    def test_short_values_are_unaffected(self):
+        # Pins that truncate_text is a no-op below its limit -- this is what
+        # keeps test_bad_values_name_the_offending_value's assertIn(value,
+        # error) passing unchanged for "7am"/"ture"/"paint".
+        new, error = apply_slot_update(SEED_LUNCH, "colour", "blue")
+        self.assertEqual(
+            error,
+            f"unknown field 'colour' — pick one of: {', '.join(UPDATABLE_FIELDS)}.",
+        )
+
+
+class ToggleSlotTest(unittest.TestCase):
+    def test_first_toggle_disables_absent_key(self):
+        entry = {"id": "x", "time": "07:00", "type": "generate", "message": "m"}
+        new = toggle_slot(entry)
+        self.assertIs(new["enabled"], False)
+
+    def test_toggle_re_enables_an_explicitly_disabled_entry(self):
+        entry = {"id": "x", "time": "07:00", "type": "generate", "message": "m", "enabled": False}
+        new = toggle_slot(entry)
+        self.assertIs(new["enabled"], True)
+
+    def test_purity(self):
+        entry = {"id": "x", "time": "07:00", "type": "generate", "message": "m"}
+        new = toggle_slot(entry)
+        self.assertNotIn("enabled", entry)
+        self.assertIsNot(new, entry)
+
+    def test_provenance_recorded_when_supplied(self):
+        entry = {"id": "x", "time": "07:00", "type": "generate", "message": "m"}
+        new = toggle_slot(entry, editor="kev", edited="2026-08-08")
+        self.assertEqual(new["editor"], "kev")
+        self.assertEqual(new["edited"], "2026-08-08")
+
+    def test_double_toggle_returns_to_start_with_key_now_explicit(self):
+        entry = {"id": "x", "time": "07:00", "type": "generate", "message": "m"}
+        twice = toggle_slot(toggle_slot(entry))
+        self.assertIs(twice["enabled"], True)
+        self.assertIn("enabled", twice)
+
+    def test_broken_row_can_still_be_toggled(self):
+        # A slot broken in some other field must always still be switchable
+        # off -- toggle_slot doesn't validate, it just flips the flag.
+        broken = {"id": "x", "time": "7am", "type": "generate", "message": "m"}
+        new = toggle_slot(broken)
+        self.assertIs(new["enabled"], False)
+
+
+class ParseAddFieldsTest(unittest.TestCase):
+    def test_no_separator_message_only(self):
+        self.assertEqual(parse_add_fields("Tea time!"), ("Tea time!", None, None))
+
+    def test_with_separator(self):
+        self.assertEqual(
+            parse_add_fields("Tea time! :: everyone stops for tea"),
+            ("Tea time!", "everyone stops for tea", None),
+        )
+
+    def test_separator_used_twice_errors(self):
+        message, prompt, error = parse_add_fields("a :: b :: c")
+        self.assertIsNone(message)
+        self.assertIsNone(prompt)
+        self.assertIn("::", error)
+
+    def test_unspaced_separator_never_silently_absorbed(self):
+        # Any occurrence of "::" not bounded by whitespace on both sides is a
+        # hard error, never silently folded into the message text.
+        for text in ("a::b", "a ::b", "a:: b", "a ::"):
+            with self.subTest(text=text):
+                message, prompt, error = parse_add_fields(text)
+                self.assertIsNone(message)
+                self.assertIn("spaces", error)
+
+    def test_blank_inputs(self):
+        for value in (None, "", "   "):
+            with self.subTest(value=value):
+                message, prompt, error = parse_add_fields(value)
+                self.assertIsNone(message)
+                self.assertEqual(error, "the message can't be blank.")
+
+    def test_blank_edit_prompt_after_separator(self):
+        message, prompt, error = parse_add_fields("msg ::   ")
+        self.assertIsNone(message)
+        self.assertEqual(error, "the edit prompt after ` :: ` can't be blank.")
+
+    def test_pipe_is_not_a_separator(self):
+        self.assertEqual(parse_add_fields("Lunch | dinner"), ("Lunch | dinner", None, None))
+
+    def test_edges_stripped_interior_untouched(self):
+        self.assertEqual(
+            parse_add_fields("  Tea time!   ::   drink tea  "),
+            ("Tea time!", "drink tea", None),
+        )
+
+
+class FormatSlotDisplayTest(unittest.TestCase):
+    def setUp(self):
+        self.seed = load_schedule(SEED_SCHEDULE_FILE)
+        self.morning = next(e for e in self.seed if e["id"] == "morning")
+        self.lunch = next(e for e in self.seed if e["id"] == "lunch")
+
+    def test_summary_morning(self):
+        self.assertEqual(
+            format_slot_summary(self.morning),
+            "`morning` — 07:00 generate — It's the image of the day for {date} (magic off, enabled)",
+        )
+
+    def test_summary_lunch(self):
+        self.assertEqual(
+            format_slot_summary(self.lunch),
+            "`lunch` — 12:00 edit — Lunch break! (magic on, enabled)",
+        )
+
+    def test_disabled_entry_summary_bolds_disabled(self):
+        entry = dict(self.lunch, enabled=False)
+        self.assertTrue(format_slot_summary(entry).endswith("(magic on, **disabled**)"))
+
+    def test_long_message_truncates_at_60_chars(self):
+        entry = dict(self.lunch, message="x" * 100)
+        summary = format_slot_summary(entry)
+        self.assertIn("x" * 60 + "…", summary)
+        self.assertNotIn("x" * 61, summary)
+
+    def test_detail_lunch_exact(self):
+        expected = (
+            "`lunch` — 12:00 edit\n"
+            "Message: Lunch break!\n"
+            "Edit prompt: It's lunchtime!\n"
+            "Magic: on | Enabled: on\n"
+            "Author: built-in | Added: —"
+        )
+        self.assertEqual(format_slot_detail(self.lunch), expected)
+
+    def test_detail_includes_editor_line_only_when_set(self):
+        without_editor = format_slot_detail(self.lunch)
+        self.assertNotIn("Last edited by", without_editor)
+        with_editor = format_slot_detail(dict(self.lunch, editor="kevin", edited="2026-08-08"))
+        self.assertIn("Last edited by: kevin on 2026-08-08", with_editor)
+
+    def test_never_raises_on_ragged_input(self):
+        for entry in ({}, {"id": "x"}, {"id": "x", "type": "edit"}, 42):
+            with self.subTest(entry=entry):
+                format_slot_summary(entry)
+                format_slot_detail(entry)
+
+    def test_format_schedule_lines_marks_broken_and_unaddressable_rows(self):
+        broken = {"id": "broken", "time": "25:00", "type": "generate", "message": "m"}
+        lines = format_schedule_lines([self.morning, broken, 42])
+        self.assertEqual(len(lines), 3)
+        self.assertEqual(lines[0], format_slot_summary(self.morning))
+        self.assertTrue(lines[1].startswith("⚠️"))
+        self.assertIn("broken", lines[1])
+        self.assertEqual(
+            lines[2],
+            "⚠️ entry #3 in the file has no usable id — fix it by hand in data/daily_schedule.json",
+        )
+
+    def test_format_schedule_lines_preserves_file_order(self):
+        lines = format_schedule_lines(self.seed)
+        self.assertEqual(len(lines), 4)
+        for entry, line in zip(self.seed, lines):
+            self.assertTrue(line.startswith(f"`{entry['id']}`"))
+
+
+class HasEnabledGenerateSlotTest(unittest.TestCase):
+    def setUp(self):
+        self.seed = load_schedule(SEED_SCHEDULE_FILE)
+
+    def test_seed_has_an_enabled_generate_slot(self):
+        self.assertTrue(has_enabled_generate_slot(self.seed))
+
+    def test_false_when_morning_disabled(self):
+        entries = [dict(e, enabled=False) if e["id"] == "morning" else e for e in self.seed]
+        self.assertFalse(has_enabled_generate_slot(entries))
+
+    def test_false_when_no_generate_slot_at_all(self):
+        entries = [e for e in self.seed if e["type"] != "generate"]
+        self.assertFalse(has_enabled_generate_slot(entries))
+
+    def test_false_on_empty_schedule(self):
+        self.assertFalse(has_enabled_generate_slot([]))
+
+    def test_false_when_the_only_generate_entry_fails_validation(self):
+        broken = {"id": "bad", "time": "7am", "type": "generate", "message": "m"}
+        self.assertFalse(has_enabled_generate_slot([broken]))
+
+    def test_find_generate_entry_still_returns_a_disabled_slot(self):
+        # find_generate_entry backs the MANUAL &daily_image command, which
+        # must keep using the slot's wording/magic even when the SCHEDULED
+        # slot is off -- pins that find_generate_entry is unaffected by
+        # `enabled` on purpose (it is not "fixed" by accident).
+        entries = [dict(e, enabled=False) if e["id"] == "morning" else e for e in self.seed]
+        entry = find_generate_entry(entries)
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["id"], "morning")
+
+
+class ScheduleWriteRoundTripTest(unittest.TestCase):
+    def test_build_save_load_round_trip(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "daily_schedule.json")
+            entries = load_schedule(SEED_SCHEDULE_FILE)
+            new_entry, error = build_slot_entry(
+                "teatime", "15:30", "generate", "Tea time!", author="kev", added="2026-08-08",
+            )
+            self.assertIsNone(error)
+            save_schedule(entries + [new_entry], path)
+
+            loaded = load_schedule(path)
+            good, errors = validate_schedule(loaded)
+            self.assertEqual(len(good), 5)
+            self.assertEqual(errors, [])
+            self.assertEqual(next(e for e in loaded if e["id"] == "teatime"), new_entry)
+
+    def test_enabled_persists_as_a_real_json_bool(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "daily_schedule.json")
+            entry = {"id": "x", "time": "07:00", "type": "generate", "message": "m"}
+            save_schedule([entry], path)
+            updated, error = apply_slot_update(load_schedule(path)[0], "enabled", "off")
+            self.assertIsNone(error)
+            save_schedule([updated], path)
+            with open(path, encoding="utf-8") as f:
+                raw = f.read()
+            # A JSON bool, not the string "false" -- a string would be
+            # rejected by validate_schedule on the very next scheduler tick.
+            self.assertIn('"enabled": false', raw)
+            self.assertNotIn('"enabled": "false"', raw)
+
+    def test_unicode_survives_round_trip(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "daily_schedule.json")
+            entry = {"id": "x", "time": "22:00", "type": "generate", "message": "Good night ♥️"}
+            save_schedule([entry], path)
+            loaded = load_schedule(path)
+            self.assertEqual(loaded[0]["message"], "Good night ♥️")
+            with open(path, encoding="utf-8") as f:
+                self.assertIn("♥️", f.read())
+
+    def test_end_to_end_disable_and_re_enable_gates_due_slots(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "daily_schedule.json")
+            save_schedule([{"id": "morning", "time": "07:00", "type": "generate", "message": "m"}], path)
+            instant = slot_instant(date(2026, 8, 7), 7, 0, NY)
+
+            disabled, error = apply_slot_update(load_schedule(path)[0], "enabled", "off")
+            self.assertIsNone(error)
+            save_schedule([disabled], path)
+            self.assertEqual(due_slots(instant, load_schedule(path), {}, NY), [])
+
+            enabled, error = apply_slot_update(load_schedule(path)[0], "enabled", "on")
+            self.assertIsNone(error)
+            save_schedule([enabled], path)
+            due = due_slots(instant, load_schedule(path), {}, NY)
+            self.assertEqual(len(due), 1)
+            self.assertEqual(due[0][1], date(2026, 8, 7))
+
+    def test_nothing_writes_the_repo_root_seed(self):
+        with open(SEED_SCHEDULE_FILE, "rb") as f:
+            before = f.read()
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "daily_schedule.json")
+            entries = load_schedule(SEED_SCHEDULE_FILE)
+            seed_schedule(path, SEED_SCHEDULE_FILE)
+            new_entry, _ = build_slot_entry("teatime", "15:30", "generate", "Tea time!")
+            save_schedule(entries + [new_entry], path)
+            updated, _ = apply_slot_update(load_schedule(path)[0], "enabled", "off")
+            save_schedule([updated] + load_schedule(path)[1:], path)
+        with open(SEED_SCHEDULE_FILE, "rb") as f:
+            after = f.read()
+        self.assertEqual(before, after)
+
+
+class SeedScheduleIntegrityTest(unittest.TestCase):
+    """Guards the specific promise this change must not disturb: the shipped
+    seed's four entries stay exactly as they are, with no `enabled` key
+    added to any of them."""
+
+    def setUp(self):
+        self.entries = load_schedule(SEED_SCHEDULE_FILE)
+
+    def test_exactly_four_entries_matching_fields(self):
+        self.assertEqual(len(self.entries), 4)
+        self.assertEqual([e["id"] for e in self.entries], ["morning", "lunch", "quitting_time", "goodnight"])
+        self.assertEqual([e["time"] for e in self.entries], ["07:00", "12:00", "17:00", "22:00"])
+        self.assertEqual([e["type"] for e in self.entries], ["generate", "edit", "edit", "edit"])
+        self.assertEqual([e["magic"] for e in self.entries], [False, True, True, True])
+
+    def test_no_entry_has_an_enabled_key(self):
+        for entry in self.entries:
+            with self.subTest(entry_id=entry["id"]):
+                self.assertNotIn("enabled", entry)
+
+    def test_every_entry_valid_and_enabled_by_default(self):
+        for entry in self.entries:
+            with self.subTest(entry_id=entry["id"]):
+                self.assertIsNone(validate_slot(entry))
+                self.assertIs(slot_is_enabled(entry), True)
+
+
+class TruncateTextTest(unittest.TestCase):
+    def test_short_text_unchanged(self):
+        self.assertEqual(truncate_text("hello"), "hello")
+
+    def test_exactly_at_limit_unchanged(self):
+        # Boundary: exactly `limit` characters must NOT get an ellipsis --
+        # only text strictly longer than the limit is truncated.
+        self.assertEqual(truncate_text("x" * 60), "x" * 60)
+
+    def test_one_over_limit_truncates(self):
+        self.assertEqual(truncate_text("x" * 61), "x" * 60 + "…")
+
+    def test_matches_format_slot_summary_preview_rule(self):
+        # This is the exact property finding #2's fix depends on: format_slot_summary's
+        # message preview and truncate_text must produce IDENTICAL output, since
+        # format_slot_summary now delegates to truncate_text instead of duplicating
+        # the 60-char rule inline.
+        long_message = "y" * 100
+        entry = {"id": "x", "time": "07:00", "type": "generate", "message": long_message}
+        self.assertIn(truncate_text(long_message), format_slot_summary(entry))
+
+    def test_custom_limit(self):
+        self.assertEqual(truncate_text("abcdef", limit=3), "abc…")
+        self.assertEqual(truncate_text("abc", limit=3), "abc")
+
+    def test_non_str_input_returns_empty_string_not_raise(self):
+        for bad in (None, 42, [], {}):
+            with self.subTest(bad=bad):
+                self.assertEqual(truncate_text(bad), "")
+
+    def test_trailing_whitespace_before_truncation_point_is_stripped(self):
+        # Mirrors format_slot_summary's original inline rule: message[:60].rstrip() + "…"
+        # -- a truncation that lands mid-word-boundary-plus-space shouldn't leave a
+        # dangling space before the ellipsis.
+        text = "x" * 59 + "   more text that gets cut off"
+        result = truncate_text(text)
+        self.assertTrue(result.endswith("…"))
+        self.assertNotIn(" …", result)
+
+
+class ScheduleFileIsCorruptTest(unittest.TestCase):
+    """Backs &daily_list/&daily_add's guard against silently treating a
+    syntax-broken data/daily_schedule.json as an empty (safe-to-overwrite)
+    schedule -- load_schedule fails open to [] in both cases, so this is the
+    one place that tells them apart."""
+
+    def test_missing_file_is_not_corrupt(self):
+        self.assertFalse(schedule_file_is_corrupt("/no/such/daily_schedule.json"))
+
+    def test_empty_file_is_not_corrupt(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "daily_schedule.json")
+            with open(path, "w") as f:
+                f.write("")
+            self.assertFalse(schedule_file_is_corrupt(path))
+
+    def test_whitespace_only_file_is_not_corrupt(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "daily_schedule.json")
+            with open(path, "w") as f:
+                f.write("   \n  ")
+            self.assertFalse(schedule_file_is_corrupt(path))
+
+    def test_valid_empty_list_is_not_corrupt(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "daily_schedule.json")
+            with open(path, "w") as f:
+                f.write("[]")
+            self.assertFalse(schedule_file_is_corrupt(path))
+
+    def test_valid_populated_list_is_not_corrupt(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "daily_schedule.json")
+            save_schedule(load_schedule(SEED_SCHEDULE_FILE), path)
+            self.assertFalse(schedule_file_is_corrupt(path))
+
+    def test_syntax_broken_json_is_corrupt(self):
+        # The exact real-world case: one hand-edit trailing comma.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "daily_schedule.json")
+            with open(path, "w") as f:
+                f.write('[{"id":"morning", "time":"07:00",}]')
+            self.assertTrue(schedule_file_is_corrupt(path))
+
+    def test_valid_json_that_is_not_a_list_is_corrupt(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "daily_schedule.json")
+            with open(path, "w") as f:
+                f.write('{"id": "morning"}')
+            self.assertTrue(schedule_file_is_corrupt(path))
+
+    def test_load_schedule_agreement_on_the_corrupt_case(self):
+        # Ties the two functions together: whenever schedule_file_is_corrupt
+        # is True, load_schedule must have failed open to [] -- that's the
+        # exact ambiguity this function exists to break.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "daily_schedule.json")
+            with open(path, "w") as f:
+                f.write("{ not valid json")
+            self.assertTrue(schedule_file_is_corrupt(path))
+            self.assertEqual(load_schedule(path), [])
 
 
 if __name__ == "__main__":

@@ -60,6 +60,21 @@ def _calls_named(node, name):
     ]
 
 
+def _calls_attr(node, module_name, func_name):
+    """All ast.Call nodes inside `node` shaped like `module_name.func_name(...)`
+    (an attribute call, e.g. daily_schedule.validate_slot(...)) -- the counterpart
+    to _calls_named for calls made through an imported module rather than a bare
+    name."""
+    return [
+        n for n in ast.walk(node)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == func_name
+        and isinstance(n.func.value, ast.Name)
+        and n.func.value.id == module_name
+    ]
+
+
 def _assigns_to(func_node, name):
     """All ast.Assign nodes inside func_node whose target is the bare name `name`."""
     return [
@@ -73,6 +88,17 @@ def _assigns_to(func_node, name):
 def _references(node, name):
     """Whether `name` appears as a bare Name anywhere inside `node`."""
     return any(isinstance(n, ast.Name) and n.id == name for n in ast.walk(node))
+
+
+def _enclosing_if_tests(func_node, target_call):
+    """All ast.If.test expressions inside func_node whose subtree contains
+    target_call (by node identity) -- lets a test ask "what condition, if
+    any, gates this specific call" without caring how deeply the call is
+    nested inside that test's own boolean expression (e.g. `and`/`or`)."""
+    return [
+        node.test for node in ast.walk(func_node)
+        if isinstance(node, ast.If) and target_call in ast.walk(node.test)
+    ]
 
 
 def _quiet_true_branch_value(test, body, orelse):
@@ -476,6 +502,88 @@ class DataDirCreatedBeforeSeedingTest(unittest.TestCase):
         )
 
 
+class DailyCommandsValidateBeforeSaveTest(unittest.TestCase):
+    """&daily_add/&daily_update/&daily_remove/&daily_toggle mutate
+    data/daily_schedule.json. Two structural invariants, both from
+    daily_schedule.py's module docstring (see its "&daily_* command-surface
+    command-surface helpers" section and CLAUDE.md's Daily Image of the Day
+    notes): a write must be validated before it's saved, and no `await` may
+    separate the load from the save (a single-threaded event loop can't
+    interleave two edits as long as nothing yields control in between --
+    but a `ctx.send` partway through would). Checked purely via `ast` since
+    bot_ross.py can never be imported under test."""
+
+    MUTATING_COMMANDS = ("daily_add", "daily_update", "daily_remove", "daily_toggle")
+    VALIDATE_GATED_COMMANDS = ("daily_add", "daily_update", "daily_toggle")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.functions = {name: _load_function(name) for name in cls.MUTATING_COMMANDS}
+
+    def test_daily_commands_exist(self):
+        for name in ("daily_list", "daily_show") + self.MUTATING_COMMANDS:
+            with self.subTest(name=name):
+                func = _load_function(name)
+                self.assertIsInstance(func, ast.AsyncFunctionDef, f"{name} must be an async command")
+
+    def test_validate_slot_precedes_save_in_add_update_toggle(self):
+        # daily_remove is deliberately excluded: removing an entry can never
+        # produce an invalid one, so it has nothing to validate before saving.
+        for name in self.VALIDATE_GATED_COMMANDS:
+            with self.subTest(command=name):
+                func = self.functions[name]
+                validate_calls = _calls_attr(func, "daily_schedule", "validate_slot")
+                save_calls = _calls_named(func, "_save_daily_schedule")
+                self.assertTrue(validate_calls, f"{name} must call daily_schedule.validate_slot before saving")
+                self.assertTrue(save_calls, f"{name} must call _save_daily_schedule")
+                first_validate_lineno = min(c.lineno for c in validate_calls)
+                for call in save_calls:
+                    self.assertGreater(
+                        call.lineno, first_validate_lineno,
+                        f"{name}: _save_daily_schedule at line {call.lineno} must come after the "
+                        f"first daily_schedule.validate_slot(...) call at line {first_validate_lineno} "
+                        "-- a schedule edit must be validated before it's written",
+                    )
+
+    def test_no_await_between_load_and_save(self):
+        for name in self.MUTATING_COMMANDS:
+            with self.subTest(command=name):
+                func = self.functions[name]
+                load_calls = _calls_named(func, "_load_daily_schedule")
+                save_calls = _calls_named(func, "_save_daily_schedule")
+                self.assertTrue(load_calls, f"{name} must call _load_daily_schedule")
+                self.assertTrue(save_calls, f"{name} must call _save_daily_schedule")
+                load_lineno = min(c.lineno for c in load_calls)
+                save_lineno = max(c.lineno for c in save_calls)
+                for a in ast.walk(func):
+                    if not isinstance(a, ast.Await):
+                        continue
+                    self.assertTrue(
+                        a.lineno < load_lineno or a.lineno > save_lineno,
+                        f"{name}: an await at line {a.lineno} falls between the load "
+                        f"(line {load_lineno}) and the save (line {save_lineno}) -- a "
+                        "ctx.send in between would let two concurrent edits interleave "
+                        "and lose one",
+                    )
+
+    def test_seed_file_never_referenced_in_a_daily_command(self):
+        for name in self.MUTATING_COMMANDS + ("daily_list", "daily_show"):
+            with self.subTest(command=name):
+                func = _load_function(name)
+                self.assertNotIn(
+                    "daily_schedule.json", _string_constants(func),
+                    f"{name} must write only through _save_daily_schedule (bound to "
+                    "DAILY_SCHEDULE_FILE) -- never the literal seed filename",
+                )
+
+    def test_scheduler_tick_reloads_the_schedule_fresh(self):
+        # Guards against caching the schedule in a module global, which would
+        # silently make every &daily_* edit require a restart to take effect.
+        func = _load_function("_run_due_daily_slots")
+        calls = _calls_attr(func, "daily_schedule", "load_schedule")
+        self.assertTrue(calls, "_run_due_daily_slots must call daily_schedule.load_schedule(...) every tick")
+
+
 class DailyImageRepostDoesNotRegenerateTest(unittest.TestCase):
     """&daily_image's headline promise: if today's image was already painted, it is
     REPOSTED, not repainted. That is what keeps a manual catch-up from silently
@@ -556,6 +664,162 @@ class DailyImageRepostDoesNotRegenerateTest(unittest.TestCase):
             _calls_named(func, "_save_daily_image"),
             "daily_image_cmd never retains what it generated, so the next run would "
             "repaint instead of reposting",
+        )
+
+
+class DailyUpdateDoesNotEchoUnboundedTextTest(unittest.TestCase):
+    """&daily_update's success reply must not echo a raw message/edit_prompt value
+    verbatim through a bare ctx.send: those fields are free text of arbitrary
+    length, and Discord's 2000-char message cap means a long enough value makes
+    the CONFIRMATION fail (discord.HTTPException) even though the write already
+    succeeded -- the user sees no reply and has no reason to believe the edit
+    landed. Regression: `&daily_update lunch message <1972 x's>` (1972 is exactly
+    what fits after the ~28-char reply prefix in 2000 chars) produced a
+    2006-character reply that raised on send.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.func = _load_function("daily_update")
+
+    def test_calls_daily_schedule_truncate_text(self):
+        calls = _calls_attr(self.func, "daily_schedule", "truncate_text")
+        self.assertTrue(
+            calls,
+            "daily_update must route the message/edit_prompt display value through "
+            "daily_schedule.truncate_text(...) before building its reply -- echoing "
+            "the raw value can exceed Discord's 2000-char message cap",
+        )
+
+
+class DailyUpdateWarnsWhenDisablingLastGenerateSlotTest(unittest.TestCase):
+    """&daily_toggle and &daily_remove both warn when a write leaves no enabled
+    `generate` slot (edit slots would then silently repaint the base image
+    themselves every time). &daily_update <id> enabled off is a DOCUMENTED
+    equivalent spelling of &daily_toggle (CLAUDE.md's field-setter examples
+    include it) and performs the identical write, but originally emitted no
+    warning at all -- a user reaching for the field-setter form got no signal
+    that they'd just disabled the day's base-image generator.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.func = _load_function("daily_update")
+
+    def test_references_has_enabled_generate_slot(self):
+        calls = _calls_attr(self.func, "daily_schedule", "has_enabled_generate_slot")
+        self.assertTrue(
+            calls,
+            "daily_update must check daily_schedule.has_enabled_generate_slot(...) "
+            "after a save, the same guard daily_toggle/daily_remove use",
+        )
+
+    def test_references_the_shared_warning_constant(self):
+        self.assertTrue(
+            _references(self.func, "NO_ENABLED_GENERATE_WARNING"),
+            "daily_update must append the same NO_ENABLED_GENERATE_WARNING constant "
+            "daily_toggle/daily_remove use, not a hand-copied (and driftable) string",
+        )
+
+    def test_toggle_and_remove_also_use_the_shared_constant(self):
+        # Belt-and-suspenders: pins that the three call sites were actually
+        # unified onto one constant, not just that daily_update grew its own.
+        for name in ("daily_toggle", "daily_remove"):
+            with self.subTest(command=name):
+                func = _load_function(name)
+                self.assertTrue(
+                    _references(func, "NO_ENABLED_GENERATE_WARNING"),
+                    f"{name} must reference the shared NO_ENABLED_GENERATE_WARNING constant",
+                )
+
+    def test_warning_check_is_not_gated_to_only_the_enabled_field(self):
+        # Regression: the check was originally written as
+        #   if normalized_field == "enabled" and ... has_enabled_generate_slot(...):
+        # which warns when &daily_update flips `enabled` off, but NOT when
+        # `&daily_update <id> type edit` is the write that empties the last
+        # enabled generate slot -- that leaves the schedule with zero generate
+        # slots exactly as surely as disabling one would, silently. The fix is
+        # to check has_enabled_generate_slot(...) unconditionally after every
+        # successful save, so no ast.If gating that call may also compare
+        # normalized_field to the literal "enabled".
+        func = _load_function("daily_update")
+        calls = _calls_attr(func, "daily_schedule", "has_enabled_generate_slot")
+        self.assertTrue(calls, "daily_update must call daily_schedule.has_enabled_generate_slot(...)")
+        for call in calls:
+            for test in _enclosing_if_tests(func, call):
+                gating_compares = [
+                    n for n in ast.walk(test)
+                    if isinstance(n, ast.Compare)
+                    and any(isinstance(c, ast.Constant) and c.value == "enabled" for c in n.comparators)
+                ]
+                self.assertEqual(
+                    gating_compares, [],
+                    "the has_enabled_generate_slot(...) check must not be gated behind "
+                    "`normalized_field == \"enabled\"` -- a `type` change to \"edit\" can "
+                    "also leave zero enabled generate slots, and the warning must fire then too",
+                )
+
+
+class DailyNoSuchSlotReplyIsBoundedTest(unittest.TestCase):
+    """&daily_show/&daily_update/&daily_remove/&daily_toggle all echo
+    daily_schedule.normalize_slot_id(slot_id) back in a "No daily slot with
+    id `...`" reply when the id isn't found. slot_id is raw, unbounded user
+    text at that point -- is_valid_slot_id's 1-32-char check only runs on
+    &daily_add's happy path, never before this message -- so an untruncated
+    echo of a long enough slot_id can itself exceed Discord's 2000-char
+    message cap and the "sorry, no such slot" reply silently fails to send.
+    Regression: `&daily_show` with a ~1980-char id produced a 2005-char reply.
+    """
+
+    COMMANDS = ("daily_show", "daily_update", "daily_remove", "daily_toggle")
+
+    def test_normalize_slot_id_is_wrapped_in_truncate_text(self):
+        for name in self.COMMANDS:
+            with self.subTest(command=name):
+                func = _load_function(name)
+                wrapped = [
+                    call for call in _calls_attr(func, "daily_schedule", "truncate_text")
+                    if any(
+                        isinstance(arg, ast.Call)
+                        and isinstance(arg.func, ast.Attribute)
+                        and arg.func.attr == "normalize_slot_id"
+                        for arg in call.args
+                    )
+                ]
+                self.assertTrue(
+                    wrapped,
+                    f"{name} must route daily_schedule.normalize_slot_id(slot_id) through "
+                    "daily_schedule.truncate_text(...) before echoing it in a 'No daily slot "
+                    "with id' reply -- slot_id is unbounded user text at that point",
+                )
+
+
+class DailyListAddGuardAgainstUnparseableScheduleTest(unittest.TestCase):
+    """&daily_list and &daily_add must distinguish "no schedule yet" from "the
+    schedule file exists but doesn't parse as JSON" -- load_schedule fails open
+    to [] in both cases. Without the distinction, a hand-edit typo (e.g. a
+    trailing comma) makes &daily_list report "empty" and the natural next step,
+    &daily_add, overwrites the whole (still-there-but-unparseable) file with a
+    single new entry, silently discarding every existing slot.
+    """
+
+    def test_daily_list_checks_schedule_file_is_corrupt(self):
+        func = _load_function("daily_list")
+        calls = _calls_attr(func, "daily_schedule", "schedule_file_is_corrupt")
+        self.assertTrue(
+            calls,
+            "daily_list must call daily_schedule.schedule_file_is_corrupt(...) when "
+            "the loaded schedule is empty, to distinguish a broken file from a "
+            "genuinely empty one",
+        )
+
+    def test_daily_add_checks_schedule_file_is_corrupt(self):
+        func = _load_function("daily_add")
+        calls = _calls_attr(func, "daily_schedule", "schedule_file_is_corrupt")
+        self.assertTrue(
+            calls,
+            "daily_add must call daily_schedule.schedule_file_is_corrupt(...) before "
+            "treating an empty-looking schedule as safe to add the first entry to",
         )
 
 

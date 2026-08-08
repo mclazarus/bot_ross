@@ -22,6 +22,12 @@ Bot Ross is a Discord bot that generates images using OpenAI's image models. Cha
 | `&macro_add <id> <text>` | Add a ;macro — the id is what you type as `;<id>` in a prompt |
 | `&macro_update <id> <text>` | Update a ;macro's text in place, recording you as editor |
 | `&macro_remove <id>` | Remove a ;macro by id |
+| `&daily_list` | List the daily-image schedule slots (id, time, type, magic, enabled, truncated message) |
+| `&daily_show <id>` | Show one daily schedule slot in full |
+| `&daily_add <id> <HH:MM> <generate\|edit> <message>` | Add a daily schedule slot — for an `edit` slot, append `` :: <edit prompt>`` after the message |
+| `&daily_update <id> <field> <value>` | Change one field of a daily schedule slot (`time`, `type`, `message`, `edit_prompt`, `magic`, `enabled`) |
+| `&daily_remove <id>` | Remove a daily schedule slot by id |
+| `&daily_toggle <id>` | Enable or disable a daily schedule slot without deleting it |
 | `&daily_image` | Post today's image of the day on demand — paints it if the scheduler missed the morning slot, or reposts the retained image (no monthly request spent) if it already exists |
 | `&stats` | Show uptime, monthly request count, limit, and magic/remix/release-image/daily-image/macro/pipe activity |
 | `&ping` | Check bot latency |
@@ -35,10 +41,18 @@ lunch (12:00), quitting time (17:00), and bedtime (22:00) — all wall-clock in
 `BOT_TIMEZONE` (default `America/New_York`), not the container's own clock. The
 generated prompt is never shown in the channel, only the announcement and the image.
 Retained base images live at `data/daily_images/`, pruned to the newest 14; the
-schedule itself is editable by hand at `data/daily_schedule.json` (seeded from the
-image on first run, same working-copy pattern as the magic/macro libraries) — add,
-remove, retime, or reword a slot, or flip its `magic` flag, without a code change.
-Set `DAILY_IMAGE_ENABLED=false` to turn the whole thing off.
+schedule itself lives at `data/daily_schedule.json` (seeded from the image on first
+run, same working-copy pattern as the magic/macro libraries) — edit it by hand, or
+manage it with the `&daily_list`/`&daily_show`/`&daily_add`/`&daily_update`/
+`&daily_remove`/`&daily_toggle` commands (see the table above), open to everyone
+like the rest of the bot's commands. Changes take effect within about a minute —
+the scheduler reloads the schedule fresh every tick — with no restart needed.
+`&daily_update <id> <field> <value>` is the one to reach for to retime a slot, reword
+its channel message, or change its edit prompt; `&daily_toggle <id>` flips a slot on
+or off without deleting it (and without losing its settings). A slot that's currently
+valid can never be saved into an invalid state by these commands — a bad edit is
+rejected with an explanation instead. Set `DAILY_IMAGE_ENABLED=false` to turn the
+whole scheduler off (the manage commands still work; `&daily_image` still works too).
 
 A slot only fires if the bot is running within 10 minutes of its scheduled time —
 there is deliberately no catch-up, so a morning slot missed during an outage is
