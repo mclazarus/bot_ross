@@ -48,8 +48,9 @@ FROM base AS test
 # Repo artifacts some tests read (never shipped in the runtime image):
 # test_bot_ross_source reads Dockerfile and requirements.txt (the latter is
 # already in base), test_pipe_chain reads README.md, test_daily_schedule reads
-# env.example.
-COPY Dockerfile README.md env.example ./
+# env.example, and test_bot_ross_source's DocsTruthTest reads CLAUDE.md and
+# README.md.
+COPY CLAUDE.md Dockerfile README.md env.example ./
 
 # Test modules listed EXPLICITLY, never `COPY test_*.py` and never `unittest
 # discover`: test_image.py and test_remix.py hit the live OpenAI API and spend

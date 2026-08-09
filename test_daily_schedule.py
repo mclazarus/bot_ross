@@ -1265,8 +1265,9 @@ class SeedScheduleDataTest(unittest.TestCase):
 #
 # Backs &daily_list/&daily_show/&daily_add/&daily_update/&daily_remove/&daily_toggle
 # (bot_ross.py keeps thin wrappers -- see test_bot_ross_source.py's
-# DailyCommandsValidateBeforeSaveTest for the AST-level checks on those wrappers,
-# since bot_ross.py itself can never be imported under test).
+# DailyCommandsValidateBeforeSaveTest for the AST-level ordering checks on those
+# wrappers, and test_bot_ross_commands.py's DailyScheduleCommandsTest for their
+# behavioral coverage now that bot_ross.py is importable under test).
 
 class ParseFlagValueTest(unittest.TestCase):
     """Strict sibling of parse_bool: raises rather than falling back to a

@@ -1,8 +1,9 @@
 """Pure, side-effect-free prompt-macro logic.
 
-Kept separate from bot_ross.py (which ends in bot.run() at import) so it can be
-imported and unit tested without Discord/OpenAI secrets, mirroring
-magic_paint.py. All functions take their path/library explicitly rather than
+Kept separate from bot_ross.py so it can be imported and unit tested with no
+Discord/OpenAI dependencies or secrets at all, mirroring magic_paint.py
+(bot_ross.py is importable under test these days; staying dependency-free here is
+still the point). All functions take their path/library explicitly rather than
 reading a bot_ross module global. See test_macros.py.
 
 A macro is a `;token` embedded anywhere in a &paint/&remix/etc. prompt (e.g.

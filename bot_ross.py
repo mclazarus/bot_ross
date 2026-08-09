@@ -138,7 +138,12 @@ def load_config(env=None):
     module globals, not a Config object: &magic_rate mutates MAGIC_PAINT_RATE
     via `global` at runtime, and ~40 call sites (including lambdas, which
     close over the global rather than capturing it) read these names at call
-    time, so reassignment is picked up with zero call-site changes."""
+    time, so reassignment is picked up with zero call-site changes.
+
+    Called exactly once per process, from main(). Never call it again on a
+    live bot: it re-reads MAGIC_PAINT_RATE (and everything else) from the
+    environment, which would stomp a runtime &magic_rate change back to the
+    env value."""
     global OPENAI_API_KEY, DISCORD_BOT_TOKEN, LIMIT, IMAGE_MODEL, IMAGE_MODERATION, \
         MEME_MODEL, MAGIC_PAINT_RATE, DRAIN_TIMEOUT, BOT_TIMEZONE, BOT_ZONE, \
         DAILY_IMAGE_ENABLED, _raw_daily_channel, DAILY_IMAGE_CHANNEL_ID, \
@@ -179,7 +184,7 @@ def load_config(env=None):
     # The bot's single wall-clock timezone for the daily-image scheduler (see
     # _daily_scheduler_loop below) -- all slot times in daily_schedule.json are wall-clock
     # in THIS zone, regardless of the container's own (UTC) clock. A bad/unknown
-    # BOT_TIMEZONE falls back to UTC rather than crashing at import; get_zone() reports
+    # BOT_TIMEZONE falls back to UTC rather than crashing at startup; get_zone() reports
     # the problem back as a string so we can still log it loudly here.
     BOT_TIMEZONE = env.get('BOT_TIMEZONE', daily_schedule.DEFAULT_TIMEZONE)
     BOT_ZONE, _tz_error = daily_schedule.get_zone(BOT_TIMEZONE)
@@ -188,7 +193,7 @@ def load_config(env=None):
 
     # DAILY_IMAGE_CHANNEL_ID unset (None) disables the scheduler entirely, same as
     # DAILY_IMAGE_ENABLED=false -- see on_ready. Both are parsed leniently (never raise) so a
-    # typo'd env var can't crash the bot at import.
+    # typo'd env var can't crash the bot at startup.
     DAILY_IMAGE_ENABLED = daily_schedule.parse_bool(env.get('DAILY_IMAGE_ENABLED'), True)
     _raw_daily_channel = env.get('DAILY_IMAGE_CHANNEL_ID')
     DAILY_IMAGE_CHANNEL_ID = daily_schedule.parse_channel_id(_raw_daily_channel)

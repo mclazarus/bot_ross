@@ -1,8 +1,9 @@
 """Pure, side-effect-free daily-image scheduling logic.
 
-Kept separate from bot_ross.py (which ends in bot.run() at import) so it can be
-imported and unit tested without Discord/OpenAI secrets, mirroring
-release_image.py/macros.py. No function here ever calls datetime.now() -- "now"
+Kept separate from bot_ross.py so it can be imported and unit tested with no
+Discord/OpenAI dependencies or secrets at all, mirroring release_image.py/macros.py
+(bot_ross.py is importable under test these days; staying dependency-free here is
+still the point). No function here ever calls datetime.now() -- "now"
 is always a parameter -- which is the entire point of the module: the container
 runs UTC while the schedule is wall-clock in a configurable bot timezone
 (BOT_TIMEZONE, default America/New_York), and DST gaps/folds plus UTC/local day
@@ -56,7 +57,7 @@ MONTHS = ("January", "February", "March", "April", "May", "June", "July",
 # --- Env parsing helpers -------------------------------------------------------------
 #
 # All three are deliberately never-raise: a typo'd env var must fall back to a
-# documented default, not crash the bot at import/startup.
+# documented default, not crash the bot at startup.
 
 _TRUTHY_STRINGS = {"1", "true", "yes", "on"}
 _FALSY_STRINGS = {"0", "false", "no", "off"}
@@ -89,7 +90,7 @@ def parse_channel_id(value):
     surrounding whitespace run, or a single "<#...>" mention wrapper (users
     copy-paste those). Anything else -- non-digits, a non-positive value,
     None/empty -- returns None rather than raising, so a stray space or a
-    pasted mention can never crash the bot at import (int(os.environ[...])
+    pasted mention can never crash the bot at startup (int(os.environ[...])
     would)."""
     if value is None:
         return None

@@ -5,10 +5,10 @@ A pipe chain is one command invocation split on literal `|` into up to five segm
 the first segment behaves exactly like the command does today, and every later
 segment is treated as an image-edit of the previous segment's output. This module
 owns only the pure, no-side-effect pieces -- splitting the raw text and formatting the
-handful of fixed status strings -- so they're unit-testable despite bot_ross.py being
-unimportable under test (it ends in bot.run() at module scope). The actual chain
-runner (_piped/_run_chain/_pipe_edit_once) stays in bot_ross.py, thin and untested,
-since it has to talk to Discord/do_the_art.
+handful of fixed status strings -- so they're unit-testable in isolation with no
+harness. The actual chain runner (_piped/_run_chain/_pipe_edit_once) stays in
+bot_ross.py, thin, and is driven behaviorally by PipeChainTest in
+test_bot_ross_commands.py now that bot_ross.py is importable under test.
 
 No escape syntax for a literal `|` -- consistent with macros.py's documented stance on
 `;`. A prompt that genuinely needs a pipe character in it can't have one; that's a
@@ -38,8 +38,9 @@ class ArtResult(NamedTuple):
     therefore ALWAYS truthy -- even when every field is falsy (None/b""/None/0.0) --
     which is load-bearing: &meme's `if await do_the_art(...)` (bot_ross.py) and every
     other call site that only checks truthiness must keep working unchanged. Defined
-    here (not in bot_ross.py) so that truthiness guarantee itself is unit-testable
-    (see ArtResultTest) despite bot_ross.py being unimportable under test.
+    here (not in bot_ross.py) so that truthiness guarantee is pinned by a tiny
+    dependency-free unit test (see ArtResultTest in test_pipe_chain.py) rather than
+    only through the full command harness.
 
     Field order is part of the contract -- callers are allowed to positionally unpack
     it (`message, image_bytes, size, elapsed = result`), so don't reorder these.

@@ -16,7 +16,10 @@ OPENAI_API_KEY constant) -- plus a handful of classes that were
 candidates for retirement here but are still AST-only because
 test_bot_ross_commands.py does not yet drive the specific scenario that would
 supersede them. Each such class's docstring says so explicitly, and the
-retiring commit's message records the gap so it isn't lost.
+retiring commit's message records the gap so it isn't lost. Docs-consistency
+checks on CLAUDE.md/README.md (DocsTruthTest) also live here, on the same
+theory: CLAUDE.md is a build artifact like the Dockerfile, and this file
+already owns artifact-shape properties.
 
 Everything with a landed behavioral replacement was retired in favor of it,
 except where retiring one half of a paired check would split a class's
@@ -1203,6 +1206,401 @@ class NoStaleC6PreconditionClaimsTest(unittest.TestCase):
                 phrase, content,
                 f"{relpath} still contains the stale phrase {phrase!r} -- {why}",
             )
+
+
+class NoStaleAtImportClaimsTest(unittest.TestCase):
+    """Guards comments/docs that described env-var parsing (BOT_TIMEZONE,
+    DAILY_IMAGE_ENABLED/DAILY_IMAGE_CHANNEL_ID) or library seeding
+    (_seed_daily_schedule) as happening "at import". Since C1, none of
+    load_config()'s body -- and none of the three _seed_*() calls -- runs at
+    import time; they only run when main() calls them, from the
+    `if __name__ == "__main__":` guard. "At import" is therefore a literally
+    false timing claim even though the protective behavior itself (never
+    raise on a bad env var; seed the working copy before it's read) still
+    holds at startup. Each phrase below must never reappear verbatim; a
+    similar comment reintroduced later must say "at startup"/"from main()",
+    not "at import"/"at module bottom"."""
+
+    REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+    # (relative path, forbidden phrase, why it's now false)
+    CASES = [
+        (
+            "bot_ross.py",
+            "falls back to UTC rather than crashing at import",
+            "BOT_TIMEZONE is parsed inside load_config(), called from main() -- "
+            "not at import time",
+        ),
+        (
+            "bot_ross.py",
+            "typo'd env var can't crash the bot at import",
+            "DAILY_IMAGE_ENABLED/DAILY_IMAGE_CHANNEL_ID are parsed inside "
+            "load_config(), called from main() -- not at import time",
+        ),
+        (
+            "daily_schedule.py",
+            "not crash the bot at import/startup",
+            "parse_bool/parse_channel_id/get_zone are pure helpers called from "
+            "load_config() at startup, never at import time",
+        ),
+        (
+            "daily_schedule.py",
+            "pasted mention can never crash the bot at import",
+            "parse_channel_id is called from load_config() at startup, never "
+            "at import time",
+        ),
+        (
+            "CLAUDE.md",
+            "seeded via `_seed_daily_schedule()` at module bottom",
+            "_seed_daily_schedule() is called from main(), reachable only via "
+            "the `if __name__ == \"__main__\":` guard -- nothing at module "
+            "bottom seeds anything since C1",
+        ),
+        (
+            "CLAUDE.md",
+            "rather than crashing at import",
+            "the BOT_TIMEZONE env-var table row paraphrases the same claim as "
+            "the bot_ross.py CASE above with different wording ('at startup' "
+            "vs. 'at import') -- this guard was written to catch it but only "
+            "covered bot_ross.py, letting the sibling doc occurrence sail "
+            "past; load_config() (which parses BOT_TIMEZONE) runs from "
+            "main(), never at import time",
+        ),
+    ]
+
+    def test_stale_phrases_do_not_reappear(self):
+        for relpath, phrase, why in self.CASES:
+            path = os.path.join(self.REPO_ROOT, relpath)
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            self.assertNotIn(
+                phrase, content,
+                f"{relpath} still contains the stale phrase {phrase!r} -- {why}",
+            )
+
+
+class NoStaleDailySchedulerCoverageClaimsTest(unittest.TestCase):
+    """Guards two CLAUDE.md claims about DailyCommandsValidateBeforeSaveTest
+    and the daily-scheduler wiring's behavioral coverage, each banned for a
+    different reason -- neither ban is a claim that CLAUDE.md ever said this
+    verbatim in the past; it's a forward-looking guard against the phrase
+    being (re)introduced:
+
+    1. The class's ordering invariant is validate-BEFORE-save (see its
+       docstring and test_validate_slot_precedes_save_in_add_update_toggle).
+       "write-before-validate" names the OPPOSITE, invalid ordering, so it is
+       banned outright -- a future rewrite of the CLAUDE.md description must
+       never invert the invariant this way, even though (checked via `git log
+       -S` against this repo's history) that exact phrase never actually
+       shipped in a committed CLAUDE.md.
+    2. `_run_due_daily_slots` (the scheduler's per-tick channel-resolve /
+       due-slot / mark-fired query) has no behavioral test either -- only an
+       AST call-presence check -- so a claim that `_daily_scheduler_loop` is
+       the ONLY untested piece of the daily-scheduler wiring is false. This
+       one WAS found overclaiming in a draft of the C8 docs pass (spec E5's
+       proposed wording) and rejected before it ever reached a commit."""
+
+    REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+    # (relative path, forbidden phrase, why it's now false)
+    CASES = [
+        (
+            "CLAUDE.md",
+            "the write-before-validate ordering",
+            "DailyCommandsValidateBeforeSaveTest's invariant is "
+            "validate-before-save (validate_slot must precede the save "
+            "call) -- 'write-before-validate' names the opposite ordering",
+        ),
+        (
+            "CLAUDE.md",
+            "only the `_daily_scheduler_loop` heartbeat itself runs untested",
+            "_run_due_daily_slots has no behavioral coverage either (only "
+            "an AST reload-fresh check) -- 'only' overclaims that "
+            "_daily_scheduler_loop is the sole untested piece",
+        ),
+    ]
+
+    def test_stale_phrases_do_not_reappear(self):
+        for relpath, phrase, why in self.CASES:
+            path = os.path.join(self.REPO_ROOT, relpath)
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            self.assertNotIn(
+                phrase, content,
+                f"{relpath} still contains the stale phrase {phrase!r} -- {why}",
+            )
+
+
+class DocClassFileAttributionTest(unittest.TestCase):
+    """Guards a mis-attribution found in review of the C8 docs pass: CLAUDE.md's
+    'Startup and Testability' section named LoadConfigGlobalListTest right after
+    citing test_bot_ross_config.py's `_CONFIG_GLOBALS` (implying, wrongly, that
+    the class lives in that file too) and cited MainBodyOrderingTest with no
+    file at all -- both classes actually live in test_bot_ross_source.py.
+    DocsTruthTest.test_test_classes_named_in_docs_exist only checks that a
+    mentioned class exists SOMEWHERE in the repo, never which file the doc
+    claims it lives in, so a mis-attribution like this sails past that check
+    silently -- worse, ImportSafetyTest is genuinely defined in BOTH
+    test_bot_ross_commands.py and test_bot_ross_config.py, so "just check the
+    name exists" would not even catch an ImportSafetyTest mis-citation. A
+    maintainer told the wrong file greps that file, finds nothing, and
+    concludes the guard was deleted. This test checks two things for each
+    (class, file) pair: the doc actually attributes the class to that file
+    (the exact phrasing CLAUDE.md uses), and the class really is defined
+    there -- so both a doc regression and a future code move away from that
+    file are caught."""
+
+    REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+    # (class name, file CLAUDE.md must attribute it to, via the phrasing
+    # "`ClassName` in `file.py`"). Add an entry whenever CLAUDE.md names a
+    # test class alongside the specific file it lives in.
+    ATTRIBUTIONS = [
+        ("LoadConfigGlobalListTest", "test_bot_ross_source.py"),
+        ("MainBodyOrderingTest", "test_bot_ross_source.py"),
+    ]
+
+    def test_class_attributions_match_definitions(self):
+        claude_md_path = os.path.join(self.REPO_ROOT, "CLAUDE.md")
+        with open(claude_md_path, "r", encoding="utf-8") as f:
+            claude_md = f.read()
+        for class_name, expected_file in self.ATTRIBUTIONS:
+            with self.subTest(class_name=class_name, expected_file=expected_file):
+                # The doc must actually say the class lives in this file --
+                # not merely mention the class name somewhere in the doc.
+                attribution = f"`{class_name}` in `{expected_file}`"
+                self.assertIn(
+                    attribution, claude_md,
+                    f"CLAUDE.md does not attribute {class_name} to {expected_file} "
+                    f"via the phrase {attribution!r} -- either the attribution was "
+                    "dropped/reworded, or it points at the wrong file",
+                )
+                # And the attribution must actually be true: the class must be
+                # defined in the file the doc says it's in, not merely exist
+                # somewhere in the repo (some class names -- e.g. ImportSafetyTest
+                # -- are defined in more than one file, so "exists somewhere" is
+                # not strong enough to back a specific-file claim).
+                target_path = os.path.join(self.REPO_ROOT, expected_file)
+                with open(target_path, "r", encoding="utf-8") as f:
+                    target_source = f.read()
+                self.assertRegex(
+                    target_source, rf"(?m)^class {re.escape(class_name)}\b",
+                    f"CLAUDE.md attributes {class_name} to {expected_file}, but no "
+                    f"such class is defined there -- the class moved, was renamed, "
+                    "or the attribution was never true",
+                )
+
+
+class NoStaleDocPointerDirectionTest(unittest.TestCase):
+    """Guards a mis-pointed cross-reference found during the C8 docs pass:
+    a sentence inside 'Daily Image of the Day' pointed a reader at "the
+    canonical gate line in Startup and Testability below". `## Startup and
+    Testability` appears EARLIER in CLAUDE.md than `## Daily Image of the
+    Day`, so the section being pointed at is above the pointer, not below
+    it -- a reader following "below" would scroll to the end of the file,
+    find no gate line there (Key Dependencies/Notes are the only sections
+    after Daily Image of the Day), and could wrongly conclude the canonical
+    gate line was deleted."""
+
+    REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+    def test_startup_and_testability_pointer_points_the_right_direction(self):
+        path = os.path.join(self.REPO_ROOT, "CLAUDE.md")
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        self.assertNotIn(
+            "Startup and Testability below", content,
+            "CLAUDE.md still points a reader at 'Startup and Testability "
+            "below', but that section appears earlier in the file than "
+            "this pointer -- it should say 'above'",
+        )
+
+
+class DocsTruthTest(unittest.TestCase):
+    """Docs-consistency guards. CLAUDE.md is a build artifact like the Dockerfile:
+    this file's charter (source/artifact-shape properties) is exactly where checks
+    on it belong. Each method pins one documentation-drift failure mode that has
+    already happened at least once in this repo's history."""
+
+    LIVE_API_SCRIPTS = frozenset({"test_image.py", "test_remix.py"})
+    DOC_FILES = ("CLAUDE.md", "README.md")
+    REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+    @staticmethod
+    def _read(path):
+        # A missing/unreadable doc file is itself a defect -- let
+        # FileNotFoundError/OSError propagate loudly rather than skipping past it.
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    @classmethod
+    def _repo_test_modules(cls):
+        # Repo root only, no recursion -- never descends into .venv/data/__pycache__.
+        # The live-API scripts are real test_*.py files but are deliberately never
+        # part of the local gate (they hit the live OpenAI API and spend real money).
+        live_stems = {os.path.splitext(n)[0] for n in cls.LIVE_API_SCRIPTS}
+        return {
+            os.path.splitext(n)[0]
+            for n in os.listdir(cls.REPO_ROOT)
+            if n.startswith("test_") and n.endswith(".py")
+        } - live_stems
+
+    @staticmethod
+    def _gate_module_lists(text):
+        # [ \t] NOT \s: \s would glue tokens across a newline and turn two
+        # adjacent single-module run lines into a phantom "gate line" spanning
+        # both. Returns every invocation found, including single-module ones --
+        # callers filter on len(...) >= 2 to isolate actual multi-module gates.
+        return [
+            match.split()
+            for match in re.findall(r"python -m unittest((?:[ \t]+test_\w+)+)", text)
+        ]
+
+    @classmethod
+    def _defined_test_classes(cls):
+        # Raw-text regex, not import: importing test_image.py/test_remix.py must
+        # never happen from inside the gate. Includes the live-API scripts --
+        # classes defined there still legitimately exist and may legitimately be
+        # named in the docs.
+        classes = set()
+        for name in os.listdir(cls.REPO_ROOT):
+            if name.startswith("test_") and name.endswith(".py"):
+                source = cls._read(os.path.join(cls.REPO_ROOT, name))
+                classes.update(re.findall(r"^class (\w+)\b", source, re.MULTILINE))
+        return classes
+
+    def test_documented_gate_lines_list_every_test_module(self):
+        # Failure mode prevented: a doc's gate line silently drifting out of
+        # sync with the repo's actual test_*.py files -- this already happened
+        # once (test_bot_ross_config.py was added by C1 but omitted from the
+        # documented gate, so C4 broke that module undetected).
+        expected = self._repo_test_modules()
+        gate_lines = []
+        for name in self.DOC_FILES:
+            text = self._read(os.path.join(self.REPO_ROOT, name))
+            for module_list in self._gate_module_lists(text):
+                if len(module_list) >= 2:
+                    gate_lines.append((name, module_list))
+        self.assertTrue(
+            gate_lines,
+            f"no multi-module `python -m unittest ...` gate line found in {self.DOC_FILES!r} "
+            "-- if the documented gate was deleted outright, the check below would "
+            "vacuously pass, so its mere existence is asserted here first",
+        )
+        for name, module_list in gate_lines:
+            got = set(module_list)
+            with self.subTest(doc=name, line=module_list):
+                missing = sorted(expected - got)
+                extra = sorted(got - expected)
+                self.assertEqual(
+                    got, expected,
+                    f"{name}'s gate line is out of sync with the repo's test_*.py files -- "
+                    f"missing from the doc: {missing}, stale/extra in the doc: {extra} "
+                    "-- a doc naming a deleted module is as wrong as one omitting a new one",
+                )
+
+    def test_test_classes_named_in_docs_exist(self):
+        # Failure mode prevented: a doc crediting a class that was renamed or
+        # retired -- both already happened (a renamed-in-doc-only class, and a
+        # retired class whose name lingered in prose after its test was deleted).
+        defined = self._defined_test_classes()
+        mentioned = set()
+        for name in self.DOC_FILES:
+            text = self._read(os.path.join(self.REPO_ROOT, name))
+            mentioned.update(re.findall(r"\b([A-Z][A-Za-z0-9]*Test)\b", text))
+        self.assertTrue(
+            mentioned,
+            f"no *Test class name found mentioned across {self.DOC_FILES!r} -- the "
+            "scanning regex likely broke rather than the docs genuinely naming none",
+        )
+        phantom = sorted(mentioned - defined)
+        self.assertLessEqual(
+            mentioned, defined,
+            f"{self.DOC_FILES!r} mention test class name(s) that don't exist in any "
+            f"repo test_*.py file: {phantom} -- renamed or retired without updating the docs",
+        )
+
+    def test_no_stale_unimportability_claims(self):
+        # Failure mode prevented: the next copy-pasted module docstring
+        # reintroducing the false "importing bot_ross always starts the bot"
+        # rationale -- it already propagated to seven files once. Each phrase
+        # below is assembled by adjacent-string concatenation so the contiguous
+        # phrase never appears literally in THIS file's own source -- otherwise
+        # this very check would trip on itself the moment it scans its own file.
+        # For the same reason, no assertion message anywhere in this method may
+        # spell out the trigger phrases verbatim either.
+        stale_phrases = [
+            "cannot be imported" " under test",
+            "can't be imported" " under test",
+            "can never be imported" " under test",
+            "isn't possible" " under test",
+            "unimportable" " under test",
+        ]
+        # Catches both the plain and backtick-quoted markdown form of the claim
+        # that a module's source concludes with a call that starts the bot.
+        # Deliberately does NOT match bot_ross.py's true statement that
+        # bot.run() returns once _graceful_shutdown closes the bot, since that
+        # sentence never reads "ends in" immediately before it.
+        stale_run_call_re = re.compile(r"ends in `?bot\.run\(\)")
+
+        names = sorted(
+            n for n in os.listdir(self.REPO_ROOT)
+            if (n.endswith(".py") or n.endswith(".md"))
+            and os.path.isfile(os.path.join(self.REPO_ROOT, n))
+        )
+        for name in names:
+            text = self._read(os.path.join(self.REPO_ROOT, name))
+            for phrase in stale_phrases:
+                with self.subTest(file=name, phrase=phrase):
+                    self.assertNotIn(
+                        phrase, text,
+                        f"{name} still contains a stale claim (phrase {phrase!r}) that "
+                        "bot_ross.py can't be exercised without starting the bot -- false "
+                        "since load_config()/main() landed; keep the module's "
+                        "dependency-free POINT, fix the reasoning",
+                    )
+            with self.subTest(file=name, phrase="module concludes with a bot-starting call"):
+                self.assertNotRegex(
+                    text, stale_run_call_re,
+                    f"{name} still claims a module's source concludes with a call that "
+                    "starts the bot at import time -- false since load_config()/main() "
+                    "landed; keep the module's dependency-free POINT, fix the reasoning",
+                )
+
+    def test_dockerfile_test_stage_copies_files_this_class_reads(self):
+        # Failure mode prevented: this class opens DOC_FILES by name via _read(),
+        # which lets FileNotFoundError propagate rather than skipping past a
+        # missing doc -- but the Docker test stage's COPY list is maintained by
+        # hand and can drift out of sync with what the tests actually read. That
+        # already happened: DocsTruthTest was added without adding CLAUDE.md to
+        # the test stage's COPY line, so `docker build --target test .` ERRORed
+        # on both doc-reading methods while the host gate stayed green and never
+        # noticed. This pins the two file sets together so the next doc file a
+        # test starts reading can't silently miss the same COPY line.
+        dockerfile_path = os.path.join(self.REPO_ROOT, "Dockerfile")
+        text = self._read(dockerfile_path)
+        stage_marker = re.search(r"^FROM\s+\S+\s+AS\s+test\s*$", text, re.MULTILINE)
+        self.assertIsNotNone(
+            stage_marker, "Dockerfile has no `FROM ... AS test` stage to inspect",
+        )
+        test_stage_text = text[stage_marker.end():]
+        # Dockerfile line-continuations (trailing `\`) join a COPY's source list
+        # across multiple physical lines -- collapse them before scanning so a
+        # wrapped COPY instruction isn't mistaken for several short ones.
+        joined = re.sub(r"\\\n[ \t]*", " ", test_stage_text)
+        copied = set()
+        for args in re.findall(r"^COPY[ \t]+(.+)$", joined, re.MULTILINE):
+            copied.update(args.split())
+        copied.discard("./")
+        missing = [name for name in self.DOC_FILES if name not in copied]
+        self.assertFalse(
+            missing,
+            f"Dockerfile's test stage never COPYs {missing} into the image, but "
+            f"this class's DOC_FILES {self.DOC_FILES!r} are read by name via "
+            "_read() -- the container gate would FileNotFoundError even though "
+            "the host gate (which reads straight off the checked-out repo) stays "
+            "green",
+        )
 
 
 if __name__ == "__main__":
