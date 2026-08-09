@@ -1603,5 +1603,47 @@ class DocsTruthTest(unittest.TestCase):
         )
 
 
+    def test_dockerfile_gate_line_lists_every_test_module(self):
+        # Failure mode prevented: the CONTAINER's gate drifting out of sync with
+        # the repo. test_documented_gate_lines_list_every_test_module above scans
+        # only DOC_FILES, and the COPY guard below checks only which files reach
+        # the image -- neither looks at the `RUN python -m unittest ...` line,
+        # which is the gate that actually decides whether `docker build --target
+        # test .` fails. A new test_foo.py could be added, both docs updated, and
+        # COPY updated, while the RUN line silently never runs it: the build would
+        # stay green while the container gate quietly stopped being a gate.
+        #
+        # This is the same class of drift that already bit the documented gate
+        # (test_bot_ross_config.py was added by C1, omitted from the doc gate,
+        # and C4 then broke that module undetected) -- the Dockerfile's RUN line
+        # is simply the copy of that list nothing was checking yet.
+        dockerfile_path = os.path.join(self.REPO_ROOT, "Dockerfile")
+        text = self._read(dockerfile_path)
+        # Same trailing-backslash normalization the COPY guard uses: the RUN gate
+        # wraps across four physical lines, and without collapsing them the regex
+        # would see only the first line's modules and pass while the rest went
+        # unchecked -- a false green on the exact thing being verified.
+        joined = re.sub(r"\\\n[ \t]*", " ", text)
+        gate_lines = [m for m in self._gate_module_lists(joined) if len(m) >= 2]
+        self.assertTrue(
+            gate_lines,
+            "Dockerfile has no multi-module `python -m unittest ...` line -- if the "
+            "container gate were deleted outright the check below would vacuously "
+            "pass, so its existence is asserted first",
+        )
+        expected = self._repo_test_modules()
+        for module_list in gate_lines:
+            got = set(module_list)
+            with self.subTest(line=module_list):
+                self.assertEqual(
+                    got, expected,
+                    "the Dockerfile's `RUN python -m unittest` gate is out of sync "
+                    f"with the repo's test_*.py files -- missing: {sorted(expected - got)}, "
+                    f"stale/extra: {sorted(got - expected)}. This line is the container's "
+                    "real gate; a module missing here is a module `docker build "
+                    "--target test .` will never run.",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -212,7 +212,7 @@ All options are set via environment variables (see `env.example`).
 | `OPENAI_API_KEY` | required | OpenAI API key |
 | `DISCORD_BOT_TOKEN` | required | Discord bot token |
 | `API_LIMIT` | `100` | Max image generations per calendar month. Note: the shipped daily-image schedule alone fires 4 slots/day (1 generate + 3 edits) — 4 × ~30 days ≈ 120/month, more on a base-image recovery or retry — which exceeds this default by itself, so enabling `DAILY_IMAGE_CHANNEL_ID` below means raising this accordingly |
-| `IMAGE_MODEL` | `gpt-image-2` | Image model for `&paint` and `&meme` |
+| `IMAGE_MODEL` | `gpt-image-2-low` | Image model for `&paint` and `&meme`; also accepts `gpt-image-2`, `gpt-image-2-medium`, `dall-e-3` |
 | `IMAGE_MODERATION` | `low` | Content moderation level (`low` or `auto`, gpt-image-2 only) |
 | `MEME_MODEL` | `gpt-5.4-mini` | GPT model used to generate meme prompts |
 | `MAGIC_PAINT_RATE` | `0.05` | Chance (0.0-1.0) that `&paint`/`&remix` silently appends a background gag to the prompt |
