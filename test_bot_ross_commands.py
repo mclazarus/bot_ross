@@ -469,7 +469,7 @@ class ImportSafetyTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             mod = _fresh_import(tmp)
             self.assertEqual(mod.LIMIT, 100)
-            self.assertEqual(mod.IMAGE_MODEL, "gpt-image-2-low")
+            self.assertEqual(mod.IMAGE_MODEL, "gpt-image-2.5-flare-low")
             self.assertEqual(mod.MAGIC_PAINT_RATE, 0.05)
             self.assertEqual(mod.DRAIN_TIMEOUT, 300.0)
             self.assertIs(mod.DAILY_IMAGE_ENABLED, True)

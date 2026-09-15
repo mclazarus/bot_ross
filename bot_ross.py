@@ -32,7 +32,7 @@ logger = logging.getLogger("bot_ross")
 OPENAI_API_KEY = None
 DISCORD_BOT_TOKEN = None
 LIMIT = 100
-IMAGE_MODEL = 'gpt-image-2-low'
+IMAGE_MODEL = 'gpt-image-2.5-flare-low'
 IMAGE_MODERATION = 'low'
 MEME_MODEL = 'gpt-5.4-mini'
 MAGIC_PAINT_RATE = 0.05
@@ -158,7 +158,7 @@ def load_config(env=None):
 
     # Configuration
     LIMIT            = int(env.get('API_LIMIT', 100))
-    IMAGE_MODEL      = env.get('IMAGE_MODEL', 'gpt-image-2-low')
+    IMAGE_MODEL      = env.get('IMAGE_MODEL', 'gpt-image-2.5-flare-low')
     IMAGE_MODERATION = env.get('IMAGE_MODERATION', 'low')
     MEME_MODEL       = env.get('MEME_MODEL', 'gpt-5.4-mini')
 
@@ -238,6 +238,41 @@ DAILY_STATE_FILE = "data/daily_state.json"
 DAILY_IMAGES_DIR = "data/daily_images"
 
 MODEL_CONFIGS = {
+    "gpt-image-2.5-flare": {
+        "model": "gpt-image-2.5-flare",
+        "params": {"size": "1024x1024", "quality": "high"},
+        "has_revised_prompt": False,
+        "supports_moderation": True,
+        "supports_edit": True,
+    },
+    "gpt-image-2.5-flare-xhigh": {
+        "model": "gpt-image-2.5-flare",
+        "params": {"size": "1024x1024", "quality": "xhigh"},
+        "has_revised_prompt": False,
+        "supports_moderation": True,
+        "supports_edit": True,
+    },
+    "gpt-image-2.5-flare-max": {
+        "model": "gpt-image-2.5-flare",
+        "params": {"size": "1024x1024", "quality": "max"},
+        "has_revised_prompt": False,
+        "supports_moderation": True,
+        "supports_edit": True,
+    },
+    "gpt-image-2.5-flare-medium": {
+        "model": "gpt-image-2.5-flare",
+        "params": {"size": "1024x1024", "quality": "medium"},
+        "has_revised_prompt": False,
+        "supports_moderation": True,
+        "supports_edit": True,
+    },
+    "gpt-image-2.5-flare-low": {
+        "model": "gpt-image-2.5-flare",
+        "params": {"size": "1024x1024", "quality": "low"},
+        "has_revised_prompt": False,
+        "supports_moderation": True,
+        "supports_edit": True,
+    },
     "gpt-image-2": {
         "model": "gpt-image-2",
         "params": {"size": "1024x1024", "quality": "high"},
@@ -267,6 +302,11 @@ MODEL_CONFIGS = {
         "supports_edit": False,
     },
 }
+
+# The config every model lookup falls back to when asked for an unknown alias, and the
+# edit model for a config with no edit endpoint (dall-e-3). The full-quality entry of
+# the current default family; the quality-tier commands below use its siblings.
+DEFAULT_MODEL_FAMILY = "gpt-image-2.5-flare"
 
 
 def format_duration(seconds):
@@ -1094,22 +1134,22 @@ async def paint(ctx, *, prompt):
                  "paint", IMAGE_MODEL, "roll")
 
 
-@bot.command(name='hpaint', help='Paint a high quality picture with gpt-image-2. Flags: --landscape/--portrait/--square, --res WxH. monthly limit Chain follow-up edits with | (up to 5 steps).')
+@bot.command(name='hpaint', help='Paint a high quality picture with gpt-image-2.5-flare. Flags: --landscape/--portrait/--square, --res WxH. monthly limit Chain follow-up edits with | (up to 5 steps).')
 async def hpaint(ctx, *, prompt):
-    await _piped(ctx, prompt, lambda c, t: _paint_once(c, t, "hpaint", "gpt-image-2", "none"),
-                 "hpaint", "gpt-image-2", "none")
+    await _piped(ctx, prompt, lambda c, t: _paint_once(c, t, "hpaint", "gpt-image-2.5-flare", "none"),
+                 "hpaint", "gpt-image-2.5-flare", "none")
 
 
-@bot.command(name='mpaint', help='Paint a medium quality picture with gpt-image-2. Flags: --landscape/--portrait/--square, --res WxH. monthly limit Chain follow-up edits with | (up to 5 steps).')
+@bot.command(name='mpaint', help='Paint a medium quality picture with gpt-image-2.5-flare. Flags: --landscape/--portrait/--square, --res WxH. monthly limit Chain follow-up edits with | (up to 5 steps).')
 async def mpaint(ctx, *, prompt):
-    await _piped(ctx, prompt, lambda c, t: _paint_once(c, t, "mpaint", "gpt-image-2-medium", "none"),
-                 "mpaint", "gpt-image-2-medium", "none")
+    await _piped(ctx, prompt, lambda c, t: _paint_once(c, t, "mpaint", "gpt-image-2.5-flare-medium", "none"),
+                 "mpaint", "gpt-image-2.5-flare-medium", "none")
 
 
-@bot.command(name='lpaint', help='Paint a low quality picture with gpt-image-2. Flags: --landscape/--portrait/--square, --res WxH. monthly limit Chain follow-up edits with | (up to 5 steps).')
+@bot.command(name='lpaint', help='Paint a low quality picture with gpt-image-2.5-flare. Flags: --landscape/--portrait/--square, --res WxH. monthly limit Chain follow-up edits with | (up to 5 steps).')
 async def lpaint(ctx, *, prompt):
-    await _piped(ctx, prompt, lambda c, t: _paint_once(c, t, "lpaint", "gpt-image-2-low", "none"),
-                 "lpaint", "gpt-image-2-low", "none")
+    await _piped(ctx, prompt, lambda c, t: _paint_once(c, t, "lpaint", "gpt-image-2.5-flare-low", "none"),
+                 "lpaint", "gpt-image-2.5-flare-low", "none")
 
 
 @bot.command(name='dpaint', help='Paint with DALL-E 3. monthly limit Chain follow-up edits with | (up to 5 steps).')
@@ -1455,8 +1495,8 @@ async def do_the_art(ctx, prompt, request_type, model, images=None, size=None,
 
 
 def get_edit_model(model):
-    config = MODEL_CONFIGS.get(model, MODEL_CONFIGS["gpt-image-2"])
-    return model if config.get("supports_edit") else "gpt-image-2"
+    config = MODEL_CONFIGS.get(model, MODEL_CONFIGS[DEFAULT_MODEL_FAMILY])
+    return model if config.get("supports_edit") else DEFAULT_MODEL_FAMILY
 
 
 async def _classify_image_error(response, prompt):
@@ -1485,7 +1525,7 @@ async def fetch_image(prompt, model, size=None):
     --res/--landscape/--portrait/--square); None keeps today's behavior of always
     using the model config's configured size. Copies config["params"] into a local
     dict before any override so the shared MODEL_CONFIGS entry is never mutated."""
-    config = MODEL_CONFIGS.get(model, MODEL_CONFIGS["gpt-image-2"])
+    config = MODEL_CONFIGS.get(model, MODEL_CONFIGS[DEFAULT_MODEL_FAMILY])
     params = dict(config["params"])
     if size is not None:
         params["size"] = size
@@ -1535,7 +1575,7 @@ async def fetch_image_edit(prompt, model, images, size=None):
     image_size.py, used by &remix to match the first input image's orientation);
     None keeps today's behavior of always sending the model config's configured size.
     Returns {"image": b64, "revised_prompt": None} — the edits endpoint has no revised_prompt."""
-    config = MODEL_CONFIGS.get(model, MODEL_CONFIGS["gpt-image-2"])
+    config = MODEL_CONFIGS.get(model, MODEL_CONFIGS[DEFAULT_MODEL_FAMILY])
     async with aiohttp.ClientSession() as session:
         for _ in range(2):
             form = aiohttp.FormData()  # rebuilt every attempt: FormData is single-use
