@@ -5,19 +5,20 @@ A pipe chain is one command invocation split on literal `|` into up to five segm
 the first segment behaves exactly like the command does today, and every later
 segment is treated as an image-edit of the previous segment's output. This module
 owns only the pure, no-side-effect pieces -- splitting the raw text and formatting the
-handful of fixed status strings -- so they're unit-testable despite bot_ross.py being
-unimportable under test (it ends in bot.run() at module scope). The actual chain
-runner (_piped/_run_chain/_pipe_edit_once) stays in bot_ross.py, thin and untested,
-since it has to talk to Discord/do_the_art.
+handful of fixed status strings -- so they're unit-testable in isolation with no
+harness. The actual chain runner (_piped/_run_chain/_pipe_edit_once) stays in
+bot_ross.py, thin, and is driven behaviorally by PipeChainTest in
+test_bot_ross_commands.py now that bot_ross.py is importable under test.
 
 No escape syntax for a literal `|` -- consistent with macros.py's documented stance on
 `;`. A prompt that genuinely needs a pipe character in it can't have one; that's a
 deliberate simplicity trade-off, not an oversight.
 
-Naming note: this module is named pipe_chain.py, not pipes.py, specifically to avoid
-shadowing the stdlib `pipes` module -- a dependency (coloredlogs' converter submodule,
-pulled in transitively) does import and use stdlib `pipes`, and WORKDIR /app in Docker
-puts a same-named local module first on sys.path.
+Naming note: this module is named pipe_chain.py, not pipes.py. WORKDIR /app in Docker
+puts local modules first on sys.path, so a repo module must never share a name with a
+stdlib module or an installed package -- whatever imports that name (even transitively)
+would silently get ours instead. (The historical worry here, stdlib `pipes`, was
+removed from the stdlib in Python 3.13; the general rule is what still holds.)
 """
 
 from typing import NamedTuple
@@ -37,8 +38,9 @@ class ArtResult(NamedTuple):
     therefore ALWAYS truthy -- even when every field is falsy (None/b""/None/0.0) --
     which is load-bearing: &meme's `if await do_the_art(...)` (bot_ross.py) and every
     other call site that only checks truthiness must keep working unchanged. Defined
-    here (not in bot_ross.py) so that truthiness guarantee itself is unit-testable
-    (see ArtResultTest) despite bot_ross.py being unimportable under test.
+    here (not in bot_ross.py) so that truthiness guarantee is pinned by a tiny
+    dependency-free unit test (see ArtResultTest in test_pipe_chain.py) rather than
+    only through the full command harness.
 
     Field order is part of the contract -- callers are allowed to positionally unpack
     it (`message, image_bytes, size, elapsed = result`), so don't reorder these.

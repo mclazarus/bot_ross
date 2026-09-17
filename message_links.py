@@ -1,9 +1,10 @@
 """Pure logic for detecting and classifying Discord message links pasted into a
 &remix prompt (e.g. "https://discord.com/channels/111/222/333").
 
-Kept separate from bot_ross.py (which ends in bot.run() at import) so it can be
-imported and unit tested without Discord/OpenAI secrets, mirroring release_image.py/
-image_size.py/macros.py/pipe_chain.py. No I/O, no Discord import -- everything here is
+Kept separate from bot_ross.py so it can be imported and unit tested with no
+Discord/OpenAI dependencies or secrets at all, mirroring release_image.py/
+image_size.py/macros.py/pipe_chain.py (bot_ross.py is importable under test these
+days; staying dependency-free here is still the point). No I/O, no Discord import -- everything here is
 string parsing and id comparison.
 
 SECURITY CONTRACT -- read this before touching _resolve_linked_images in bot_ross.py:
@@ -176,9 +177,9 @@ def format_skip_notes(
     happen to be computed in over in bot_ross.py's _resolve_linked_images.
 
     This lives here rather than as inline appends in bot_ross.py specifically so
-    the ordering contract is unit-testable: bot_ross.py cannot be imported under
-    test (it ends in bot.run() at module scope), so any logic that stays inline
-    there is untestable by construction. Each of the five buckets is independent
+    the ordering contract is unit-testable in isolation (see test_message_links.py)
+    -- bot_ross.py is importable under test these days, but a pure formatting
+    contract shouldn't need the command harness to pin it. Each of the five buckets is independent
     -- a bucket contributes its line iff its count is truthy -- so callers can pass
     zero and skip a line without needing to filter first.
 
@@ -210,9 +211,10 @@ def needs_thread_membership_check(is_private_thread, has_manage_threads):
     `channel.fetch_member(ctx.author.id)` check before trusting
     `channel.permissions_for(ctx.author)` for a linked message's channel.
 
-    discord.py 2.3.2's Thread.permissions_for(obj) delegates straight to
-    `self.parent.permissions_for(obj)` -- it does NOT factor in private-thread
-    membership at all (verified against the installed discord.py source: it reads
+    discord.py's Thread.permissions_for(obj) (re-verified on 2.7.1, the pinned
+    version) delegates straight to `self.parent.permissions_for(obj)` -- it does
+    NOT factor in private-thread membership at all (verified against the
+    installed discord.py source: it reads
     `parent = self.parent; base = GuildChannel.permissions_for(parent, obj)` and
     never touches thread membership). That means authoritative check (b) in
     _resolve_linked_images (view_channel + read_message_history) can come back

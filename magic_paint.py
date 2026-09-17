@@ -1,7 +1,8 @@
 """Pure, side-effect-free magic-paint logic.
 
-Kept separate from bot_ross.py (which ends in bot.run() at import) so it can be
-imported and unit tested without Discord/OpenAI secrets. All functions here take
+Kept separate from bot_ross.py so it can be imported and unit tested with no
+Discord/OpenAI dependencies or secrets at all (bot_ross.py is importable under
+test these days; staying dependency-free here is still the point). All functions here take
 their paths/rate/library explicitly rather than reading bot_ross module globals,
 so the magic-mixin rate calculation is testable in isolation. See test_magic_paint.py.
 """

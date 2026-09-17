@@ -15,9 +15,9 @@ rather than snapping to a fixed size.
   closely as a valid size allows (falling back to "auto" when Discord didn't report
   them).
 
-No Discord/OpenAI/bot side effects -- bot_ross.py can't be imported under test because
-module load ends in bot.run(), so this logic lives here for test_image_size.py to
-exercise directly.
+No Discord/OpenAI/bot side effects. bot_ross.py is importable under test these
+days (load_config()/main() gate its side effects), but this logic stays here,
+dependency-free, so test_image_size.py can exercise it directly with no harness.
 """
 
 import math

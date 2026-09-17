@@ -6,7 +6,7 @@ Bot Ross is a Discord bot that generates images using OpenAI's image models. Cha
 
 | Command | Description |
 |---|---|
-| `&paint <prompt>` | Generate an image with gpt-image-2 (or `IMAGE_MODEL`). Flags: `--landscape`/`--portrait`/`--square`, `--res WxH` (coerced to the nearest valid generation size). Chain follow-up edits with `\|` (up to 5 steps) |
+| `&paint <prompt>` | Generate an image with gpt-image-2.5-flare (or `IMAGE_MODEL`). Flags: `--landscape`/`--portrait`/`--square`, `--res WxH` (coerced to the nearest valid generation size). Chain follow-up edits with `\|` (up to 5 steps) |
 | `&dpaint <prompt>` | Generate an image with DALL-E 3. Chain follow-up edits with `\|` (up to 5 steps) |
 | `&meme [idea]` | GPT generates a meme prompt, then paints it |
 | `&remix [prompt]` | Remix attached image(s), the image in a message you reply to, and/or images from Discord message links pasted in the prompt (same server only) — or paint a prompt if none is found. Output size matches the first image's own dimensions as closely as possible by default; override with `--landscape`/`--portrait`/`--square`/`--res WxH` (coerced to a valid size, same as `&paint`). Chain follow-up edits with `\|` (up to 5 steps) |
@@ -178,6 +178,8 @@ beyond that are dropped with a note.
 ./run.sh .env /path/to/data docks.local
 ```
 
+`./build.sh` first runs the full test suite inside the image (`docker build --target test .`) and aborts without tagging `bot_ross` if any test fails, so a broken build never produces a shippable image.
+
 If a `bot_ross` container is already running, `run.sh` will stop and remove it before starting the new one. The stop **drains in-flight image generations**: on SIGTERM the bot stops accepting new commands and waits (up to `DRAIN_TIMEOUT` seconds, default `300` — a full 5-step `|` pipe chain is bracketed as one drain unit and can easily take longer than a minute) for running generations to finish before exiting, so a redeploy doesn't drop paintings (or chains) mid-flight. `run.sh` uses `docker stop -t $STOP_TIMEOUT` (default `330`, override via the `STOP_TIMEOUT` env var) — keep it above `DRAIN_TIMEOUT` so the bot exits on its own before Docker force-kills. When a host is provided, `DOCKER_HOST=ssh://<host>` is set so all docker commands run against the remote daemon — the `.env` file is read locally and never copied to the remote host.
 
 The `data/` directory stores monthly request counts, stats, the working magic-mixin library (`data/magic_prompts.json`), the working macro library (`data/macros.json`), the working daily-image schedule (`data/daily_schedule.json`), the daily scheduler's fired-slot bookkeeping (`data/daily_state.json`), and the retained daily base images (`data/daily_images/`) — mount a host path to persist them across container restarts and redeploys. On startup the bot seeds `data/magic_prompts.json`, `data/macros.json`, and `data/daily_schedule.json` from the image's bundled defaults only if they aren't already present, so mixins/macros/schedule edits added via the bot's commands (or by hand, for the schedule) survive image rebuilds.
@@ -210,8 +212,8 @@ All options are set via environment variables (see `env.example`).
 | `OPENAI_API_KEY` | required | OpenAI API key |
 | `DISCORD_BOT_TOKEN` | required | Discord bot token |
 | `API_LIMIT` | `100` | Max image generations per calendar month. Note: the shipped daily-image schedule alone fires 4 slots/day (1 generate + 3 edits) — 4 × ~30 days ≈ 120/month, more on a base-image recovery or retry — which exceeds this default by itself, so enabling `DAILY_IMAGE_CHANNEL_ID` below means raising this accordingly |
-| `IMAGE_MODEL` | `gpt-image-2` | Image model for `&paint` and `&meme` |
-| `IMAGE_MODERATION` | `low` | Content moderation level (`low` or `auto`, gpt-image-2 only) |
+| `IMAGE_MODEL` | `gpt-image-2.5-flare-low` | Image model for `&paint` and `&meme`; also accepts `gpt-image-2.5-flare` (high), `gpt-image-2.5-flare-xhigh`, `gpt-image-2.5-flare-max`, `gpt-image-2.5-flare-medium`, `gpt-image-2`, `gpt-image-2-medium`, `gpt-image-2-low`, `dall-e-3` |
+| `IMAGE_MODERATION` | `low` | Content moderation level (`low` or `auto`, gpt-image-2 family only) |
 | `MEME_MODEL` | `gpt-5.4-mini` | GPT model used to generate meme prompts |
 | `MAGIC_PAINT_RATE` | `0.05` | Chance (0.0-1.0) that `&paint`/`&remix` silently appends a background gag to the prompt |
 | `DRAIN_TIMEOUT` | `300` | Seconds to let in-flight image generations (including a whole in-progress `\|` pipe chain) finish on shutdown before the bot closes |
