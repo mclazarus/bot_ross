@@ -72,8 +72,11 @@ class CommitTest(unittest.TestCase):
                     mock.patch.object(release.subprocess, "run", side_effect=OSError):
                 self.assertIsNone(release.commit())
 
-    def test_shipped_placeholder_is_the_format_string(self):
-        self.assertEqual((release.HERE / "_commit.txt").read_text().strip(), "$Format:%h$")
+    def test_shipped_file_is_placeholder_or_stamp(self):
+        # A working tree has the export-subst placeholder; a `git archive` build (how
+        # home-docks-infra builds the image) has the real short hash stamped in.
+        text = (release.HERE / "_commit.txt").read_text().strip()
+        self.assertRegex(text, r"^(\$Format:%h\$|[0-9a-f]{7,40})$")
 
 
 class MessagesTest(unittest.TestCase):
