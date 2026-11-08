@@ -6,7 +6,7 @@ Bot Ross is a Discord bot that generates images using OpenAI's image models. Cha
 
 | Command | Description |
 |---|---|
-| `&paint <prompt>` | Generate an image with gpt-image-2.5-flare (or `IMAGE_MODEL`). Flags: `--landscape`/`--portrait`/`--square`, `--res WxH` (coerced to the nearest valid generation size). Chain follow-up edits with `\|` (up to 5 steps) |
+| `&paint <prompt>` | Generate an image with gpt-image-2.6-flare (or `IMAGE_MODEL`). Flags: `--landscape`/`--portrait`/`--square`, `--res WxH` (coerced to the nearest valid generation size). Chain follow-up edits with `\|` (up to 5 steps) |
 | `&dpaint <prompt>` | Generate an image with DALL-E 3. Chain follow-up edits with `\|` (up to 5 steps) |
 | `&meme [idea]` | GPT generates a meme prompt, then paints it |
 | `&remix [prompt]` | Remix attached image(s), the image in a message you reply to, and/or images from Discord message links pasted in the prompt (same server only) — or paint a prompt if none is found. Output size matches the first image's own dimensions as closely as possible by default; override with `--landscape`/`--portrait`/`--square`/`--res WxH` (coerced to a valid size, same as `&paint`). Chain follow-up edits with `\|` (up to 5 steps) |
@@ -31,6 +31,8 @@ Bot Ross is a Discord bot that generates images using OpenAI's image models. Cha
 | `&daily_image` | Post today's image of the day on demand — paints it if the scheduler missed the morning slot, or reposts the retained image (no monthly request spent) if it already exists |
 | `&stats` | Show uptime, monthly request count, limit, and magic/remix/release-image/daily-image/macro/pipe activity |
 | `&ping` | Check bot latency |
+| `&version` | Which build is running, and its commit |
+| `&changelog [build]` | What changed in this build, or an earlier one |
 
 ## Daily image of the day
 
@@ -212,11 +214,12 @@ All options are set via environment variables (see `env.example`).
 | `OPENAI_API_KEY` | required | OpenAI API key |
 | `DISCORD_BOT_TOKEN` | required | Discord bot token |
 | `API_LIMIT` | `100` | Max image generations per calendar month. Note: the shipped daily-image schedule alone fires 4 slots/day (1 generate + 3 edits) — 4 × ~30 days ≈ 120/month, more on a base-image recovery or retry — which exceeds this default by itself, so enabling `DAILY_IMAGE_CHANNEL_ID` below means raising this accordingly |
-| `IMAGE_MODEL` | `gpt-image-2.5-flare-low` | Image model for `&paint` and `&meme`; also accepts `gpt-image-2.5-flare` (high), `gpt-image-2.5-flare-xhigh`, `gpt-image-2.5-flare-max`, `gpt-image-2.5-flare-medium`, `gpt-image-2`, `gpt-image-2-medium`, `gpt-image-2-low`, `dall-e-3` |
+| `IMAGE_MODEL` | `gpt-image-2.6-flare-low` | Image model for `&paint` and `&meme`; also accepts `gpt-image-2.6-flare` (high), `gpt-image-2.6-flare-xhigh`, `gpt-image-2.6-flare-max`, `gpt-image-2.6-flare-medium`, the `gpt-image-2.5-flare` family (same five suffixes), `gpt-image-2`, `gpt-image-2-medium`, `gpt-image-2-low`, `dall-e-3` |
 | `IMAGE_MODERATION` | `low` | Content moderation level (`low` or `auto`, gpt-image-2 family only) |
 | `MEME_MODEL` | `gpt-5.4-mini` | GPT model used to generate meme prompts |
 | `MAGIC_PAINT_RATE` | `0.05` | Chance (0.0-1.0) that `&paint`/`&remix` silently appends a background gag to the prompt |
 | `DRAIN_TIMEOUT` | `300` | Seconds to let in-flight image generations (including a whole in-progress `\|` pipe chain) finish on shutdown before the bot closes |
 | `BOT_TIMEZONE` | `America/New_York` | IANA timezone the daily-image schedule's slot times are wall-clock in. An unknown zone falls back to UTC with a logged warning |
 | `DAILY_IMAGE_CHANNEL_ID` | unset | Discord channel id the daily image/edits post to. Unset disables the scheduler. Setting this adds ~120 generations/month against `API_LIMIT` (see above) — raise it accordingly |
+| `DISCORD_CHANNEL_ID` | unset | Discord channel id for the startup greeting ("A wild Bot Ross appears!" with the build number, sent once per start). Unset skips it |
 | `DAILY_IMAGE_ENABLED` | `true` | Set `false` to disable the daily-image scheduler outright, even with a channel id configured |

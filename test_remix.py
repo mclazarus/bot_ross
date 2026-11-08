@@ -116,12 +116,12 @@ if __name__ == "__main__":
         image_paths = args
         prompt = "creatively reinterpret this image"
 
-    model = os.environ.get("IMAGE_MODEL", "gpt-image-2.5-flare")
+    model = os.environ.get("IMAGE_MODEL", "gpt-image-2.6-flare")
     if not model.startswith("gpt-image"):
-        model = "gpt-image-2.5-flare"
-    # IMAGE_MODEL may be an internal alias like "gpt-image-2.5-flare-low"; resolve it to
+        model = "gpt-image-2.6-flare"
+    # IMAGE_MODEL may be an internal alias like "gpt-image-2.6-flare-low"; resolve it to
     # the real API model name through the bot's own MODEL_CONFIGS (a plain prefix strip
-    # would turn "gpt-image-2.5-flare-low" into "gpt-image-2").
+    # would turn "gpt-image-2.6-flare-low" into "gpt-image-2").
     from bot_ross import MODEL_CONFIGS
     api_model = MODEL_CONFIGS.get(model, {}).get("model", model)
     print(f"Model: {api_model}")

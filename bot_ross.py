@@ -22,6 +22,7 @@ import image_size
 import daily_schedule
 import pipe_chain
 import message_links
+import release
 from magic_paint import parse_magic_rate, format_magic_rate
 
 logger = logging.getLogger("bot_ross")
@@ -32,7 +33,7 @@ logger = logging.getLogger("bot_ross")
 OPENAI_API_KEY = None
 DISCORD_BOT_TOKEN = None
 LIMIT = 100
-IMAGE_MODEL = 'gpt-image-2.5-flare-low'
+IMAGE_MODEL = 'gpt-image-2.6-flare-low'
 IMAGE_MODERATION = 'low'
 MEME_MODEL = 'gpt-5.4-mini'
 MAGIC_PAINT_RATE = 0.05
@@ -43,6 +44,8 @@ DAILY_IMAGE_ENABLED = True
 _raw_daily_channel = None
 DAILY_IMAGE_CHANNEL_ID = None
 DAILY_CHANNEL_MISCONFIGURED = False
+# Where the startup greeting goes. None (unset or unparseable) skips the greeting.
+DISCORD_CHANNEL_ID = None
 
 DATA_FILE = "data/request_data.json"
 
@@ -147,7 +150,7 @@ def load_config(env=None):
     global OPENAI_API_KEY, DISCORD_BOT_TOKEN, LIMIT, IMAGE_MODEL, IMAGE_MODERATION, \
         MEME_MODEL, MAGIC_PAINT_RATE, DRAIN_TIMEOUT, BOT_TIMEZONE, BOT_ZONE, \
         DAILY_IMAGE_ENABLED, _raw_daily_channel, DAILY_IMAGE_CHANNEL_ID, \
-        DAILY_CHANNEL_MISCONFIGURED
+        DAILY_CHANNEL_MISCONFIGURED, DISCORD_CHANNEL_ID
 
     if env is None:
         env = os.environ
@@ -158,7 +161,7 @@ def load_config(env=None):
 
     # Configuration
     LIMIT            = int(env.get('API_LIMIT', 100))
-    IMAGE_MODEL      = env.get('IMAGE_MODEL', 'gpt-image-2.5-flare-low')
+    IMAGE_MODEL      = env.get('IMAGE_MODEL', 'gpt-image-2.6-flare-low')
     IMAGE_MODERATION = env.get('IMAGE_MODERATION', 'low')
     MEME_MODEL       = env.get('MEME_MODEL', 'gpt-5.4-mini')
 
@@ -204,12 +207,16 @@ def load_config(env=None):
         (_raw_daily_channel or "").strip()
     )
 
+    # The channel the startup greeting ("A wild Bot Ross appears!") is posted to. Optional:
+    # unset or unparseable just skips the greeting (logged in on_ready), never a crash.
+    DISCORD_CHANNEL_ID = daily_schedule.parse_channel_id(env.get('DISCORD_CHANNEL_ID'))
+
     # `docker run --env-file` takes everything after the first "=" as the value, comment
     # included, so a .env written with trailing `# ...` comments silently poisons every
     # value it touches. Each parser above then falls back to its default without saying
     # why. Check the raw values once at startup and name the variable, so this shows up as
     # one obvious log line instead of a scheduler that quietly never runs.
-    for _name in ('BOT_TIMEZONE', 'DAILY_IMAGE_CHANNEL_ID', 'DAILY_IMAGE_ENABLED',
+    for _name in ('BOT_TIMEZONE', 'DAILY_IMAGE_CHANNEL_ID', 'DISCORD_CHANNEL_ID', 'DAILY_IMAGE_ENABLED',
                   'DRAIN_TIMEOUT', 'API_LIMIT', 'IMAGE_MODEL', 'IMAGE_MODERATION',
                   'MEME_MODEL', 'MAGIC_PAINT_RATE'):
         if daily_schedule.looks_like_inline_comment(env.get(_name)):
@@ -238,6 +245,41 @@ DAILY_STATE_FILE = "data/daily_state.json"
 DAILY_IMAGES_DIR = "data/daily_images"
 
 MODEL_CONFIGS = {
+    "gpt-image-2.6-flare": {
+        "model": "gpt-image-2.6-flare",
+        "params": {"size": "1024x1024", "quality": "high"},
+        "has_revised_prompt": False,
+        "supports_moderation": True,
+        "supports_edit": True,
+    },
+    "gpt-image-2.6-flare-xhigh": {
+        "model": "gpt-image-2.6-flare",
+        "params": {"size": "1024x1024", "quality": "xhigh"},
+        "has_revised_prompt": False,
+        "supports_moderation": True,
+        "supports_edit": True,
+    },
+    "gpt-image-2.6-flare-max": {
+        "model": "gpt-image-2.6-flare",
+        "params": {"size": "1024x1024", "quality": "max"},
+        "has_revised_prompt": False,
+        "supports_moderation": True,
+        "supports_edit": True,
+    },
+    "gpt-image-2.6-flare-medium": {
+        "model": "gpt-image-2.6-flare",
+        "params": {"size": "1024x1024", "quality": "medium"},
+        "has_revised_prompt": False,
+        "supports_moderation": True,
+        "supports_edit": True,
+    },
+    "gpt-image-2.6-flare-low": {
+        "model": "gpt-image-2.6-flare",
+        "params": {"size": "1024x1024", "quality": "low"},
+        "has_revised_prompt": False,
+        "supports_moderation": True,
+        "supports_edit": True,
+    },
     "gpt-image-2.5-flare": {
         "model": "gpt-image-2.5-flare",
         "params": {"size": "1024x1024", "quality": "high"},
@@ -306,7 +348,7 @@ MODEL_CONFIGS = {
 # The config every model lookup falls back to when asked for an unknown alias, and the
 # edit model for a config with no edit endpoint (dall-e-3). The full-quality entry of
 # the current default family; the quality-tier commands below use its siblings.
-DEFAULT_MODEL_FAMILY = "gpt-image-2.5-flare"
+DEFAULT_MODEL_FAMILY = "gpt-image-2.6-flare"
 
 
 def format_duration(seconds):
@@ -510,6 +552,8 @@ _signals_installed = False
 # errors we logged (so a persistently bad data/daily_schedule.json warns once per
 # distinct problem, not once a minute forever -- see _run_due_daily_slots).
 _daily_task = None
+# on_ready refires on every reconnect; the greeting goes out once per process.
+_greeted = False
 _last_schedule_errors = []
 
 
@@ -556,8 +600,11 @@ def get_current_month():
 
 @bot.event
 async def on_ready():
-    global _signals_installed, _daily_task
+    global _signals_installed, _daily_task, _greeted
     logger.info(f'{bot.user.name} has connected to Discord!')
+    if not _greeted:
+        _greeted = True
+        await _send_greeting()
     # discord.py installs no SIGTERM handler, so as PID 1 in Docker the process would
     # ignore `docker stop` until it SIGKILLs. Install real loop handlers so we drain
     # instead. Idempotent, but guard anyway since on_ready refires on reconnect.
@@ -589,6 +636,21 @@ async def on_ready():
     elif _daily_task is None or _daily_task.done():
         _daily_task = asyncio.create_task(_daily_scheduler_loop())
         _daily_task.add_done_callback(_log_daily_task_result)
+
+
+async def _send_greeting():
+    """Post the startup greeting with the running build. Never raises: a missing or
+    unreachable channel is logged, and startup carries on."""
+    r, commit_hash = release.current(), release.commit()
+    logger.info(f"Running build {r.build} ({commit_hash or 'dev'})")
+    if DISCORD_CHANNEL_ID is None:
+        logger.info("No DISCORD_CHANNEL_ID set; skipping the startup greeting.")
+        return
+    try:
+        channel = bot.get_channel(DISCORD_CHANNEL_ID) or await bot.fetch_channel(DISCORD_CHANNEL_ID)
+        await channel.send(release.greeting_message(r, commit_hash))
+    except Exception as e:
+        logger.warning(f"Couldn't post the startup greeting to {DISCORD_CHANNEL_ID}: {e}")
 
 
 @bot.check
@@ -1134,22 +1196,22 @@ async def paint(ctx, *, prompt):
                  "paint", IMAGE_MODEL, "roll")
 
 
-@bot.command(name='hpaint', help='Paint a high quality picture with gpt-image-2.5-flare. Flags: --landscape/--portrait/--square, --res WxH. monthly limit Chain follow-up edits with | (up to 5 steps).')
+@bot.command(name='hpaint', help='Paint a high quality picture with gpt-image-2.6-flare. Flags: --landscape/--portrait/--square, --res WxH. monthly limit Chain follow-up edits with | (up to 5 steps).')
 async def hpaint(ctx, *, prompt):
-    await _piped(ctx, prompt, lambda c, t: _paint_once(c, t, "hpaint", "gpt-image-2.5-flare", "none"),
-                 "hpaint", "gpt-image-2.5-flare", "none")
+    await _piped(ctx, prompt, lambda c, t: _paint_once(c, t, "hpaint", "gpt-image-2.6-flare", "none"),
+                 "hpaint", "gpt-image-2.6-flare", "none")
 
 
-@bot.command(name='mpaint', help='Paint a medium quality picture with gpt-image-2.5-flare. Flags: --landscape/--portrait/--square, --res WxH. monthly limit Chain follow-up edits with | (up to 5 steps).')
+@bot.command(name='mpaint', help='Paint a medium quality picture with gpt-image-2.6-flare. Flags: --landscape/--portrait/--square, --res WxH. monthly limit Chain follow-up edits with | (up to 5 steps).')
 async def mpaint(ctx, *, prompt):
-    await _piped(ctx, prompt, lambda c, t: _paint_once(c, t, "mpaint", "gpt-image-2.5-flare-medium", "none"),
-                 "mpaint", "gpt-image-2.5-flare-medium", "none")
+    await _piped(ctx, prompt, lambda c, t: _paint_once(c, t, "mpaint", "gpt-image-2.6-flare-medium", "none"),
+                 "mpaint", "gpt-image-2.6-flare-medium", "none")
 
 
-@bot.command(name='lpaint', help='Paint a low quality picture with gpt-image-2.5-flare. Flags: --landscape/--portrait/--square, --res WxH. monthly limit Chain follow-up edits with | (up to 5 steps).')
+@bot.command(name='lpaint', help='Paint a low quality picture with gpt-image-2.6-flare. Flags: --landscape/--portrait/--square, --res WxH. monthly limit Chain follow-up edits with | (up to 5 steps).')
 async def lpaint(ctx, *, prompt):
-    await _piped(ctx, prompt, lambda c, t: _paint_once(c, t, "lpaint", "gpt-image-2.5-flare-low", "none"),
-                 "lpaint", "gpt-image-2.5-flare-low", "none")
+    await _piped(ctx, prompt, lambda c, t: _paint_once(c, t, "lpaint", "gpt-image-2.6-flare-low", "none"),
+                 "lpaint", "gpt-image-2.6-flare-low", "none")
 
 
 @bot.command(name='dpaint', help='Paint with DALL-E 3. monthly limit Chain follow-up edits with | (up to 5 steps).')
@@ -2243,6 +2305,29 @@ def generate_file_name(prompt):
     file_name = re.sub(r'[^0-9a-zA-Z]', '_', prompt)[:50]
     random_string = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(6))
     return f"{file_name}_{random_string}.png"
+
+
+@bot.command(name='version', help="Show which build of Bot Ross is running.")
+async def version_cmd(ctx):
+    await ctx.send(release.version_message(release.current(), release.commit()))
+
+
+@bot.command(name='changelog', help="What changed in this build, or in an earlier one: &changelog [build]")
+async def changelog_cmd(ctx, build=None):
+    builds = [r.build for r in release.releases()]
+    if build is None:
+        r = release.current()
+        await send_long(ctx, release.changelog_message(r, release.commit(), builds))
+        return
+    try:
+        r = release.find(int(build.lstrip('#')))
+    except ValueError:
+        r = None
+    if r is None:
+        await ctx.send(release.unknown_build(build, builds))
+        return
+    commit_hash = release.commit() if r is release.current() else r.commit
+    await send_long(ctx, release.changelog_message(r, commit_hash, builds))
 
 
 @bot.command(name='stats', help='Check monthly stats. (limit, requests)')

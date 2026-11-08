@@ -55,6 +55,7 @@ import image_size
 import macros
 import magic_paint
 import pipe_chain
+import release
 import release_image
 
 # --- Sentinels ------------------------------------------------------------------
@@ -343,6 +344,7 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
         self.enterContext(mock.patch.object(bot_ross, "draining", False))
         self.enterContext(mock.patch.object(bot_ross, "_signals_installed", False))
         self.enterContext(mock.patch.object(bot_ross, "_daily_task", None))
+        self.enterContext(mock.patch.object(bot_ross, "_greeted", False))
         self.enterContext(mock.patch.object(bot_ross, "_last_schedule_errors", []))
 
         # Determinism: pin the rate rather than seed random. random.random() < 0.0
@@ -469,7 +471,7 @@ class ImportSafetyTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             mod = _fresh_import(tmp)
             self.assertEqual(mod.LIMIT, 100)
-            self.assertEqual(mod.IMAGE_MODEL, "gpt-image-2.5-flare-low")
+            self.assertEqual(mod.IMAGE_MODEL, "gpt-image-2.6-flare-low")
             self.assertEqual(mod.MAGIC_PAINT_RATE, 0.05)
             self.assertEqual(mod.DRAIN_TIMEOUT, 300.0)
             self.assertIs(mod.DAILY_IMAGE_ENABLED, True)
@@ -1531,6 +1533,66 @@ class StatsCommandTest(BotTestCase):
         self.assertIn("Monthly requests: 3", text)
         self.assertIn("Pipe chains: 2", text)
         self.assertIn("Pipe segments: 5", text)
+
+
+# =========================================================================== #
+# R. &version / &changelog / startup greeting
+# =========================================================================== #
+
+class ReleaseCommandsTest(BotTestCase):
+    def setUp(self):
+        super().setUp()
+        self.enterContext(mock.patch.object(release, "commit", lambda: "abc1234"))
+
+    async def test_version_names_the_current_build_and_commit(self):
+        ctx = self.make_ctx()
+        await cmd("version")(ctx)
+        text = ctx.channel.texts[0]
+        self.assertIn(f"**Build {release.current().build}**", text)
+        self.assertIn("`abc1234`", text)
+
+    async def test_changelog_defaults_to_the_current_build(self):
+        ctx = self.make_ctx()
+        await cmd("changelog")(ctx)
+        text = "\n".join(ctx.channel.texts)
+        self.assertIn(f"**Build {release.current().build}**", text)
+        self.assertIn("•", text)
+
+    async def test_changelog_for_an_earlier_build_uses_its_own_hash(self):
+        ctx = self.make_ctx()
+        await cmd("changelog")(ctx, "1")
+        text = "\n".join(ctx.channel.texts)
+        self.assertIn("**Build 1**", text)
+        self.assertIn(f"`{release.find(1).commit}`", text)
+
+    async def test_unknown_build(self):
+        ctx = self.make_ctx()
+        await cmd("changelog")(ctx, "nope")
+        self.assertTrue(ctx.channel.texts[0].startswith("No record of build nope."))
+
+    async def test_greeting_goes_to_the_configured_channel_once(self):
+        channel = FakeChannel()
+        self.enterContext(mock.patch.object(bot_ross, "DISCORD_CHANNEL_ID", 42))
+        self.enterContext(mock.patch.object(bot_ross.bot, "get_channel", lambda cid: channel if cid == 42 else None))
+        await bot_ross._send_greeting()
+        self.assertEqual(len(channel.texts), 1)
+        self.assertTrue(channel.texts[0].startswith("A wild Bot Ross appears!"))
+        self.assertIn("&changelog", channel.texts[0])
+
+    async def test_greeting_failure_never_raises(self):
+        class Broken:
+            async def send(self, *a, **k):
+                raise RuntimeError("no perms")
+        self.enterContext(mock.patch.object(bot_ross, "DISCORD_CHANNEL_ID", 42))
+        self.enterContext(mock.patch.object(bot_ross.bot, "get_channel", lambda cid: Broken()))
+        await bot_ross._send_greeting()  # logs, doesn't raise
+
+    async def test_no_channel_configured_skips_the_greeting(self):
+        self.enterContext(mock.patch.object(bot_ross, "DISCORD_CHANNEL_ID", None))
+        getter = mock.Mock()
+        self.enterContext(mock.patch.object(bot_ross.bot, "get_channel", getter))
+        await bot_ross._send_greeting()
+        getter.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -4,11 +4,11 @@ spends real money, so it is deliberately excluded from the local test gate and n
 copied into the Docker image.
 
     python test_image.py                                  # IMAGE_MODEL from .env, quality high
-    python test_image.py --model gpt-image-2.5-flare --quality low,xhigh,max a red fox
+    python test_image.py --model gpt-image-2.6-flare --quality low,xhigh,max a red fox
     python test_image.py --quality low "a happy robot"
 
 `--model` is the raw API model name (NOT a bot_ross MODEL_CONFIGS alias like
-`gpt-image-2.5-flare-low`); `--quality` is a comma-separated list, and every quality
+`gpt-image-2.6-flare-low`); `--quality` is a comma-separated list, and every quality
 is generated in turn and timed individually so the tiers can be compared. Each
 image is saved as test_output_<model>_<quality>.png.
 """
@@ -21,7 +21,7 @@ import aiohttp
 import time
 
 ENV_FILE = ".env"
-DEFAULT_MODEL = "gpt-image-2.5-flare"
+DEFAULT_MODEL = "gpt-image-2.6-flare"
 
 def load_env(path):
     with open(path) as f:

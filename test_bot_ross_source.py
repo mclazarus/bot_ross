@@ -1017,7 +1017,7 @@ class LoadConfigGlobalListTest(unittest.TestCase):
         "OPENAI_API_KEY", "DISCORD_BOT_TOKEN", "LIMIT", "IMAGE_MODEL", "IMAGE_MODERATION",
         "MEME_MODEL", "MAGIC_PAINT_RATE", "DRAIN_TIMEOUT", "BOT_TIMEZONE", "BOT_ZONE",
         "DAILY_IMAGE_ENABLED", "_raw_daily_channel", "DAILY_IMAGE_CHANNEL_ID",
-        "DAILY_CHANNEL_MISCONFIGURED",
+        "DAILY_CHANNEL_MISCONFIGURED", "DISCORD_CHANNEL_ID",
     }
 
     @classmethod
