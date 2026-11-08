@@ -6,8 +6,25 @@ heading gets the short commit hash: `## Build N · YYYY-MM-DD · abc1234`.
 
 ## Build 14 · 2026-11-07
 - Paintings now use OpenAI's gpt-image-2.6-flare, which is faster than 2.5. `&hpaint`,
-  `&mpaint` and `&lpaint` use it too. The 2.5 and 2 models are still there if the bot's
-  configured to use them.
+  `&mpaint` and `&lpaint` use it too.
+- `--gif` makes an animated GIF instead of a still: `--frames N` (2–16) and `--ms N` (per
+  frame) tune it. In a `|` chain the last step can be the GIF, so `&paint a fox | --gif`
+  paints a fox and then animates it.
+- `&animate` animates an image you attach, reply to or link, or paints an animation from
+  just a prompt.
+- `--svg` makes a vector picture, posted with a PNG preview since Discord can't show SVGs.
+- `--boring` turns off magic for that command, every `|` step included.
+- Some mornings the image of the day comes to life: there's a 20% chance it's posted as a GIF
+  instead of a still. `&daily_gif_rate` shows or changes the chance.
+- Five secret magic mixins: on any day with at least five prompts, at 11:30 pm Bot Ross
+  writes a new mixin inspired by what everyone painted that day, replacing the oldest once
+  there are five. They turn up in magic paint like the others.
+- `&meme` writes its prompts with a newer GPT model (gpt-6-sol), which comes up with funnier,
+  more detailed memes.
+- `&release_image` and the image of the day pick from much bigger word lists, about 8,300
+  ideas instead of 431, so they repeat themselves far less. `&release_image --v1` still makes
+  the old pictures.
+- `&stats` counts GIFs, SVGs and secret mixins.
 - `&version` shows which build is running, and `&changelog [build]` shows what changed in it
   or in any earlier build.
 - Bot Ross says hello in the channel when he starts up, with his build number.
