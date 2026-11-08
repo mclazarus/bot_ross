@@ -19,6 +19,10 @@ COPY image_size.py .
 COPY daily_schedule.py .
 COPY pipe_chain.py .
 COPY message_links.py .
+# Build number + notes for &version/&changelog/the startup greeting. _commit.txt is
+# stamped with the commit by `git archive` (export-subst, see .gitattributes).
+COPY release.py CHANGELOG.md _commit.txt ./
+COPY output_format.py secret_magic.py ./
 # Seed library only. At startup bot_ross copies this to data/magic_prompts.json (the
 # persistent volume) if that file is absent, so user-added mixins survive redeploys.
 COPY magic_prompts.json .
@@ -59,9 +63,10 @@ COPY CLAUDE.md Dockerfile README.md env.example ./
 COPY test_daily_schedule.py test_pipe_chain.py test_message_links.py \
      test_image_size.py test_macros.py test_magic_paint.py \
      test_release_image.py test_bot_ross_source.py test_bot_ross_commands.py \
-     test_bot_ross_config.py test_runtime_deps.py ./
+     test_bot_ross_config.py test_runtime_deps.py test_release.py \
+     test_output_format.py test_secret_magic.py ./
 
 RUN python -m unittest test_daily_schedule test_pipe_chain test_message_links \
     test_image_size test_macros test_magic_paint test_release_image \
     test_bot_ross_source test_bot_ross_commands test_bot_ross_config \
-    test_runtime_deps
+    test_runtime_deps test_release test_output_format test_secret_magic

@@ -32,3 +32,5 @@ data/
 test_remix_output.png
 test_output*.png
 
+test_output*.gif
+test_output*.svg

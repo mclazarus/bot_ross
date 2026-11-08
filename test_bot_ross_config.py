@@ -36,7 +36,8 @@ _CONFIG_GLOBALS = (
     "OPENAI_API_KEY", "DISCORD_BOT_TOKEN", "LIMIT", "IMAGE_MODEL", "IMAGE_MODERATION",
     "MEME_MODEL", "MAGIC_PAINT_RATE", "DRAIN_TIMEOUT", "BOT_TIMEZONE", "BOT_ZONE",
     "DAILY_IMAGE_ENABLED", "_raw_daily_channel", "DAILY_IMAGE_CHANNEL_ID",
-    "DAILY_CHANNEL_MISCONFIGURED",
+    "DAILY_CHANNEL_MISCONFIGURED", "DISCORD_CHANNEL_ID", "DAILY_GIF_RATE", "SECRET_MAGIC_MODEL",
+    "SVG_MODEL",
 )
 
 
@@ -226,9 +227,9 @@ class LoadConfigDefaultsTest(unittest.TestCase):
         self.assertIsNone(bot_ross.OPENAI_API_KEY)
         self.assertIsNone(bot_ross.DISCORD_BOT_TOKEN)
         self.assertEqual(bot_ross.LIMIT, 100)
-        self.assertEqual(bot_ross.IMAGE_MODEL, "gpt-image-2.5-flare-low")
+        self.assertEqual(bot_ross.IMAGE_MODEL, "gpt-image-2.6-flare-low")
         self.assertEqual(bot_ross.IMAGE_MODERATION, "low")
-        self.assertEqual(bot_ross.MEME_MODEL, "gpt-5.4-mini")
+        self.assertEqual(bot_ross.MEME_MODEL, "gpt-6-sol")
         self.assertEqual(bot_ross.MAGIC_PAINT_RATE, 0.05)
         self.assertEqual(bot_ross.DRAIN_TIMEOUT, 300.0)
         self.assertEqual(bot_ross.BOT_TIMEZONE, "America/New_York")
@@ -250,9 +251,9 @@ class LoadConfigParsingTest(ConfigMutationTestCase):
         self.assertEqual(bot_ross.OPENAI_API_KEY, "test-openai-key")
         self.assertEqual(bot_ross.DISCORD_BOT_TOKEN, "test-discord-token")
         self.assertEqual(bot_ross.LIMIT, 100)
-        self.assertEqual(bot_ross.IMAGE_MODEL, "gpt-image-2.5-flare-low")
+        self.assertEqual(bot_ross.IMAGE_MODEL, "gpt-image-2.6-flare-low")
         self.assertEqual(bot_ross.IMAGE_MODERATION, "low")
-        self.assertEqual(bot_ross.MEME_MODEL, "gpt-5.4-mini")
+        self.assertEqual(bot_ross.MEME_MODEL, "gpt-6-sol")
         self.assertEqual(bot_ross.MAGIC_PAINT_RATE, 0.05)
         self.assertEqual(bot_ross.DRAIN_TIMEOUT, 300.0)
         self.assertEqual(bot_ross.BOT_TIMEZONE, "America/New_York")
@@ -552,6 +553,35 @@ class SetupLoggingTest(unittest.TestCase):
         for stream, expected in cases:
             with self.subTest(stream=type(stream).__name__):
                 self.assertEqual(bot_ross._stream_supports_color(stream), expected)
+
+
+
+class NewConfigTest(unittest.TestCase):
+    """DAILY_GIF_RATE / SECRET_MAGIC_MODEL / SVG_MODEL / DISCORD_CHANNEL_ID parsing."""
+
+    BASE = {"OPENAI_API_KEY": "k", "DISCORD_BOT_TOKEN": "t"}
+
+    def setUp(self):
+        self._snapshot = {name: getattr(bot_ross, name) for name in _CONFIG_GLOBALS}
+
+    def tearDown(self):
+        for name, value in self._snapshot.items():
+            setattr(bot_ross, name, value)
+
+    def test_defaults(self):
+        bot_ross.load_config(dict(self.BASE))
+        self.assertEqual(bot_ross.DAILY_GIF_RATE, 0.20)
+        self.assertIsNone(bot_ross.SECRET_MAGIC_MODEL)
+        self.assertEqual(bot_ross.SVG_MODEL, "gpt-6-sol")
+        self.assertIsNone(bot_ross.DISCORD_CHANNEL_ID)
+
+    def test_values_and_bad_rate(self):
+        bot_ross.load_config({**self.BASE, "DAILY_GIF_RATE": "0.5", "SECRET_MAGIC_MODEL": "gpt-x",
+                              "SVG_MODEL": "gpt-5.4-mini", "DISCORD_CHANNEL_ID": "<#123>"})
+        self.assertEqual((bot_ross.DAILY_GIF_RATE, bot_ross.SECRET_MAGIC_MODEL, bot_ross.SVG_MODEL,
+                          bot_ross.DISCORD_CHANNEL_ID), (0.5, "gpt-x", "gpt-5.4-mini", 123))
+        bot_ross.load_config({**self.BASE, "DAILY_GIF_RATE": "7"})
+        self.assertEqual(bot_ross.DAILY_GIF_RATE, 0.20)
 
 
 if __name__ == "__main__":

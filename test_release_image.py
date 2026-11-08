@@ -64,12 +64,16 @@ class VarietyTest(unittest.TestCase):
                 wl = sub_algo["word_lists"][cat]
                 idx = release_image._release_index(src, latest_version(), cat, len(wl))
                 seen[cat].add(idx)
-        # Over 500 inputs, selection should spread across most of every list, not
-        # collapse onto a handful of values.
+        # Selection should spread across the list like uniform random picks would, not
+        # collapse onto a handful of values. With n draws from L items, uniform picking
+        # hits L * (1 - (1 - 1/L)**n) distinct items on average; v2's lists are far
+        # longer than the sample, so a fixed fraction of the list can't be the bar.
+        n = len(SAMPLE_INPUTS)
         for cat, indices in seen.items():
             list_len = len(algo["word_lists"][cat])
-            coverage = len(indices) / list_len
-            self.assertGreater(coverage, 0.5, f"category {cat} only covered {coverage:.0%} of its list")
+            expected = list_len * (1 - (1 - 1 / list_len) ** n)
+            self.assertGreater(len(indices), 0.9 * expected,
+                               f"category {cat} hit {len(indices)} distinct items; uniform picks would hit ~{expected:.0f}")
 
 
 class StructuralValidityTest(unittest.TestCase):
@@ -188,6 +192,41 @@ class DataIntegrityTest(unittest.TestCase):
                 for phrase in wl:
                     self.assertNotIn("{", phrase, f"v{version} {cat}: stray '{{' in {phrase!r}")
                     self.assertNotIn("}", phrase, f"v{version} {cat}: stray '}}' in {phrase!r}")
+
+
+class FrozenV1Test(unittest.TestCase):
+    """v1 must never change: old release avatars are reproduced from it. These prompts were
+    recorded from v1 on 2026-11-07, before v2 existed."""
+
+    PINNED = {
+        "abc123": "A detailed pen-and-ink drawing of a blocky adventurer in the style of Minecraft within a snow-laden Japanese onsen town, with a single red rose. Styled as a faded Polaroid snapshot. A mirrored kaleidoscopic composition. Backlit by a blazing sunset. Buoyant with carefree delight. In a fiery orange and crimson blaze.",
+        "e6f8d85": "A playful claymation still of a rotund quokka grinning on a lonely country road lined with poplars, with a floating soap bubble. Painted in soft Impressionist dabs of light. A dramatic extreme close-up. Illuminated by a swirling aurora. Shadowed by lonely solitude. In stark black-and-white with a single red accent.",
+        "hello world": "A bold linocut print of a thunderous Norse god Thor amid the paper lanterns of a temple festival, with a stack of dusty leather books. Painted in bold Post-Impressionist brushstrokes. Framed as a cinematic widescreen still. Washed in silvery starlight. Shadowed by lonely solitude. In regal purples and gilded gold.",
+    }
+
+    def test_v1_prompts_are_unchanged(self):
+        for source, prompt in self.PINNED.items():
+            with self.subTest(source=source):
+                self.assertEqual(build_release_prompt(source, version="1")[0], prompt)
+
+
+class V2Test(unittest.TestCase):
+    """v2 is the much larger list set built in 2026-11 (see CLAUDE.md's Release Image notes)."""
+
+    def test_v2_is_the_default_and_much_bigger_than_v1(self):
+        self.assertEqual(latest_version(), "2")
+        v1, v2 = RELEASE_ALGORITHMS["1"], RELEASE_ALGORITHMS["2"]
+        self.assertEqual(v2["template"], v1["template"])
+        self.assertEqual(v2["categories"], v1["categories"])
+        for cat in v1["categories"]:
+            with self.subTest(cat=cat):
+                self.assertGreaterEqual(len(v2["word_lists"][cat]), 5 * len(v1["word_lists"][cat]))
+                # v2 keeps every v1 entry.
+                self.assertTrue(set(v1["word_lists"][cat]) <= set(v2["word_lists"][cat]))
+
+    def test_v1_still_selectable(self):
+        _, _, ver = build_release_prompt("abc123", version="1")
+        self.assertEqual(ver, "1")
 
 
 if __name__ == "__main__":

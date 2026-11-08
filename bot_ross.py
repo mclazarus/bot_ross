@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import aiohttp
 import time
 import signal
@@ -22,6 +23,9 @@ import image_size
 import daily_schedule
 import pipe_chain
 import message_links
+import release
+import output_format
+import secret_magic
 from magic_paint import parse_magic_rate, format_magic_rate
 
 logger = logging.getLogger("bot_ross")
@@ -32,9 +36,9 @@ logger = logging.getLogger("bot_ross")
 OPENAI_API_KEY = None
 DISCORD_BOT_TOKEN = None
 LIMIT = 100
-IMAGE_MODEL = 'gpt-image-2.5-flare-low'
+IMAGE_MODEL = 'gpt-image-2.6-flare-low'
 IMAGE_MODERATION = 'low'
-MEME_MODEL = 'gpt-5.4-mini'
+MEME_MODEL = 'gpt-6-sol'
 MAGIC_PAINT_RATE = 0.05
 DRAIN_TIMEOUT = 300.0
 BOT_TIMEZONE = daily_schedule.DEFAULT_TIMEZONE
@@ -43,8 +47,21 @@ DAILY_IMAGE_ENABLED = True
 _raw_daily_channel = None
 DAILY_IMAGE_CHANNEL_ID = None
 DAILY_CHANNEL_MISCONFIGURED = False
+# Where the startup greeting goes. None (unset or unparseable) skips the greeting.
+DISCORD_CHANNEL_ID = None
+# Chance (0.0-1.0) that the morning daily image is animated. Runtime-mutable via
+# &daily_gif_rate, same as MAGIC_PAINT_RATE / &magic_rate.
+DAILY_GIF_RATE = 0.20
+# Chat model that writes the nightly secret magic mixin. None means MEME_MODEL.
+SECRET_MAGIC_MODEL = None
+# Text model OpenAI uses to write SVG output (the image model draws a reference first).
+SVG_MODEL = 'gpt-6-sol'
 
 DATA_FILE = "data/request_data.json"
+# Person-typed image prompts, for the nightly secret-magic job (see secret_magic.py).
+PROMPT_LOG_FILE = "data/prompt_log.json"
+# The five rotating secret magic mixins.
+SECRET_MAGIC_FILE = "data/secret_magic.json"
 
 
 def _require(env, name):
@@ -147,7 +164,8 @@ def load_config(env=None):
     global OPENAI_API_KEY, DISCORD_BOT_TOKEN, LIMIT, IMAGE_MODEL, IMAGE_MODERATION, \
         MEME_MODEL, MAGIC_PAINT_RATE, DRAIN_TIMEOUT, BOT_TIMEZONE, BOT_ZONE, \
         DAILY_IMAGE_ENABLED, _raw_daily_channel, DAILY_IMAGE_CHANNEL_ID, \
-        DAILY_CHANNEL_MISCONFIGURED
+        DAILY_CHANNEL_MISCONFIGURED, DISCORD_CHANNEL_ID, DAILY_GIF_RATE, SECRET_MAGIC_MODEL, \
+        SVG_MODEL
 
     if env is None:
         env = os.environ
@@ -158,9 +176,9 @@ def load_config(env=None):
 
     # Configuration
     LIMIT            = int(env.get('API_LIMIT', 100))
-    IMAGE_MODEL      = env.get('IMAGE_MODEL', 'gpt-image-2.5-flare-low')
+    IMAGE_MODEL      = env.get('IMAGE_MODEL', 'gpt-image-2.6-flare-low')
     IMAGE_MODERATION = env.get('IMAGE_MODERATION', 'low')
-    MEME_MODEL       = env.get('MEME_MODEL', 'gpt-5.4-mini')
+    MEME_MODEL       = env.get('MEME_MODEL', 'gpt-6-sol')
 
     try:
         MAGIC_PAINT_RATE = float(env.get('MAGIC_PAINT_RATE', 0.05))
@@ -168,6 +186,16 @@ def load_config(env=None):
             raise ValueError
     except (TypeError, ValueError):
         MAGIC_PAINT_RATE = 0.05
+
+    try:
+        DAILY_GIF_RATE = float(env.get('DAILY_GIF_RATE', 0.20))
+        if not (0.0 <= DAILY_GIF_RATE <= 1.0):
+            raise ValueError
+    except (TypeError, ValueError):
+        DAILY_GIF_RATE = 0.20
+
+    SECRET_MAGIC_MODEL = env.get('SECRET_MAGIC_MODEL') or None
+    SVG_MODEL = env.get('SVG_MODEL', 'gpt-6-sol')
 
     # On SIGTERM/SIGINT the bot stops accepting new commands and waits up to DRAIN_TIMEOUT
     # seconds for in-flight image generations to finish before closing (see
@@ -204,14 +232,19 @@ def load_config(env=None):
         (_raw_daily_channel or "").strip()
     )
 
+    # The channel the startup greeting ("A wild Bot Ross appears!") is posted to. Optional:
+    # unset or unparseable just skips the greeting (logged in on_ready), never a crash.
+    DISCORD_CHANNEL_ID = daily_schedule.parse_channel_id(env.get('DISCORD_CHANNEL_ID'))
+
     # `docker run --env-file` takes everything after the first "=" as the value, comment
     # included, so a .env written with trailing `# ...` comments silently poisons every
     # value it touches. Each parser above then falls back to its default without saying
     # why. Check the raw values once at startup and name the variable, so this shows up as
     # one obvious log line instead of a scheduler that quietly never runs.
-    for _name in ('BOT_TIMEZONE', 'DAILY_IMAGE_CHANNEL_ID', 'DAILY_IMAGE_ENABLED',
+    for _name in ('BOT_TIMEZONE', 'DAILY_IMAGE_CHANNEL_ID', 'DISCORD_CHANNEL_ID', 'DAILY_IMAGE_ENABLED',
                   'DRAIN_TIMEOUT', 'API_LIMIT', 'IMAGE_MODEL', 'IMAGE_MODERATION',
-                  'MEME_MODEL', 'MAGIC_PAINT_RATE'):
+                  'MEME_MODEL', 'MAGIC_PAINT_RATE', 'DAILY_GIF_RATE', 'SECRET_MAGIC_MODEL',
+                  'SVG_MODEL'):
         if daily_schedule.looks_like_inline_comment(env.get(_name)):
             logger.warning(
                 f"{_name} looks like it contains an inline `# comment` -- docker --env-file "
@@ -238,6 +271,51 @@ DAILY_STATE_FILE = "data/daily_state.json"
 DAILY_IMAGES_DIR = "data/daily_images"
 
 MODEL_CONFIGS = {
+    "gpt-image-2.6-flare": {
+        "model": "gpt-image-2.6-flare",
+        "params": {"size": "1024x1024", "quality": "high"},
+        "has_revised_prompt": False,
+        "supports_moderation": True,
+        "supports_edit": True,
+        "supports_gif": True,
+        "supports_svg": True,
+    },
+    "gpt-image-2.6-flare-xhigh": {
+        "model": "gpt-image-2.6-flare",
+        "params": {"size": "1024x1024", "quality": "xhigh"},
+        "has_revised_prompt": False,
+        "supports_moderation": True,
+        "supports_edit": True,
+        "supports_gif": True,
+        "supports_svg": True,
+    },
+    "gpt-image-2.6-flare-max": {
+        "model": "gpt-image-2.6-flare",
+        "params": {"size": "1024x1024", "quality": "max"},
+        "has_revised_prompt": False,
+        "supports_moderation": True,
+        "supports_edit": True,
+        "supports_gif": True,
+        "supports_svg": True,
+    },
+    "gpt-image-2.6-flare-medium": {
+        "model": "gpt-image-2.6-flare",
+        "params": {"size": "1024x1024", "quality": "medium"},
+        "has_revised_prompt": False,
+        "supports_moderation": True,
+        "supports_edit": True,
+        "supports_gif": True,
+        "supports_svg": True,
+    },
+    "gpt-image-2.6-flare-low": {
+        "model": "gpt-image-2.6-flare",
+        "params": {"size": "1024x1024", "quality": "low"},
+        "has_revised_prompt": False,
+        "supports_moderation": True,
+        "supports_edit": True,
+        "supports_gif": True,
+        "supports_svg": True,
+    },
     "gpt-image-2.5-flare": {
         "model": "gpt-image-2.5-flare",
         "params": {"size": "1024x1024", "quality": "high"},
@@ -306,7 +384,7 @@ MODEL_CONFIGS = {
 # The config every model lookup falls back to when asked for an unknown alias, and the
 # edit model for a config with no edit endpoint (dall-e-3). The full-quality entry of
 # the current default family; the quality-tier commands below use its siblings.
-DEFAULT_MODEL_FAMILY = "gpt-image-2.5-flare"
+DEFAULT_MODEL_FAMILY = "gpt-image-2.6-flare"
 
 
 def format_duration(seconds):
@@ -343,8 +421,24 @@ def _load_magic_library():
     return magic_paint.load_magic_library(MAGIC_PROMPTS_FILE)
 
 
+# Per-command request options, set by _piped for each segment and read by do_the_art
+# and the magic helpers. Every Discord command (and every scheduler task) runs in its
+# own asyncio task, which gets its own copy of the context, so a value set for one
+# command never leaks into another.
+_boring = contextvars.ContextVar("bot_ross_boring", default=False)
+_output = contextvars.ContextVar("bot_ross_output", default=output_format.OutputFlags())
+
+
+def _magic_pool():
+    """Human-written mixins plus the nightly secret ones (see secret_magic.py)."""
+    return (magic_paint.load_magic_library(MAGIC_PROMPTS_FILE)
+            + secret_magic.magic_entries(secret_magic.load_store(SECRET_MAGIC_FILE)))
+
+
 def _apply_random_magic_entry(prompt):
-    return magic_paint.apply_random_magic_entry(prompt, path=MAGIC_PROMPTS_FILE)
+    if _boring.get():
+        return prompt
+    return magic_paint.apply_random_magic_entry(prompt, entries=_magic_pool())
 
 
 def _save_magic_library(entries):
@@ -356,8 +450,13 @@ def _seed_magic_library():
 
 
 def maybe_apply_magic_paint(prompt):
-    """Random-roll magic paint at the live MAGIC_PAINT_RATE. Only reads the library if the roll succeeds."""
-    return magic_paint.maybe_apply_magic_paint(prompt, MAGIC_PAINT_RATE, path=MAGIC_PROMPTS_FILE)
+    """Random-roll magic paint at the live MAGIC_PAINT_RATE over the human + secret pool.
+    Only reads the libraries if the roll succeeds. `--boring` (see _boring) never rolls."""
+    if _boring.get():
+        return prompt, False
+    if random.random() < MAGIC_PAINT_RATE:
+        return _apply_random_magic_entry(prompt), True
+    return prompt, False
 
 
 # Thin wrappers binding macros.py's pure logic to this module's file paths, mirroring
@@ -411,14 +510,15 @@ def format_rate_change_time(iso_str):
     return rendered
 
 
-def _record_rate_change(user, rate):
-    """Append a rate-change record to the persisted history (keeps the last 10) and log it."""
+def _record_rate_change(user, rate, key='magic_rate_history', label="Magic rate"):
+    """Append a rate-change record to the persisted history (keeps the last 10) and log it.
+    `key`/`label` let &daily_gif_rate keep its own history the same way."""
     data = load_data()
-    history = data.get('magic_rate_history', [])
+    history = data.get(key, [])
     history.append({"user": user, "rate": rate, "time": datetime.now().astimezone().isoformat()})
-    data['magic_rate_history'] = history[-10:]
+    data[key] = history[-10:]
     save_data(data)
-    logger.info(f"Magic rate changed to {format_magic_rate(rate)} ({rate}) by {user}")
+    logger.info(f"{label} changed to {format_magic_rate(rate)} ({rate}) by {user}")
 
 
 def _bump_stat(key, amount=1):
@@ -461,6 +561,19 @@ async def send_long(ctx, text):
         await ctx.send(chunk)
 
 
+def _log_prompt(ctx, prompt):
+    """Record a person-typed prompt (post-macro, pre-magic) for the nightly secret-magic
+    job. Never raises: logging must not cost anyone their painting."""
+    try:
+        now = datetime.now(BOT_ZONE)
+        command = getattr(getattr(ctx, "command", None), "name", None) or "?"
+        user = getattr(getattr(ctx, "author", None), "name", None) or "?"
+        secret_magic.append_prompt(PROMPT_LOG_FILE, now.date(), now.isoformat(timespec="seconds"),
+                                   user, command, prompt)
+    except Exception:
+        logger.exception("Couldn't log the prompt for secret magic")
+
+
 async def expand_prompt_macros(ctx, prompt):
     """Expand every ';token' in `prompt` via the macro library (data/macros.json).
 
@@ -475,6 +588,7 @@ async def expand_prompt_macros(ctx, prompt):
     however many tokens actually hit/missed on this call -- if the prompt had no
     ';tokens' at all, nothing is written to disk and nothing is sent."""
     prompt, hits, misses = macros.expand_macros(prompt, path=MACROS_FILE)
+    _log_prompt(ctx, prompt)
     if hits or misses:
         lines = []
         if misses:
@@ -510,6 +624,10 @@ _signals_installed = False
 # errors we logged (so a persistently bad data/daily_schedule.json warns once per
 # distinct problem, not once a minute forever -- see _run_due_daily_slots).
 _daily_task = None
+# on_ready refires on every reconnect; the greeting goes out once per process.
+_greeted = False
+# The nightly secret-magic background task (see _secret_magic_loop).
+_secret_task = None
 _last_schedule_errors = []
 
 
@@ -556,8 +674,11 @@ def get_current_month():
 
 @bot.event
 async def on_ready():
-    global _signals_installed, _daily_task
+    global _signals_installed, _daily_task, _greeted, _secret_task
     logger.info(f'{bot.user.name} has connected to Discord!')
+    if not _greeted:
+        _greeted = True
+        await _send_greeting()
     # discord.py installs no SIGTERM handler, so as PID 1 in Docker the process would
     # ignore `docker stop` until it SIGKILLs. Install real loop handlers so we drain
     # instead. Idempotent, but guard anyway since on_ready refires on reconnect.
@@ -590,6 +711,26 @@ async def on_ready():
         _daily_task = asyncio.create_task(_daily_scheduler_loop())
         _daily_task.add_done_callback(_log_daily_task_result)
 
+    # The nightly secret-magic job runs whether or not the daily image is on.
+    if _secret_task is None or _secret_task.done():
+        _secret_task = asyncio.create_task(_secret_magic_loop())
+        _secret_task.add_done_callback(_log_daily_task_result)
+
+
+async def _send_greeting():
+    """Post the startup greeting with the running build. Never raises: a missing or
+    unreachable channel is logged, and startup carries on."""
+    r, commit_hash = release.current(), release.commit()
+    logger.info(f"Running build {r.build} ({commit_hash or 'dev'})")
+    if DISCORD_CHANNEL_ID is None:
+        logger.info("No DISCORD_CHANNEL_ID set; skipping the startup greeting.")
+        return
+    try:
+        channel = bot.get_channel(DISCORD_CHANNEL_ID) or await bot.fetch_channel(DISCORD_CHANNEL_ID)
+        await channel.send(release.greeting_message(r, commit_hash))
+    except Exception as e:
+        logger.warning(f"Couldn't post the startup greeting to {DISCORD_CHANNEL_ID}: {e}")
+
 
 @bot.check
 async def _reject_while_draining(ctx):
@@ -618,6 +759,7 @@ async def ping(ctx):
 @bot.command(name='meme', help='Create an image based on a GPT generated prompt takes suggestions. monthly limit')
 async def meme(ctx, *, prompt=None):
     if prompt:
+        _log_prompt(ctx, prompt)
         await ctx.send(f"Generating meme prompt based on: {prompt}")
     else:
         await ctx.send(f"Generating meme prompt based on GPTs wildest imagination.")
@@ -690,6 +832,8 @@ async def _paint_once(ctx, raw, request_type, model, magic_mode):
     if prompt is None:
         return False
     prompt = await expand_prompt_macros(ctx, prompt)
+    if _boring.get():
+        magic_mode = "none"
     if magic_mode == "roll":
         prompt, magic = maybe_apply_magic_paint(prompt)
         await send_quote(ctx, magic)
@@ -948,8 +1092,10 @@ async def _remix_once(ctx, raw):
         prompt = await expand_prompt_macros(ctx, prompt)
         prompt, magic = maybe_apply_magic_paint(prompt)
     else:
-        prompt = _apply_random_magic_entry("creatively reinterpret this image")
-        magic = True
+        fallback = ("bring this image to life as a short looping animation"
+                    if _output.get().kind == output_format.GIF else "creatively reinterpret this image")
+        prompt = _apply_random_magic_entry(fallback)
+        magic = not _boring.get()
 
     await send_quote(ctx, magic)
     return await do_the_art(ctx, prompt, "remix", IMAGE_MODEL, images=images, size=size)
@@ -985,7 +1131,51 @@ async def _release_image_once(ctx, raw):
 # magic paint ever see it), and each individual segment is then processed in the same
 # size-flags -> macros -> magic order a plain single command always has been.
 
-async def _piped(ctx, raw, first_runner, request_type, model, magic_mode):
+# Commands whose FIRST step may ask for --gif / --svg. &dpaint is DALL-E 3 by name, so it
+# keeps its stills; every command's later pipe steps are 2.6 edits and may end in --gif.
+GIF_FIRST_STEP = {"paint", "hpaint", "mpaint", "lpaint", "xpaint", "remix", "animate", "release_image"}
+SVG_FIRST_STEP = {"paint", "hpaint", "mpaint", "lpaint", "xpaint"}
+
+
+def _parse_chain_flags(segments, request_type, force_gif_last=False):
+    """Strip the output flags from every segment and check the chain's rules before
+    anything is spent. Returns (cleaned_segments, per_segment_flags, boring), or raises
+    output_format.FlagError with the message to send.
+
+    - `--boring` anywhere turns magic off for the whole command.
+    - `--gif` only on the LAST step: a GIF can't be fed into the next step's edit.
+    - `--svg` only on a single-step paint command: SVG is generations-only, so nothing
+      can follow it and &remix can't produce one.
+    - `force_gif_last` (&animate) makes the last step a GIF unless it already is.
+    """
+    cleaned, flags = [], []
+    for seg in segments:
+        text, f = output_format.parse_output_flags(seg)
+        cleaned.append(text)
+        flags.append(f)
+    boring = any(f.boring for f in flags)
+    last = len(flags) - 1
+    if force_gif_last and flags[last].kind != output_format.GIF:
+        if flags[last].kind == output_format.SVG:
+            raise output_format.FlagError("`&animate` makes a GIF, so `--svg` doesn't fit here.")
+        flags[last] = flags[last]._replace(kind=output_format.GIF)
+    for i, f in enumerate(flags):
+        if f.kind == output_format.GIF:
+            if i != last:
+                raise output_format.FlagError(
+                    f"`--gif` only works on the last step of a chain (it's on step {i + 1} of {last + 1}).")
+            if i == 0 and request_type not in GIF_FIRST_STEP:
+                raise output_format.FlagError(
+                    f"`&{request_type}` can't make a GIF itself — add a `| --gif` step after it.")
+        if f.kind == output_format.SVG:
+            if last != 0:
+                raise output_format.FlagError("`--svg` can't be part of a chain — nothing can edit an SVG.")
+            if request_type not in SVG_FIRST_STEP:
+                raise output_format.FlagError("`--svg` works with `&paint` and its quality variants.")
+    return cleaned, flags, boring
+
+
+async def _piped(ctx, raw, first_runner, request_type, model, magic_mode, force_gif_last=False):
     """Entry point for every pipe-capable command. Splits `raw` on '|' before
     anything else touches it -- splitting after macro expansion would let a library
     macro whose text happens to contain '|' inject extra pipeline steps; splitting
@@ -997,6 +1187,8 @@ async def _piped(ctx, raw, first_runner, request_type, model, magic_mode):
     like today.
     """
     if raw is None:
+        if force_gif_last:
+            _output.set(output_format.OutputFlags(kind=output_format.GIF))
         await first_runner(ctx, None)
         return
 
@@ -1011,6 +1203,14 @@ async def _piped(ctx, raw, first_runner, request_type, model, magic_mode):
         return
     if dropped:
         await ctx.send(pipe_chain.dropped_note(dropped))
+
+    try:
+        segments, seg_flags, boring = _parse_chain_flags(segments, request_type, force_gif_last)
+    except output_format.FlagError as e:
+        await ctx.send(str(e))
+        return
+    _boring.set(boring)
+    _output.set(seg_flags[0])
 
     if len(segments) == 1:
         # No real chain: with no '|' at all, segments[0] is `raw` verbatim, so this
@@ -1028,12 +1228,12 @@ async def _piped(ctx, raw, first_runner, request_type, model, magic_mode):
     global active_requests
     active_requests += 1
     try:
-        await _run_chain(ctx, segments, first_runner, request_type, model, magic_mode)
+        await _run_chain(ctx, segments, first_runner, request_type, model, magic_mode, seg_flags)
     finally:
         active_requests -= 1
 
 
-async def _run_chain(ctx, segments, first_runner, request_type, model, magic_mode):
+async def _run_chain(ctx, segments, first_runner, request_type, model, magic_mode, seg_flags=None):
     """Run a real chain: segment 1 via `first_runner` (identical to today's un-piped
     command), every later segment as an edit of the previous segment's output via
     _pipe_edit_once. Aborts with "Chain stopped at step N of M" on the first failure
@@ -1053,6 +1253,8 @@ async def _run_chain(ctx, segments, first_runner, request_type, model, magic_mod
     prev_bytes = result.image_bytes
 
     for step, text in enumerate(segments[1:], start=2):
+        if seg_flags is not None:
+            _output.set(seg_flags[step - 1])
         result = await _pipe_edit_once(ctx, text, prev_bytes, anchor, model, magic_mode)
         if not result:
             await ctx.send(pipe_chain.chain_stopped_message(step, total))
@@ -1096,9 +1298,12 @@ async def _pipe_edit_once(ctx, raw, prev_bytes, anchor, model, magic_mode):
         # A segment that's flags-only (e.g. "... | --portrait") -- the same literal
         # fallback &remix uses for an image with no guiding text at all. Not run
         # through macro expansion; there's no user text to expand.
-        prompt = "creatively reinterpret this image"
+        prompt = ("bring this image to life as a short looping animation"
+                  if _output.get().kind == output_format.GIF else "creatively reinterpret this image")
 
     magic = False
+    if _boring.get():
+        magic_mode = "none"
     if magic_mode == "roll":
         prompt, magic = maybe_apply_magic_paint(prompt)
     elif magic_mode == "always":
@@ -1128,28 +1333,28 @@ async def _pipe_edit_once(ctx, raw, prev_bytes, anchor, model, magic_mode):
     return result
 
 
-@bot.command(name='paint', help='Paint a picture based on a prompt. Flags: --landscape/--portrait/--square, --res WxH. monthly limit Chain follow-up edits with | (up to 5 steps).')
+@bot.command(name='paint', help='Paint a picture based on a prompt. Flags: --landscape/--portrait/--square, --res WxH, --gif (--frames N, --ms N), --svg, --boring. monthly limit Chain follow-up edits with | (up to 5 steps).')
 async def paint(ctx, *, prompt):
     await _piped(ctx, prompt, lambda c, t: _paint_once(c, t, "paint", IMAGE_MODEL, "roll"),
                  "paint", IMAGE_MODEL, "roll")
 
 
-@bot.command(name='hpaint', help='Paint a high quality picture with gpt-image-2.5-flare. Flags: --landscape/--portrait/--square, --res WxH. monthly limit Chain follow-up edits with | (up to 5 steps).')
+@bot.command(name='hpaint', help='Paint a high quality picture with gpt-image-2.6-flare. Flags: --landscape/--portrait/--square, --res WxH, --gif (--frames N, --ms N), --svg, --boring. monthly limit Chain follow-up edits with | (up to 5 steps).')
 async def hpaint(ctx, *, prompt):
-    await _piped(ctx, prompt, lambda c, t: _paint_once(c, t, "hpaint", "gpt-image-2.5-flare", "none"),
-                 "hpaint", "gpt-image-2.5-flare", "none")
+    await _piped(ctx, prompt, lambda c, t: _paint_once(c, t, "hpaint", "gpt-image-2.6-flare", "none"),
+                 "hpaint", "gpt-image-2.6-flare", "none")
 
 
-@bot.command(name='mpaint', help='Paint a medium quality picture with gpt-image-2.5-flare. Flags: --landscape/--portrait/--square, --res WxH. monthly limit Chain follow-up edits with | (up to 5 steps).')
+@bot.command(name='mpaint', help='Paint a medium quality picture with gpt-image-2.6-flare. Flags: --landscape/--portrait/--square, --res WxH, --gif (--frames N, --ms N), --svg, --boring. monthly limit Chain follow-up edits with | (up to 5 steps).')
 async def mpaint(ctx, *, prompt):
-    await _piped(ctx, prompt, lambda c, t: _paint_once(c, t, "mpaint", "gpt-image-2.5-flare-medium", "none"),
-                 "mpaint", "gpt-image-2.5-flare-medium", "none")
+    await _piped(ctx, prompt, lambda c, t: _paint_once(c, t, "mpaint", "gpt-image-2.6-flare-medium", "none"),
+                 "mpaint", "gpt-image-2.6-flare-medium", "none")
 
 
-@bot.command(name='lpaint', help='Paint a low quality picture with gpt-image-2.5-flare. Flags: --landscape/--portrait/--square, --res WxH. monthly limit Chain follow-up edits with | (up to 5 steps).')
+@bot.command(name='lpaint', help='Paint a low quality picture with gpt-image-2.6-flare. Flags: --landscape/--portrait/--square, --res WxH, --gif (--frames N, --ms N), --svg, --boring. monthly limit Chain follow-up edits with | (up to 5 steps).')
 async def lpaint(ctx, *, prompt):
-    await _piped(ctx, prompt, lambda c, t: _paint_once(c, t, "lpaint", "gpt-image-2.5-flare-low", "none"),
-                 "lpaint", "gpt-image-2.5-flare-low", "none")
+    await _piped(ctx, prompt, lambda c, t: _paint_once(c, t, "lpaint", "gpt-image-2.6-flare-low", "none"),
+                 "lpaint", "gpt-image-2.6-flare-low", "none")
 
 
 @bot.command(name='dpaint', help='Paint with DALL-E 3. monthly limit Chain follow-up edits with | (up to 5 steps).')
@@ -1159,15 +1364,20 @@ async def dpaint(ctx, *, prompt):
 
 # Hidden always-on variant of &paint. Named xpaint (not mpaint) since &mpaint is
 # already the medium-quality command. Not listed in help; the addition is never revealed.
-@bot.command(name='xpaint', help='Paint a picture, with a little extra magic. Flags: --landscape/--portrait/--square, --res WxH. Chain follow-up edits with | (up to 5 steps).', hidden=True)
+@bot.command(name='xpaint', help='Paint a picture, with a little extra magic. Flags: --landscape/--portrait/--square, --res WxH, --gif (--frames N, --ms N), --svg, --boring. Chain follow-up edits with | (up to 5 steps).', hidden=True)
 async def xpaint(ctx, *, prompt):
     await _piped(ctx, prompt, lambda c, t: _paint_once(c, t, "xpaint", IMAGE_MODEL, "always"),
                  "xpaint", IMAGE_MODEL, "always")
 
 
-@bot.command(name='remix', help='Remix an image with a prompt. Attach an image, reply to one, paste a message link from this server, or any mix — and add a prompt to guide the transformation. Flags: --landscape/--portrait/--square, --res WxH (coerced to a valid size, same as &paint). Falls back to painting if no image is found. Monthly limit applies. Chain follow-up edits with | (up to 5 steps).')
+@bot.command(name='remix', help='Remix an image with a prompt. Attach an image, reply to one, paste a message link from this server, or any mix — and add a prompt to guide the transformation. Flags: --landscape/--portrait/--square, --res WxH (coerced to a valid size, same as &paint), --gif (--frames N, --ms N), --boring. Falls back to painting if no image is found. Monthly limit applies. Chain follow-up edits with | (up to 5 steps).')
 async def remix(ctx, *, prompt=None):
     await _piped(ctx, prompt, _remix_once, "remix", IMAGE_MODEL, "roll")
+
+
+@bot.command(name='animate', help='Animate an image as a GIF: attach one, reply to one, or paste a message link — or give just a prompt to animate from scratch. Flags: --frames N (2-16), --ms N per frame, --landscape/--portrait/--square, --res WxH, --boring. Chain steps with | and the last one is animated.')
+async def animate(ctx, *, prompt=None):
+    await _piped(ctx, prompt, _remix_once, "animate", IMAGE_MODEL, "roll", force_gif_last=True)
 
 
 @bot.command(name='release_image', help='Generate a deterministic release avatar from a git hash (or any text) — same input always yields the same prompt. Flags: --george, --vN. Monthly limit applies. Chain follow-up edits with | (up to 5 steps).')
@@ -1287,6 +1497,41 @@ async def magic_rate(ctx, value=None):
     await ctx.send(f"Magic rate set to {format_magic_rate(rate)}.")
 
 
+@bot.command(name='daily_gif_rate', help='Show or set the chance the morning daily image is animated. e.g. &daily_gif_rate, &daily_gif_rate 20, &daily_gif_rate .2, &daily_gif_rate 20%')
+async def daily_gif_rate(ctx, value=None):
+    global DAILY_GIF_RATE
+    if value is None:
+        data = load_data()
+        history = data.get('daily_gif_rate_history', [])
+        msg = f"Daily GIF rate: {format_magic_rate(DAILY_GIF_RATE)}"
+        if history:
+            last = history[-1]
+            msg += f"\nLast changed by {last['user']} on {format_rate_change_time(last['time'])}"
+        await ctx.send(msg)
+        return
+    try:
+        rate = parse_magic_rate(value)
+    except ValueError:
+        await ctx.send("Couldn't read that rate. Try `20`, `.2`, `20%`, or `.2%` (values map to a 0–100% chance).")
+        return
+    DAILY_GIF_RATE = rate
+    _record_rate_change(ctx.author.name, rate, key='daily_gif_rate_history', label="Daily GIF rate")
+    await ctx.send(f"Daily GIF rate set to {format_magic_rate(rate)}.")
+
+
+@bot.command(name='secret_magic', help='List the secret magic mixins Bot Ross writes each night from the day\'s prompts.', hidden=True)
+async def secret_magic_cmd(ctx):
+    store = secret_magic.load_store(SECRET_MAGIC_FILE)
+    if not store["slots"]:
+        await ctx.send(f"No secret magic yet. Bot Ross writes one at {secret_magic.RUN_HOUR}:"
+                       f"{secret_magic.RUN_MINUTE:02d} on any day with at least {secret_magic.MIN_PROMPTS} prompts.")
+        return
+    lines = [f"🤫 Secret magic ({len(store['slots'])} of {secret_magic.MAX_SLOTS}, newest last):"]
+    for slot in store["slots"]:
+        lines.append(f"`{slot['id']}` (from {slot.get('prompt_count', '?')} prompts): {slot['text']}")
+    await send_long(ctx, "\n".join(lines))
+
+
 @bot.command(name='macro_list', help='List the ;macro ids and authors. Use &macro_show to read one, &macro_update to change it.')
 async def macro_list(ctx):
     entries = _load_macro_library()
@@ -1382,8 +1627,42 @@ async def macro_remove(ctx, entry_id=None):
     await ctx.send(f"Removed macro `;{normalized_id}`.{note}")
 
 
+# Output tokens of one 1024x1024 2.6-flare still, per quality, measured 2026-11-07. A GIF
+# counts against the monthly limit as (its output tokens / a still's at the same quality),
+# rounded, at least 1 -- about 1.4x at 512px frames up to 3.4x at 960px. If the API
+# reports no usage, GIF_REQUEST_WEIGHT is used instead.
+STILL_OUTPUT_TOKENS = {"low": 824, "medium": 1449, "high": 1758, "xhigh": 3122, "max": 7024}
+GIF_REQUEST_WEIGHT = 3
+DISCORD_DEFAULT_UPLOAD_LIMIT = 10 * 1024 * 1024
+
+
+def _request_weight(kind, model, usage):
+    if kind != output_format.GIF:
+        return 1
+    quality = MODEL_CONFIGS.get(model, {}).get("params", {}).get("quality", "low")
+    try:
+        return max(1, round(usage["output_tokens"] / STILL_OUTPUT_TOKENS[quality]))
+    except (TypeError, KeyError, ZeroDivisionError):
+        return GIF_REQUEST_WEIGHT
+
+
+def _svg_preview(svg_bytes):
+    """Render an SVG to a PNG preview (Discord won't preview SVGs). None if it fails."""
+    try:
+        import resvg_py
+        return bytes(resvg_py.svg_to_bytes(svg_string=svg_bytes.decode("utf-8"), width=1024))
+    except Exception:
+        logger.exception("Couldn't render the SVG preview")
+        return None
+
+
+def _upload_limit(ctx):
+    guild = getattr(ctx, "guild", None)
+    return getattr(guild, "filesize_limit", None) or DISCORD_DEFAULT_UPLOAD_LIMIT
+
+
 async def do_the_art(ctx, prompt, request_type, model, images=None, size=None,
-                      reply_to=None, content=None, quiet=False):
+                      reply_to=None, content=None, quiet=False, output=None, send=True):
     # `size` (see image_size.py) is now forwarded on BOTH paths below: fetch_image_edit
     # (images given -- &remix with an attachment, or a pipe chain's edit segments) and
     # fetch_image (generation -- &paint/&hpaint/&mpaint/&lpaint/&xpaint honoring
@@ -1410,10 +1689,20 @@ async def do_the_art(ctx, prompt, request_type, model, images=None, size=None,
     # Every image command funnels through here, so bracketing the whole body with the
     # active-request counter is what lets a shutdown drain in-flight work (see
     # _graceful_shutdown); the finally guarantees the count is released on every path.
+    # `output` (output_format.OutputFlags) picks PNG/GIF/SVG; None means this command's
+    # flags as _piped set them (see _output), which is PNG for everything else.
+    #
+    # `send=False` makes the image and counts it but posts nothing (no image, no revised
+    # prompt, no trailer); the ArtResult's `message` is None. Used on a GIF day, when the
+    # morning still is only the source for the animation and the base for the day's edits.
+    if output is None:
+        output = _output.get()
+    kind = output.kind
     global active_requests
     active_requests += 1
     try:
-        logger.info(f"Received {request_type} request from {ctx.author.name} using {model} to paint: {prompt}")
+        model = media_model(model, kind)
+        logger.info(f"Received {request_type} request from {ctx.author.name} using {model} ({kind}) to paint: {prompt}")
         current_month = get_current_month()
         data = load_data()
         if over_limit(data):
@@ -1430,13 +1719,20 @@ async def do_the_art(ctx, prompt, request_type, model, images=None, size=None,
         # Neutral/feature-agnostic name (not "daily_image_...") -- quiet=True covers
         # both the daily scheduler and chained pipe segments.
         file_name = generate_file_name(prompt) if not quiet else f"painting_{int(time.time())}.png"
+        file_name = file_name[:-len(".png")] + "." + output_format.extension(kind)
 
         try:
             t0 = time.monotonic()
+            out_arg = output if kind != output_format.PNG else None
+            req_size = size
+            if kind == output_format.GIF:
+                src_wh = image_size.png_dimensions(images[0][0]) if images else None
+                req_size = gif_request_size(output, size, src_wh)
             if images:
-                response = await fetch_image_edit(prompt, get_edit_model(model), images, size=size)
+                edit_model = media_model(get_edit_model(model), kind)
+                response = await fetch_image_edit(prompt, edit_model, images, size=req_size, output=out_arg)
             else:
-                response = await fetch_image(prompt, model, size=size)
+                response = await fetch_image(prompt, model, size=req_size, output=out_arg)
             elapsed = time.monotonic() - t0
             image_data = base64.b64decode(response['image'])
             if quiet:
@@ -1444,13 +1740,29 @@ async def do_the_art(ctx, prompt, request_type, model, images=None, size=None,
             else:
                 description = (response['revised_prompt'] or prompt)[:1024]
 
-            send_kwargs = {"file": discord.File(io.BytesIO(image_data), file_name, description=description)}
+            limit = _upload_limit(ctx)
+            if len(image_data) > limit:
+                raise Exception(f"the {kind.upper()} came out at {len(image_data) / 1e6:.1f} MB, over this "
+                                f"server's {limit / 1e6:.0f} MB upload limit")
+
+            def _files():
+                # Rebuilt on every send attempt: a discord.File's BytesIO is consumed by a send.
+                main = discord.File(io.BytesIO(image_data), file_name, description=description)
+                if kind != output_format.SVG:
+                    return {"file": main}
+                preview = _svg_preview(image_data)
+                if preview is None:
+                    return {"file": main}
+                png_name = file_name[:-len(".svg")] + ".png"
+                return {"files": [discord.File(io.BytesIO(preview), png_name, description=description), main]}
+
+            send_kwargs = _files()
             if content is not None:
                 send_kwargs["content"] = content
             if reply_to is not None:
                 send_kwargs["reference"] = reply_to
             try:
-                sent = await ctx.send(**send_kwargs)
+                sent = await ctx.send(**send_kwargs) if send else None
             except discord.HTTPException:
                 # A deleted anchor message resolves as Discord 400 "reference_unknown".
                 # Only retry the reference case -- with reply_to None this is the
@@ -1462,16 +1774,20 @@ async def do_the_art(ctx, prompt, request_type, model, images=None, size=None,
                 if reply_to is None:
                     raise
                 send_kwargs.pop("reference")
-                send_kwargs["file"] = discord.File(io.BytesIO(image_data), file_name, description=description)
+                send_kwargs.update(_files())
                 sent = await ctx.send(**send_kwargs)
 
-            if response['revised_prompt']:
+            if response['revised_prompt'] and send:
                 await ctx.send(f"**Revised prompt**: {response['revised_prompt']}")
             # reload the data for the increment since we are async
             data = load_data()
             if current_month not in data:
                 data[current_month] = 0
-            data[current_month] += 1
+            data[current_month] += _request_weight(kind, model, response.get('usage'))
+            if kind == output_format.GIF:
+                data['gifs'] = data.get('gifs', 0) + 1
+            if kind == output_format.SVG:
+                data['svgs'] = data.get('svgs', 0) + 1
             if request_type == "remix":
                 data['remixes'] = data.get('remixes', 0) + 1
             if request_type == "release_image":
@@ -1481,7 +1797,7 @@ async def do_the_art(ctx, prompt, request_type, model, images=None, size=None,
             if request_type == "daily_edit":
                 data['daily_edits'] = data.get('daily_edits', 0) + 1
             save_data(data)
-            if not quiet:
+            if not quiet and send:
                 await ctx.send(f"Generated in {format_duration(elapsed)} | Monthly requests: {data[current_month]}")
             return pipe_chain.ArtResult(sent, image_data, size, elapsed)
         except Exception as e:
@@ -1499,10 +1815,62 @@ def get_edit_model(model):
     return model if config.get("supports_edit") else DEFAULT_MODEL_FAMILY
 
 
+def media_model(model, kind):
+    """The model to use for `kind` output. PNG keeps `model`. GIF/SVG need the 2.6
+    family: a model without support swaps to the 2.6 alias at the same quality tier
+    (gpt-image-2.5-flare-low -> gpt-image-2.6-flare-low), or DEFAULT_MODEL_FAMILY
+    (dall-e-3, unknown aliases)."""
+    if kind == output_format.PNG:
+        return model
+    flag = "supports_gif" if kind == output_format.GIF else "supports_svg"
+    if MODEL_CONFIGS.get(model, {}).get(flag):
+        return model
+    quality = MODEL_CONFIGS.get(model, {}).get("params", {}).get("quality")
+    for alias, cfg in MODEL_CONFIGS.items():
+        if cfg.get(flag) and cfg["params"].get("quality") == quality:
+            return alias
+    return DEFAULT_MODEL_FAMILY
+
+
+GIF_PROMPT_SUFFIX = " Animate it as a short, seamless looping animation."
+SHEET_ERROR = "No supported sheet"
+
+
+def _output_params(output, size):
+    """Extra request fields for GIF/SVG output; {} for PNG."""
+    if output is None or output.kind == output_format.PNG:
+        return {}
+    if output.kind == output_format.GIF:
+        return {"output_format": "gif", "frame_count": output.frames, "frame_duration_ms": output.ms}
+    return {"output_format": "svg", "svg": {"model": SVG_MODEL, "reasoning": {"effort": "low"}}}
+
+
+def gif_request_size(output, size, src_wh=None):
+    """Map the still-image size the flags resolved to (or None/auto) onto a GIF frame
+    size that fits the sprite-sheet limits. The three preset sizes stand for their
+    orientation (so the default stays GIF_DEFAULT_EDGE); any other WxH is an exact
+    --res and is scaled down to fit."""
+    presets = {image_size.SQUARE: "square", image_size.LANDSCAPE: "landscape",
+               image_size.PORTRAIT: "portrait"}
+    if size in presets:
+        return output_format.gif_frame_size(output.frames, orientation=presets[size])
+    if size and size != image_size.AUTO:
+        try:
+            return output_format.gif_frame_size(output.frames, res_wh=image_size.parse_resolution(size))
+        except ValueError:
+            pass
+    return output_format.gif_frame_size(output.frames, src_wh=src_wh)
+
+
 async def _classify_image_error(response, prompt):
     """Shared by fetch_image and fetch_image_edit. Returns ('retry'|'safety'|'stop', error_message)."""
     error_json = await response.json()
     error_message = error_json.get("error", {}).get("message") or str(error_json)
+    if response.status == 400 and SHEET_ERROR in error_message:
+        # A GIF frame size the sprite sheet can't fit: not a safety trip. The caller
+        # retries once with size "auto".
+        logger.info(f"Request: {prompt} GIF sheet too big: {error_message}")
+        return 'sheet', error_message
     if response.status == 400:
         logger.info(f"Request: {prompt} Safety Violation.")
         data = load_data()
@@ -1519,7 +1887,7 @@ async def _classify_image_error(response, prompt):
         return 'stop', error_message
 
 
-async def fetch_image(prompt, model, size=None):
+async def fetch_image(prompt, model, size=None, output=None):
     """`size`, when given, overrides the model config's default generation size (see
     image_size.py -- used by &paint/&hpaint/&mpaint/&lpaint/&xpaint for
     --res/--landscape/--portrait/--square); None keeps today's behavior of always
@@ -1529,12 +1897,16 @@ async def fetch_image(prompt, model, size=None):
     params = dict(config["params"])
     if size is not None:
         params["size"] = size
+    kind = output.kind if output is not None else output_format.PNG
+    if kind == output_format.GIF:
+        prompt = prompt + GIF_PROMPT_SUFFIX
     payload = {
         "model": config["model"],
         "prompt": prompt,
         "n": 1,
         "user": "bot_ross",
         **params,
+        **_output_params(output, params.get("size")),
     }
     if config["supports_moderation"]:
         payload["moderation"] = IMAGE_MODERATION
@@ -1554,9 +1926,13 @@ async def fetch_image(prompt, model, size=None):
                     logger.info(f"Request: {prompt} Success")
                     item = data["data"][0]
                     revised = item.get("revised_prompt") if config["has_revised_prompt"] else None
-                    return {"image": item["b64_json"], "revised_prompt": revised}
+                    return {"image": item["b64_json"], "revised_prompt": revised, "format": kind,
+                            "usage": data.get("usage")}
                 verdict, error_message = await _classify_image_error(response, prompt)
-                if verdict == 'safety':
+                if verdict == 'sheet' and payload.get("size") != image_size.AUTO:
+                    payload["size"] = image_size.AUTO
+                    continue
+                if verdict in ('safety', 'sheet'):
                     break
                 if verdict == 'retry':
                     await asyncio.sleep(5)
@@ -1568,7 +1944,7 @@ def _image_extension(content_type):
     return (content_type or "image/png").split("/")[-1].split(";")[0] or "png"
 
 
-async def fetch_image_edit(prompt, model, images, size=None):
+async def fetch_image_edit(prompt, model, images, size=None, output=None):
     """images: list[(bytes, content_type)] of raw image content and its Discord-reported
     content type (e.g. from discord.Attachment.read()/.content_type).
     `size`, when given, overrides the model config's default edit size (see
@@ -1576,6 +1952,10 @@ async def fetch_image_edit(prompt, model, images, size=None):
     None keeps today's behavior of always sending the model config's configured size.
     Returns {"image": b64, "revised_prompt": None} — the edits endpoint has no revised_prompt."""
     config = MODEL_CONFIGS.get(model, MODEL_CONFIGS[DEFAULT_MODEL_FAMILY])
+    kind = output.kind if output is not None else output_format.PNG
+    if kind == output_format.GIF:
+        prompt = prompt + GIF_PROMPT_SUFFIX
+    sheet_auto = False
     async with aiohttp.ClientSession() as session:
         for _ in range(2):
             form = aiohttp.FormData()  # rebuilt every attempt: FormData is single-use
@@ -1584,8 +1964,12 @@ async def fetch_image_edit(prompt, model, images, size=None):
             form.add_field("n", "1")
             form.add_field("user", "bot_ross")
             size_value = size if size is not None else config["params"].get("size")
+            if sheet_auto:
+                size_value = image_size.AUTO
             if size_value:
                 form.add_field("size", size_value)
+            for key, value in _output_params(output, size_value).items():
+                form.add_field(key, str(value))
             quality = config["params"].get("quality")
             if quality:
                 form.add_field("quality", quality)
@@ -1605,9 +1989,13 @@ async def fetch_image_edit(prompt, model, images, size=None):
                     data = await response.json()
                     logger.info(f"Edit request: {prompt} Success (size={size_value})")
                     item = data["data"][0]
-                    return {"image": item["b64_json"], "revised_prompt": None}
+                    return {"image": item["b64_json"], "revised_prompt": None, "format": kind,
+                            "usage": data.get("usage")}
                 verdict, error_message = await _classify_image_error(response, prompt)
-                if verdict == 'safety':
+                if verdict == 'sheet' and not sheet_auto:
+                    sheet_auto = True
+                    continue
+                if verdict in ('safety', 'sheet'):
                     break
                 if verdict == 'retry':
                     await asyncio.sleep(5)
@@ -1638,6 +2026,54 @@ class _ChannelContext:
 
     async def send(self, *args, **kwargs):
         return await self.channel.send(*args, **kwargs)
+
+
+async def _secret_magic_loop():
+    """Once a minute, run the secret-magic job if it's due (see secret_magic.is_due)."""
+    logger.info(f"Secret magic: writes a mixin at {secret_magic.RUN_HOUR}:{secret_magic.RUN_MINUTE:02d} "
+                f"{BOT_ZONE} on days with at least {secret_magic.MIN_PROMPTS} prompts")
+    while not draining:
+        await asyncio.sleep(daily_schedule.seconds_to_next_minute(datetime.now(BOT_ZONE)))
+        if draining:
+            break
+        try:
+            await _run_secret_magic(datetime.now(timezone.utc))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Secret magic tick failed")
+
+
+async def _run_secret_magic(now, force=False):
+    """Write today's secret mixin if the job is due (or `force`) and the day had enough
+    prompts. The day is marked done BEFORE the chat call, so a crash or a failed call
+    can't make it run twice. Returns the new mixin text, or None."""
+    store = secret_magic.load_store(SECRET_MAGIC_FILE)
+    due, day = secret_magic.is_due(now, BOT_ZONE, store["last_run"])
+    if not (due or force):
+        return None
+    store["last_run"] = day.isoformat()
+    secret_magic.save_store(store, SECRET_MAGIC_FILE)
+
+    prompts = secret_magic.prompts_for(secret_magic.load_log(PROMPT_LOG_FILE), day)
+    if len(prompts) < secret_magic.MIN_PROMPTS:
+        logger.info(f"Secret magic: only {len(prompts)} prompt(s) on {day}; skipping tonight")
+        return None
+    examples = [e.get("text", "") for e in _load_magic_library() if e.get("text")]
+    model = SECRET_MAGIC_MODEL or MEME_MODEL
+    data = await _fetch_meme_prompt({"model": model, "messages": secret_magic.build_messages(prompts, examples)})
+    try:
+        text = secret_magic.clean_mixin(data["choices"][0]["message"]["content"])
+    except (KeyError, IndexError, TypeError):
+        text = None
+    if not text:
+        logger.warning(f"Secret magic: unusable reply from {model}: {data!r}"[:500])
+        return None
+    store = secret_magic.add_secret(secret_magic.load_store(SECRET_MAGIC_FILE), text,
+                                    now.astimezone(BOT_ZONE).isoformat(timespec="seconds"), len(prompts))
+    secret_magic.save_store(store, SECRET_MAGIC_FILE)
+    logger.info(f"Secret magic: new mixin from {len(prompts)} prompts: {text}")
+    return text
 
 
 def _log_daily_task_result(task):
@@ -1807,6 +2243,24 @@ def _save_daily_image(path, image_bytes):
         logger.error(f"Daily scheduler: failed to save/prune retained image at {path}: {e}")
 
 
+DAILY_GIF_PROMPT = "bring this image to life as a short looping animation, keeping its style and subject"
+
+
+async def _animate_daily(ctx, result, day):
+    """GIF day: animate the (unposted) morning still and post only the GIF. If the
+    animation fails, post the still instead so the day still gets its image. One
+    attempt, no 2-minute retry delay. Returns True if the GIF was posted."""
+    gif = await do_the_art(
+        ctx, DAILY_GIF_PROMPT, "daily_gif", IMAGE_MODEL, quiet=True,
+        images=[(result.image_bytes, "image/png")], output=output_format.OutputFlags(kind=output_format.GIF),
+    )
+    if gif:
+        return True
+    logger.warning("Daily image: the animated version failed; posting the still instead")
+    await ctx.send(file=discord.File(io.BytesIO(result.image_bytes), daily_schedule.daily_image_filename(day)))
+    return False
+
+
 async def _run_daily_slot(channel, entry, day):
     """Run one due schedule slot: "generate" posts the day's deterministic base image
     (announcing it, with an optional magic roll); "edit" edits today's retained base
@@ -1832,11 +2286,17 @@ async def _run_daily_slot(channel, entry, day):
             _bump_magic_counter()
         await ctx.send(message)
 
-        result = await _do_the_art_with_retry(ctx, prompt, "daily_image", IMAGE_MODEL)
+        # On a GIF day only the GIF is posted. The still is still made first, quietly:
+        # it's what the GIF animates and what the day's edit slots work from (the edit
+        # endpoint won't take a GIF).
+        gif_day = random.random() < DAILY_GIF_RATE
+        result = await _do_the_art_with_retry(ctx, prompt, "daily_image", IMAGE_MODEL, send=not gif_day)
         if not result:
             await ctx.send(FAILURE_MESSAGE)
             return
         _save_daily_image(base_path, result.image_bytes)
+        if gif_day:
+            await _animate_daily(ctx, result, day)
         return
 
     # entry["type"] == "edit": read today's retained base, recovering it first (no
@@ -2245,6 +2705,29 @@ def generate_file_name(prompt):
     return f"{file_name}_{random_string}.png"
 
 
+@bot.command(name='version', help="Show which build of Bot Ross is running.")
+async def version_cmd(ctx):
+    await ctx.send(release.version_message(release.current(), release.commit()))
+
+
+@bot.command(name='changelog', help="What changed in this build, or in an earlier one: &changelog [build]")
+async def changelog_cmd(ctx, build=None):
+    builds = [r.build for r in release.releases()]
+    if build is None:
+        r = release.current()
+        await send_long(ctx, release.changelog_message(r, release.commit(), builds))
+        return
+    try:
+        r = release.find(int(build.lstrip('#')))
+    except ValueError:
+        r = None
+    if r is None:
+        await ctx.send(release.unknown_build(build, builds))
+        return
+    commit_hash = release.commit() if r is release.current() else r.commit
+    await send_long(ctx, release.changelog_message(r, commit_hash, builds))
+
+
 @bot.command(name='stats', help='Check monthly stats. (limit, requests)')
 async def stats(ctx):
     current_month = get_current_month()
@@ -2281,6 +2764,10 @@ async def stats(ctx):
     macro_misses_part = f"Macros not found: {data.get('macro_misses', 0)}"
     pipes_part = f"Pipe chains: {data.get('pipes', 0)}"
     pipe_segments_part = f"Pipe segments: {data.get('pipe_segments', 0)}"
+    gifs_part = f"GIFs: {data.get('gifs', 0)}"
+    svgs_part = f"SVGs: {data.get('svgs', 0)}"
+    daily_gif_part = f"Daily GIF rate: {format_magic_rate(DAILY_GIF_RATE)}"
+    secret_part = f"Secret mixins written: {secret_magic.load_store(SECRET_MAGIC_FILE)['generated']}"
     last_change_part = f"Last rate change: {last_change}"
 
     # Combine the parts into the final message
@@ -2300,6 +2787,10 @@ async def stats(ctx):
         f"{macro_misses_part}\n"
         f"{pipes_part}\n"
         f"{pipe_segments_part}\n"
+        f"{gifs_part}\n"
+        f"{svgs_part}\n"
+        f"{daily_gif_part}\n"
+        f"{secret_part}\n"
         f"{last_change_part}"
     )
 

@@ -1,0 +1,2 @@
+# `git archive` (used by home-docks-infra's build-ship.sh) writes the commit hash into this file.
+_commit.txt export-subst

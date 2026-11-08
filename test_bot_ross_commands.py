@@ -11,8 +11,9 @@ which proves that contract directly).
 
 Three hard rules the whole harness is built around:
 
-  1. All SIX data/ path globals (DATA_FILE, MAGIC_PROMPTS_FILE, MACROS_FILE,
-     DAILY_SCHEDULE_FILE, DAILY_STATE_FILE, DAILY_IMAGES_DIR) are patched into a
+  1. All EIGHT data/ path globals (DATA_FILE, MAGIC_PROMPTS_FILE, MACROS_FILE,
+     DAILY_SCHEDULE_FILE, DAILY_STATE_FILE, DAILY_IMAGES_DIR, PROMPT_LOG_FILE,
+     SECRET_MAGIC_FILE) are patched into a
      tmpdir UNCONDITIONALLY by BotTestCase.setUp, every time, for every test class
      below. Missing even one would let a test write into the developer's real
      data/ directory -- gitignored, so the corruption would be invisible in
@@ -43,7 +44,7 @@ import sys
 import tempfile
 import types
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import NamedTuple
 from unittest import mock
 
@@ -55,7 +56,9 @@ import image_size
 import macros
 import magic_paint
 import pipe_chain
+import release
 import release_image
+import secret_magic
 
 # --- Sentinels ------------------------------------------------------------------
 
@@ -189,7 +192,15 @@ class FakeChannel:
     def __init__(self):
         self.sent = []
 
-    async def send(self, content=None, *, file=None, reference=None, **kwargs):
+    async def send(self, content=None, *, file=None, files=None, reference=None, **kwargs):
+        if files:
+            # One Discord message carrying several attachments (the SVG preview + .svg):
+            # record each as its own entry so tests can inspect every file, sharing content.
+            last = None
+            for f in files:
+                last = await self.send(content, file=f, reference=reference)
+                content = None
+            return last
         record = SentMessage(
             content,
             file,
@@ -298,17 +309,30 @@ class FakeImageAPI:
     def call_count(self):
         return len(self.calls)
 
-    async def fetch_image(self, prompt, model, size=None):
-        self.calls.append(types.SimpleNamespace(kind="generate", prompt=prompt, model=model, size=size, images=None))
-        if len(self.calls) in self.fail_on:
-            raise self.exception
-        return {"image": base64.b64encode(self.png_bytes).decode(), "revised_prompt": self.revised_prompt}
+    # What a GIF/SVG request returns: not real media, just recognizable bytes.
+    GIF_BYTES = b"GIF89a-fake"
+    SVG_BYTES = b'<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect width="16" height="16"/></svg>'
 
-    async def fetch_image_edit(self, prompt, model, images, size=None):
-        self.calls.append(types.SimpleNamespace(kind="edit", prompt=prompt, model=model, size=size, images=list(images)))
+    def _media(self, output):
+        kind = getattr(output, "kind", "png")
+        data = {"gif": self.GIF_BYTES, "svg": self.SVG_BYTES}.get(kind, self.png_bytes)
+        return kind, base64.b64encode(data).decode()
+
+    async def fetch_image(self, prompt, model, size=None, output=None):
+        self.calls.append(types.SimpleNamespace(kind="generate", prompt=prompt, model=model, size=size, images=None,
+                                                output=output))
         if len(self.calls) in self.fail_on:
             raise self.exception
-        return {"image": base64.b64encode(self.png_bytes).decode(), "revised_prompt": None}
+        kind, b64 = self._media(output)
+        return {"image": b64, "revised_prompt": self.revised_prompt, "format": kind, "usage": None}
+
+    async def fetch_image_edit(self, prompt, model, images, size=None, output=None):
+        self.calls.append(types.SimpleNamespace(kind="edit", prompt=prompt, model=model, size=size, images=list(images),
+                                                output=output))
+        if len(self.calls) in self.fail_on:
+            raise self.exception
+        kind, b64 = self._media(output)
+        return {"image": b64, "revised_prompt": None, "format": kind, "usage": None}
 
 
 # --- BotTestCase ------------------------------------------------------------------
@@ -324,7 +348,8 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
         state_file = os.path.join(self.tmp, "daily_state.json")
         images_dir = os.path.join(self.tmp, "daily_images")
 
-        # Rule 1 (see module docstring): all SIX data/ path globals, unconditionally.
+        # Rule 1 (see module docstring): all EIGHT data/ path globals, unconditionally (the
+        # prompt log and secret store are patched just below, with the other new state).
         self.enterContext(mock.patch.object(bot_ross, "DATA_FILE", data_file))
         self.enterContext(mock.patch.object(bot_ross, "MAGIC_PROMPTS_FILE", magic_file))
         self.enterContext(mock.patch.object(bot_ross, "MACROS_FILE", macros_file))
@@ -343,6 +368,12 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
         self.enterContext(mock.patch.object(bot_ross, "draining", False))
         self.enterContext(mock.patch.object(bot_ross, "_signals_installed", False))
         self.enterContext(mock.patch.object(bot_ross, "_daily_task", None))
+        self.enterContext(mock.patch.object(bot_ross, "_greeted", False))
+        self.enterContext(mock.patch.object(bot_ross, "_secret_task", None))
+        self.enterContext(mock.patch.object(bot_ross, "PROMPT_LOG_FILE", os.path.join(self.tmp, "prompt_log.json")))
+        self.enterContext(mock.patch.object(bot_ross, "SECRET_MAGIC_FILE", os.path.join(self.tmp, "secret_magic.json")))
+        # Never animate a daily image unless a test asks for it.
+        self.enterContext(mock.patch.object(bot_ross, "DAILY_GIF_RATE", 0.0))
         self.enterContext(mock.patch.object(bot_ross, "_last_schedule_errors", []))
 
         # Determinism: pin the rate rather than seed random. random.random() < 0.0
@@ -469,7 +500,7 @@ class ImportSafetyTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             mod = _fresh_import(tmp)
             self.assertEqual(mod.LIMIT, 100)
-            self.assertEqual(mod.IMAGE_MODEL, "gpt-image-2.5-flare-low")
+            self.assertEqual(mod.IMAGE_MODEL, "gpt-image-2.6-flare-low")
             self.assertEqual(mod.MAGIC_PAINT_RATE, 0.05)
             self.assertEqual(mod.DRAIN_TIMEOUT, 300.0)
             self.assertIs(mod.DAILY_IMAGE_ENABLED, True)
@@ -1531,6 +1562,300 @@ class StatsCommandTest(BotTestCase):
         self.assertIn("Monthly requests: 3", text)
         self.assertIn("Pipe chains: 2", text)
         self.assertIn("Pipe segments: 5", text)
+
+
+# =========================================================================== #
+# R. &version / &changelog / startup greeting
+# =========================================================================== #
+
+class ReleaseCommandsTest(BotTestCase):
+    def setUp(self):
+        super().setUp()
+        self.enterContext(mock.patch.object(release, "commit", lambda: "abc1234"))
+
+    async def test_version_names_the_current_build_and_commit(self):
+        ctx = self.make_ctx()
+        await cmd("version")(ctx)
+        text = ctx.channel.texts[0]
+        self.assertIn(f"**Build {release.current().build}**", text)
+        self.assertIn("`abc1234`", text)
+
+    async def test_changelog_defaults_to_the_current_build(self):
+        ctx = self.make_ctx()
+        await cmd("changelog")(ctx)
+        text = "\n".join(ctx.channel.texts)
+        self.assertIn(f"**Build {release.current().build}**", text)
+        self.assertIn("•", text)
+
+    async def test_changelog_for_an_earlier_build_uses_its_own_hash(self):
+        ctx = self.make_ctx()
+        await cmd("changelog")(ctx, "1")
+        text = "\n".join(ctx.channel.texts)
+        self.assertIn("**Build 1**", text)
+        self.assertIn(f"`{release.find(1).commit}`", text)
+
+    async def test_unknown_build(self):
+        ctx = self.make_ctx()
+        await cmd("changelog")(ctx, "nope")
+        self.assertTrue(ctx.channel.texts[0].startswith("No record of build nope."))
+
+    async def test_greeting_goes_to_the_configured_channel_once(self):
+        channel = FakeChannel()
+        self.enterContext(mock.patch.object(bot_ross, "DISCORD_CHANNEL_ID", 42))
+        self.enterContext(mock.patch.object(bot_ross.bot, "get_channel", lambda cid: channel if cid == 42 else None))
+        await bot_ross._send_greeting()
+        self.assertEqual(len(channel.texts), 1)
+        self.assertTrue(channel.texts[0].startswith("A wild Bot Ross appears!"))
+        self.assertIn("&changelog", channel.texts[0])
+
+    async def test_greeting_failure_never_raises(self):
+        class Broken:
+            async def send(self, *a, **k):
+                raise RuntimeError("no perms")
+        self.enterContext(mock.patch.object(bot_ross, "DISCORD_CHANNEL_ID", 42))
+        self.enterContext(mock.patch.object(bot_ross.bot, "get_channel", lambda cid: Broken()))
+        await bot_ross._send_greeting()  # logs, doesn't raise
+
+    async def test_no_channel_configured_skips_the_greeting(self):
+        self.enterContext(mock.patch.object(bot_ross, "DISCORD_CHANNEL_ID", None))
+        getter = mock.Mock()
+        self.enterContext(mock.patch.object(bot_ross.bot, "get_channel", getter))
+        await bot_ross._send_greeting()
+        getter.assert_not_called()
+
+
+# =========================================================================== #
+# S. --gif / --svg / &animate / --boring
+# =========================================================================== #
+
+class OutputFlagsCommandTest(BotTestCase):
+    async def test_paint_gif_uses_a_2_6_model_and_a_gif_frame_size(self):
+        self.enterContext(mock.patch.object(bot_ross, "IMAGE_MODEL", "gpt-image-2.5-flare-low"))
+        ctx = self.make_ctx()
+        await cmd("paint")(ctx, prompt="a fox --gif --frames 4")
+        call = self.api.generate_calls[0]
+        self.assertEqual(call.prompt, "a fox")
+        self.assertEqual(call.model, "gpt-image-2.6-flare-low")
+        self.assertEqual(call.size, "768x768")
+        self.assertEqual((call.output.kind, call.output.frames), ("gif", 4))
+        self.assertTrue(ctx.channel.files[0].filename.endswith(".gif"))
+        self.assertEqual(ctx.channel.files[0].file_bytes, FakeImageAPI.GIF_BYTES)
+        data = self.read_data()
+        self.assertEqual(data.get("gifs"), 1)
+        self.assertEqual(data.get(bot_ross.get_current_month()), bot_ross.GIF_REQUEST_WEIGHT)
+
+    async def test_landscape_gif_frames_are_landscape(self):
+        ctx = self.make_ctx()
+        await cmd("paint")(ctx, prompt="a fox --gif --landscape")
+        w, h = map(int, self.api.generate_calls[0].size.split("x"))
+        self.assertGreater(w, h)
+
+    async def test_svg_sends_a_png_preview_and_the_svg(self):
+        ctx = self.make_ctx()
+        await cmd("paint")(ctx, prompt="a lighthouse --svg")
+        names = [f.filename for f in ctx.channel.files]
+        self.assertEqual(len(names), 2)
+        self.assertTrue(names[0].endswith(".png") and names[1].endswith(".svg"))
+        self.assertEqual(ctx.channel.files[1].file_bytes, FakeImageAPI.SVG_BYTES)
+        self.assertTrue(ctx.channel.files[0].file_bytes.startswith(b"\x89PNG"))
+        self.assertEqual(self.read_data().get("svgs"), 1)
+
+    async def test_gif_mid_chain_is_refused_before_spending(self):
+        ctx = self.make_ctx()
+        await cmd("paint")(ctx, prompt="a fox --gif | make it winter")
+        self.assertEqual(self.api.call_count, 0)
+        self.assertIn("last step", ctx.channel.texts[0])
+
+    async def test_gif_on_the_last_step_animates_the_previous_still(self):
+        ctx = self.make_ctx()
+        await cmd("paint")(ctx, prompt="a fox | --gif")
+        self.assertEqual([c.kind for c in self.api.calls], ["generate", "edit"])
+        self.assertIsNone(self.api.generate_calls[0].output)
+        edit = self.api.edit_calls[0]
+        self.assertEqual(edit.output.kind, "gif")
+        self.assertEqual(edit.prompt, "bring this image to life as a short looping animation")
+
+    async def test_svg_rules(self):
+        for command, prompt in (("paint", "a | b --svg"), ("remix", "x --svg"), ("dpaint", "x --svg")):
+            ctx = self.make_ctx()
+            await cmd(command)(ctx, prompt=prompt)
+            with self.subTest(command=command, prompt=prompt):
+                self.assertEqual(self.api.call_count, 0)
+                self.assertIn("svg", ctx.channel.texts[0].lower())
+
+    async def test_bad_flag_value_is_explained(self):
+        ctx = self.make_ctx()
+        await cmd("paint")(ctx, prompt="a fox --frames 40")
+        self.assertEqual(self.api.call_count, 0)
+        self.assertIn("2 to 16", ctx.channel.texts[0])
+
+    async def test_animate_an_attachment(self):
+        att = FakeAttachment(1536, 1024, data=_make_png(1536, 1024))
+        ctx = self.make_ctx(attachments=[att])
+        await cmd("animate")(ctx)
+        edit = self.api.edit_calls[0]
+        self.assertEqual(edit.output.kind, "gif")
+        w, h = map(int, edit.size.split("x"))
+        self.assertGreater(w, h)  # follows the attachment's shape
+        self.assertTrue(ctx.channel.files[0].filename.endswith(".gif"))
+
+    async def test_animate_with_no_image_paints_a_gif(self):
+        ctx = self.make_ctx()
+        await cmd("animate")(ctx, prompt="a dancing teapot")
+        call = self.api.generate_calls[0]
+        self.assertEqual(call.output.kind, "gif")
+        self.assertEqual(call.prompt, "a dancing teapot")
+
+    async def test_animate_rejects_svg(self):
+        ctx = self.make_ctx()
+        await cmd("animate")(ctx, prompt="a teapot --svg")
+        self.assertEqual(self.api.call_count, 0)
+
+    async def test_boring_beats_always_magic_and_the_rate(self):
+        self.enterContext(mock.patch.object(bot_ross, "MAGIC_PAINT_RATE", 1.0))
+        for command in ("paint", "xpaint"):
+            ctx = self.make_ctx()
+            await cmd(command)(ctx, prompt="a fox --boring | add a hat")
+            with self.subTest(command=command):
+                for call in self.api.calls:
+                    self.assertNotIn(MAGIC_TEXT, call.prompt)
+                self.assertNotIn("magic", self.read_data())
+            self.api.calls.clear()
+
+    async def test_without_boring_magic_still_rolls(self):
+        self.enterContext(mock.patch.object(bot_ross, "MAGIC_PAINT_RATE", 1.0))
+        ctx = self.make_ctx()
+        await cmd("paint")(ctx, prompt="a fox")
+        self.assertIn(MAGIC_TEXT, self.api.generate_calls[0].prompt)
+
+    async def test_stats_shows_the_new_counters(self):
+        with open(bot_ross.DATA_FILE, "w") as f:
+            json.dump({"gifs": 3, "svgs": 2}, f)
+        ctx = self.make_ctx()
+        await cmd("stats")(ctx)
+        text = ctx.channel.texts[0]
+        for line in ("GIFs: 3", "SVGs: 2", "Daily GIF rate:", "Secret mixins written: 0"):
+            self.assertIn(line, text)
+
+
+class MediaModelTest(unittest.TestCase):
+    def test_swaps_to_the_same_tier(self):
+        self.assertEqual(bot_ross.media_model("gpt-image-2.5-flare-low", "gif"), "gpt-image-2.6-flare-low")
+        self.assertEqual(bot_ross.media_model("gpt-image-2-medium", "svg"), "gpt-image-2.6-flare-medium")
+        self.assertEqual(bot_ross.media_model("dall-e-3", "gif"), bot_ross.DEFAULT_MODEL_FAMILY)
+        self.assertEqual(bot_ross.media_model("gpt-image-2.6-flare-max", "gif"), "gpt-image-2.6-flare-max")
+        self.assertEqual(bot_ross.media_model("dall-e-3", "png"), "dall-e-3")
+
+    def test_request_weight(self):
+        self.assertEqual(bot_ross._request_weight("png", "gpt-image-2.6-flare-low", None), 1)
+        self.assertEqual(bot_ross._request_weight("gif", "gpt-image-2.6-flare-low", {"output_tokens": 2777}), 3)
+        self.assertEqual(bot_ross._request_weight("gif", "gpt-image-2.6-flare-low", {"output_tokens": 100}), 1)
+        self.assertEqual(bot_ross._request_weight("gif", "gpt-image-2.6-flare-low", None), bot_ross.GIF_REQUEST_WEIGHT)
+
+
+# =========================================================================== #
+# T. Animated daily image
+# =========================================================================== #
+
+class DailyGifTest(BotTestCase):
+    DAY = date(2026, 3, 3)
+    ENTRY = {"id": "morning", "time": "07:00", "type": "generate", "message": "Daily for {date}"}
+
+    async def test_a_gif_day_posts_only_the_gif_and_keeps_the_still(self):
+        self.enterContext(mock.patch.object(bot_ross, "DAILY_GIF_RATE", 1.0))
+        channel = FakeChannel()
+        await bot_ross._run_daily_slot(channel, self.ENTRY, self.DAY)
+        self.assertEqual([c.kind for c in self.api.calls], ["generate", "edit"])
+        self.assertEqual(self.api.edit_calls[0].output.kind, "gif")
+        self.assertEqual(self.api.edit_calls[0].images, [(self.api.png_bytes, "image/png")])
+        self.assertEqual([f.filename.rsplit(".", 1)[1] for f in channel.files], ["gif"])
+        self.assertEqual(channel.texts, [daily_schedule.render_message(self.ENTRY["message"], self.DAY)])
+        with open(bot_ross._daily_image_path(self.DAY), "rb") as f:
+            self.assertEqual(f.read(), self.api.png_bytes)  # edits later today work off the still
+        data = self.read_data()
+        self.assertEqual((data.get("daily_images"), data.get("gifs")), (1, 1))
+
+    async def test_a_failed_gif_posts_the_still_instead(self):
+        self.enterContext(mock.patch.object(bot_ross, "DAILY_GIF_RATE", 1.0))
+        self.api.fail_on = {2}
+        channel = FakeChannel()
+        await bot_ross._run_daily_slot(channel, self.ENTRY, self.DAY)
+        self.assertEqual([f.filename for f in channel.files], [daily_schedule.daily_image_filename(self.DAY)])
+        self.assertEqual(channel.files[0].file_bytes, self.api.png_bytes)
+
+    async def test_a_miss_posts_only_the_still(self):
+        channel = FakeChannel()
+        await bot_ross._run_daily_slot(channel, self.ENTRY, self.DAY)
+        self.assertEqual([c.kind for c in self.api.calls], ["generate"])
+        self.assertEqual([f.filename.rsplit(".", 1)[1] for f in channel.files], ["png"])
+
+    async def test_daily_gif_rate_command(self):
+        ctx = self.make_ctx()
+        await cmd("daily_gif_rate")(ctx, "35%")
+        self.assertEqual(bot_ross.DAILY_GIF_RATE, 0.35)
+        self.assertEqual(self.read_data()["daily_gif_rate_history"][-1]["user"], "tester")
+        await cmd("daily_gif_rate")(ctx)
+        self.assertIn("35", ctx.channel.texts[-1])
+
+
+# =========================================================================== #
+# U. Secret magic
+# =========================================================================== #
+
+class SecretMagicTest(BotTestCase):
+    async def test_prompts_are_logged_post_macro_pre_magic(self):
+        self.enterContext(mock.patch.object(bot_ross, "MAGIC_PAINT_RATE", 1.0))
+        ctx = self.make_ctx()
+        ctx.command = types.SimpleNamespace(name="paint")  # discord.py sets this on a real Context
+        await cmd("paint")(ctx, prompt="a fox in a hat --landscape")
+        log = secret_magic.load_log(bot_ross.PROMPT_LOG_FILE)
+        self.assertEqual([e["prompt"] for e in log], ["a fox in a hat"])
+        self.assertEqual((log[0]["user"], log[0]["command"]), ("tester", "paint"))
+
+    async def _run(self, n_prompts, reply="  In the background, a goose files taxes.  "):
+        now = datetime(2026, 11, 7, 23, 30, tzinfo=bot_ross.BOT_ZONE).astimezone(timezone.utc)
+        day = now.astimezone(bot_ross.BOT_ZONE).date()
+        for k in range(n_prompts):
+            secret_magic.append_prompt(bot_ross.PROMPT_LOG_FILE, day, "x", "u", "paint", f"prompt {k}")
+        fake = mock.AsyncMock(return_value={"choices": [{"message": {"content": reply}}]})
+        self.enterContext(mock.patch.object(bot_ross, "_fetch_meme_prompt", fake))
+        return await bot_ross._run_secret_magic(now), fake
+
+    async def test_writes_a_mixin_on_a_busy_day_and_it_joins_the_magic_pool(self):
+        text, fake = await self._run(5)
+        self.assertEqual(text, "In the background, a goose files taxes.")
+        payload = fake.await_args.args[0]
+        self.assertEqual(payload["model"], bot_ross.MEME_MODEL)
+        self.assertIn("prompt 4", payload["messages"][1]["content"])
+        self.assertIn(MAGIC_TEXT, payload["messages"][1]["content"])  # human mixins as examples
+        pool = [e["text"] for e in bot_ross._magic_pool()]
+        self.assertIn(text, pool)
+        self.assertIn(MAGIC_TEXT, pool)
+        ctx = self.make_ctx()
+        await cmd("secret_magic")(ctx)
+        self.assertIn(text, ctx.channel.texts[0])
+
+    async def test_quiet_day_writes_nothing_but_counts_as_run(self):
+        text, fake = await self._run(4)
+        self.assertIsNone(text)
+        fake.assert_not_awaited()
+        self.assertEqual(secret_magic.load_store(bot_ross.SECRET_MAGIC_FILE)["last_run"], "2026-11-07")
+
+    async def test_runs_once_a_day(self):
+        await self._run(5)
+        again = await bot_ross._run_secret_magic(
+            datetime(2026, 11, 7, 23, 35, tzinfo=bot_ross.BOT_ZONE).astimezone(timezone.utc))
+        self.assertIsNone(again)
+
+    async def test_unusable_reply_writes_nothing(self):
+        text, _ = await self._run(5, reply="")
+        self.assertIsNone(text)
+        self.assertEqual(secret_magic.load_store(bot_ross.SECRET_MAGIC_FILE)["slots"], [])
+
+    async def test_empty_secret_list(self):
+        ctx = self.make_ctx()
+        await cmd("secret_magic")(ctx)
+        self.assertIn("No secret magic yet", ctx.channel.texts[0])
 
 
 if __name__ == "__main__":

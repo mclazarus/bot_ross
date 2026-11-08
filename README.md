@@ -6,7 +6,7 @@ Bot Ross is a Discord bot that generates images using OpenAI's image models. Cha
 
 | Command | Description |
 |---|---|
-| `&paint <prompt>` | Generate an image with gpt-image-2.5-flare (or `IMAGE_MODEL`). Flags: `--landscape`/`--portrait`/`--square`, `--res WxH` (coerced to the nearest valid generation size). Chain follow-up edits with `\|` (up to 5 steps) |
+| `&paint <prompt>` | Generate an image with gpt-image-2.6-flare (or `IMAGE_MODEL`). Flags: `--landscape`/`--portrait`/`--square`, `--res WxH` (coerced to the nearest valid generation size). Chain follow-up edits with `\|` (up to 5 steps) |
 | `&dpaint <prompt>` | Generate an image with DALL-E 3. Chain follow-up edits with `\|` (up to 5 steps) |
 | `&meme [idea]` | GPT generates a meme prompt, then paints it |
 | `&remix [prompt]` | Remix attached image(s), the image in a message you reply to, and/or images from Discord message links pasted in the prompt (same server only) — or paint a prompt if none is found. Output size matches the first image's own dimensions as closely as possible by default; override with `--landscape`/`--portrait`/`--square`/`--res WxH` (coerced to a valid size, same as `&paint`). Chain follow-up edits with `\|` (up to 5 steps) |
@@ -16,6 +16,8 @@ Bot Ross is a Discord bot that generates images using OpenAI's image models. Cha
 | `&magic_add <text>` | Add a magic mixin appended to prompts when magic fires |
 | `&magic_update <id> <text>` | Update a magic mixin's text in place, recording you as editor |
 | `&magic_remove <id>` | Remove a magic mixin by id |
+| `&animate [prompt]` | Make a GIF: animates attached image(s), a replied-to image or a linked image, or paints an animation from just a prompt. `--frames N` (2–16, default 9), `--ms N` per frame (default 200), size flags, `--boring`. In a `\|` chain the last step is the animated one |
+| `&daily_gif_rate [value]` | Show or set the chance the morning daily image is posted as a GIF instead of a still (`20`, `.2`, `20%`) |
 | `&magic_rate [value]` | Show the current magic rate, or set it (`10`, `.1`, `10%`, `.1%`) |
 | `&macro_list` | List the ;macro ids (id, truncated text, author) |
 | `&macro_show <id>` | Show the full text of a ;macro |
@@ -31,6 +33,18 @@ Bot Ross is a Discord bot that generates images using OpenAI's image models. Cha
 | `&daily_image` | Post today's image of the day on demand — paints it if the scheduler missed the morning slot, or reposts the retained image (no monthly request spent) if it already exists |
 | `&stats` | Show uptime, monthly request count, limit, and magic/remix/release-image/daily-image/macro/pipe activity |
 | `&ping` | Check bot latency |
+| `&version` | Which build is running, and its commit |
+| `&changelog [build]` | What changed in this build, or an earlier one |
+
+## GIFs, SVGs and `--boring`
+
+`&paint` and its quality variants, `&xpaint`, `&remix`, `&release_image` and `&animate` take:
+
+- `--gif` — an animated GIF instead of a still (`--frames N` 2–16, default 9; `--ms N` per frame, 20–2000, default 200; either one implies `--gif`). Frames default to 768×768 (720 above 9 frames); size flags still pick the shape. In a `|` chain only the **last** step can be a GIF, since OpenAI won't take a GIF as the input to an edit: `&paint a fox in snow | --gif` paints a still, then animates it. GIFs need the gpt-image-2.6 models, so a GIF request switches to 2.6 at the same quality if `IMAGE_MODEL` is something else.
+- `--svg` — a vector image (paint commands only, single step, no `|`). Discord can't preview SVGs, so Bot Ross posts a PNG preview alongside the `.svg` file.
+- `--boring` — no magic mixins for the whole command, every `|` step included (even `&xpaint`).
+
+A GIF costs more than a still, so it counts against `API_LIMIT` by how much it actually cost compared with a still at the same quality (about 2–3 requests for the default size).
 
 ## Daily image of the day
 
@@ -212,11 +226,15 @@ All options are set via environment variables (see `env.example`).
 | `OPENAI_API_KEY` | required | OpenAI API key |
 | `DISCORD_BOT_TOKEN` | required | Discord bot token |
 | `API_LIMIT` | `100` | Max image generations per calendar month. Note: the shipped daily-image schedule alone fires 4 slots/day (1 generate + 3 edits) — 4 × ~30 days ≈ 120/month, more on a base-image recovery or retry — which exceeds this default by itself, so enabling `DAILY_IMAGE_CHANNEL_ID` below means raising this accordingly |
-| `IMAGE_MODEL` | `gpt-image-2.5-flare-low` | Image model for `&paint` and `&meme`; also accepts `gpt-image-2.5-flare` (high), `gpt-image-2.5-flare-xhigh`, `gpt-image-2.5-flare-max`, `gpt-image-2.5-flare-medium`, `gpt-image-2`, `gpt-image-2-medium`, `gpt-image-2-low`, `dall-e-3` |
+| `IMAGE_MODEL` | `gpt-image-2.6-flare-low` | Image model for `&paint` and `&meme`; also accepts `gpt-image-2.6-flare` (high), `gpt-image-2.6-flare-xhigh`, `gpt-image-2.6-flare-max`, `gpt-image-2.6-flare-medium`, the `gpt-image-2.5-flare` family (same five suffixes), `gpt-image-2`, `gpt-image-2-medium`, `gpt-image-2-low`, `dall-e-3` |
 | `IMAGE_MODERATION` | `low` | Content moderation level (`low` or `auto`, gpt-image-2 family only) |
-| `MEME_MODEL` | `gpt-5.4-mini` | GPT model used to generate meme prompts |
+| `MEME_MODEL` | `gpt-6-sol` | GPT model used to generate meme prompts, and the nightly secret mixin unless `SECRET_MAGIC_MODEL` is set |
 | `MAGIC_PAINT_RATE` | `0.05` | Chance (0.0-1.0) that `&paint`/`&remix` silently appends a background gag to the prompt |
+| `DAILY_GIF_RATE` | `0.20` | Starting chance (0.0-1.0) that the morning daily image is posted as an animated GIF instead of a still. Read once at startup; the live rate is controlled via `&daily_gif_rate` (change history persisted, the rate itself resets on restart like `MAGIC_PAINT_RATE`) |
+| `SECRET_MAGIC_MODEL` | unset (`MEME_MODEL`) | Chat model that writes the nightly secret magic mixin |
+| `SVG_MODEL` | `gpt-6-sol` | Text model OpenAI uses to write `--svg` output from the image model's reference picture. Chosen from six compared on 2026-11-07: best-looking and fastest (~41s), ~$0.05 of text per SVG; `gpt-6-luna` is close behind at ~$0.003 |
 | `DRAIN_TIMEOUT` | `300` | Seconds to let in-flight image generations (including a whole in-progress `\|` pipe chain) finish on shutdown before the bot closes |
 | `BOT_TIMEZONE` | `America/New_York` | IANA timezone the daily-image schedule's slot times are wall-clock in. An unknown zone falls back to UTC with a logged warning |
 | `DAILY_IMAGE_CHANNEL_ID` | unset | Discord channel id the daily image/edits post to. Unset disables the scheduler. Setting this adds ~120 generations/month against `API_LIMIT` (see above) — raise it accordingly |
+| `DISCORD_CHANNEL_ID` | unset | Discord channel id for the startup greeting ("A wild Bot Ross appears!" with the build number, sent once per start). Unset skips it |
 | `DAILY_IMAGE_ENABLED` | `true` | Set `false` to disable the daily-image scheduler outright, even with a channel id configured |
