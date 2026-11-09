@@ -4,7 +4,7 @@ Newest first. Every release gets a `## Build N · YYYY-MM-DD` entry, numbered on
 The release's commit is stamped into the image when it's built. Once a build has shipped, its
 heading gets the short commit hash: `## Build N · YYYY-MM-DD · abc1234`.
 
-## Build 15 · 2026-11-09
+## Build 15 · 2026-11-09 · fa97a1f
 - `--svg` works with `&remix` and on the last step of a `|` chain, so `&remix make it
   winter --svg` or `&paint a fox | --svg` turns a picture into a vector drawing.
 
