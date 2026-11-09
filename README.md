@@ -41,7 +41,7 @@ Bot Ross is a Discord bot that generates images using OpenAI's image models. Cha
 `&paint` and its quality variants, `&xpaint`, `&remix`, `&release_image` and `&animate` take:
 
 - `--gif` — an animated GIF instead of a still (`--frames N` 2–16, default 9; `--ms N` per frame, 20–2000, default 200; either one implies `--gif`). Frames default to 768×768 (720 above 9 frames); size flags still pick the shape. In a `|` chain only the **last** step can be a GIF, since OpenAI won't take a GIF as the input to an edit: `&paint a fox in snow | --gif` paints a still, then animates it. GIFs need the gpt-image-2.6 models, so a GIF request switches to 2.6 at the same quality if `IMAGE_MODEL` is something else.
-- `--svg` — a vector image (paint commands only, single step, no `|`). Discord can't preview SVGs, so Bot Ross posts a PNG preview alongside the `.svg` file.
+- `--svg` — a vector image, on the paint commands and `&remix`, or as the last step of a `|` chain (`&paint a fox | --svg`, `&remix make it winter --svg`). Nothing can edit an SVG, so it has to be the last step. Discord can't preview SVGs, so Bot Ross posts a PNG preview alongside the `.svg` file.
 - `--boring` — no magic mixins for the whole command, every `|` step included (even `&xpaint`).
 
 A GIF costs more than a still, so it counts against `API_LIMIT` by how much it actually cost compared with a still at the same quality (about 2–3 requests for the default size).

@@ -1002,6 +1002,16 @@ async def _resolve_linked_images(ctx, links):
     return linked_attachments, notes
 
 
+def _empty_edit_prompt():
+    """The edit prompt for an image with no guiding text, by this step's output kind."""
+    kind = _output.get().kind
+    if kind == output_format.GIF:
+        return "bring this image to life as a short looping animation"
+    if kind == output_format.SVG:
+        return "redraw this image as a clean vector illustration"
+    return "creatively reinterpret this image"
+
+
 async def _remix_once(ctx, raw):
     """&remix's body -- flags are parsed here rather than via the shared
     _prep_generation_size because remix's size resolution differs by which path it
@@ -1092,9 +1102,7 @@ async def _remix_once(ctx, raw):
         prompt = await expand_prompt_macros(ctx, prompt)
         prompt, magic = maybe_apply_magic_paint(prompt)
     else:
-        fallback = ("bring this image to life as a short looping animation"
-                    if _output.get().kind == output_format.GIF else "creatively reinterpret this image")
-        prompt = _apply_random_magic_entry(fallback)
+        prompt = _apply_random_magic_entry(_empty_edit_prompt())
         magic = not _boring.get()
 
     await send_quote(ctx, magic)
@@ -1134,7 +1142,7 @@ async def _release_image_once(ctx, raw):
 # Commands whose FIRST step may ask for --gif / --svg. &dpaint is DALL-E 3 by name, so it
 # keeps its stills; every command's later pipe steps are 2.6 edits and may end in --gif.
 GIF_FIRST_STEP = {"paint", "hpaint", "mpaint", "lpaint", "xpaint", "remix", "animate", "release_image"}
-SVG_FIRST_STEP = {"paint", "hpaint", "mpaint", "lpaint", "xpaint"}
+SVG_FIRST_STEP = {"paint", "hpaint", "mpaint", "lpaint", "xpaint", "remix"}
 
 
 def _parse_chain_flags(segments, request_type, force_gif_last=False):
@@ -1144,8 +1152,9 @@ def _parse_chain_flags(segments, request_type, force_gif_last=False):
 
     - `--boring` anywhere turns magic off for the whole command.
     - `--gif` only on the LAST step: a GIF can't be fed into the next step's edit.
-    - `--svg` only on a single-step paint command: SVG is generations-only, so nothing
-      can follow it and &remix can't produce one.
+    - `--svg` only on the LAST step, like `--gif`: nothing can edit an SVG. Both the
+      generations and edits endpoints can return one (edits checked live 2026-11-09),
+      so a first step may be SVG only for the paint family and &remix.
     - `force_gif_last` (&animate) makes the last step a GIF unless it already is.
     """
     cleaned, flags = [], []
@@ -1168,10 +1177,12 @@ def _parse_chain_flags(segments, request_type, force_gif_last=False):
                 raise output_format.FlagError(
                     f"`&{request_type}` can't make a GIF itself — add a `| --gif` step after it.")
         if f.kind == output_format.SVG:
-            if last != 0:
-                raise output_format.FlagError("`--svg` can't be part of a chain — nothing can edit an SVG.")
-            if request_type not in SVG_FIRST_STEP:
-                raise output_format.FlagError("`--svg` works with `&paint` and its quality variants.")
+            if i != last:
+                raise output_format.FlagError(
+                    f"`--svg` only works on the last step of a chain (it's on step {i + 1} of {last + 1}) — nothing can edit an SVG.")
+            if i == 0 and request_type not in SVG_FIRST_STEP:
+                raise output_format.FlagError(
+                    f"`&{request_type}` can't make an SVG itself — add a `| --svg` step after it.")
     return cleaned, flags, boring
 
 
@@ -1298,8 +1309,7 @@ async def _pipe_edit_once(ctx, raw, prev_bytes, anchor, model, magic_mode):
         # A segment that's flags-only (e.g. "... | --portrait") -- the same literal
         # fallback &remix uses for an image with no guiding text at all. Not run
         # through macro expansion; there's no user text to expand.
-        prompt = ("bring this image to life as a short looping animation"
-                  if _output.get().kind == output_format.GIF else "creatively reinterpret this image")
+        prompt = _empty_edit_prompt()
 
     magic = False
     if _boring.get():
@@ -1370,7 +1380,7 @@ async def xpaint(ctx, *, prompt):
                  "xpaint", IMAGE_MODEL, "always")
 
 
-@bot.command(name='remix', help='Remix an image with a prompt. Attach an image, reply to one, paste a message link from this server, or any mix — and add a prompt to guide the transformation. Flags: --landscape/--portrait/--square, --res WxH (coerced to a valid size, same as &paint), --gif (--frames N, --ms N), --boring. Falls back to painting if no image is found. Monthly limit applies. Chain follow-up edits with | (up to 5 steps).')
+@bot.command(name='remix', help='Remix an image with a prompt. Attach an image, reply to one, paste a message link from this server, or any mix — and add a prompt to guide the transformation. Flags: --landscape/--portrait/--square, --res WxH (coerced to a valid size, same as &paint), --gif (--frames N, --ms N), --svg, --boring. Falls back to painting if no image is found. Monthly limit applies. Chain follow-up edits with | (up to 5 steps).')
 async def remix(ctx, *, prompt=None):
     await _piped(ctx, prompt, _remix_once, "remix", IMAGE_MODEL, "roll")
 
@@ -1845,6 +1855,17 @@ def _output_params(output, size):
     return {"output_format": "svg", "svg": {"model": SVG_MODEL, "reasoning": {"effort": "low"}}}
 
 
+def _form_fields(params, prefix=""):
+    """Flatten request params for multipart form data, which can't nest: the edits
+    endpoint takes {"svg": {"model": m}} as the field `svg[model]`."""
+    for key, value in params.items():
+        name = f"{prefix}[{key}]" if prefix else key
+        if isinstance(value, dict):
+            yield from _form_fields(value, name)
+        else:
+            yield name, str(value)
+
+
 def gif_request_size(output, size, src_wh=None):
     """Map the still-image size the flags resolved to (or None/auto) onto a GIF frame
     size that fits the sprite-sheet limits. The three preset sizes stand for their
@@ -1968,8 +1989,8 @@ async def fetch_image_edit(prompt, model, images, size=None, output=None):
                 size_value = image_size.AUTO
             if size_value:
                 form.add_field("size", size_value)
-            for key, value in _output_params(output, size_value).items():
-                form.add_field(key, str(value))
+            for key, value in _form_fields(_output_params(output, size_value)):
+                form.add_field(key, value)
             quality = config["params"].get("quality")
             if quality:
                 form.add_field("quality", quality)
