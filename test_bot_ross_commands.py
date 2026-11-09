@@ -1676,12 +1676,44 @@ class OutputFlagsCommandTest(BotTestCase):
         self.assertEqual(edit.prompt, "bring this image to life as a short looping animation")
 
     async def test_svg_rules(self):
-        for command, prompt in (("paint", "a | b --svg"), ("remix", "x --svg"), ("dpaint", "x --svg")):
+        for command, prompt in (("paint", "a --svg | b"), ("dpaint", "x --svg"),
+                                ("xpaint", "a --svg | b")):
             ctx = self.make_ctx()
             await cmd(command)(ctx, prompt=prompt)
             with self.subTest(command=command, prompt=prompt):
                 self.assertEqual(self.api.call_count, 0)
                 self.assertIn("svg", ctx.channel.texts[0].lower())
+
+    async def test_remix_svg_edits_the_attachment(self):
+        att = FakeAttachment(1024, 1024, data=_make_png(1024, 1024))
+        ctx = self.make_ctx(attachments=[att])
+        await cmd("remix")(ctx, prompt="make it winter --svg")
+        edit = self.api.edit_calls[0]
+        self.assertEqual(edit.output.kind, "svg")
+        self.assertEqual(edit.prompt, "make it winter")
+        names = [f.filename for f in ctx.channel.files]
+        self.assertTrue(names[0].endswith(".png") and names[1].endswith(".svg"))
+        self.assertEqual(self.read_data().get("svgs"), 1)
+
+    async def test_remix_svg_with_no_image_paints_one(self):
+        ctx = self.make_ctx()
+        await cmd("remix")(ctx, prompt="a lighthouse --svg")
+        self.assertEqual(self.api.generate_calls[0].output.kind, "svg")
+
+    async def test_svg_on_the_last_step_vectorizes_the_previous_still(self):
+        ctx = self.make_ctx()
+        await cmd("paint")(ctx, prompt="a fox | --svg")
+        self.assertEqual([c.kind for c in self.api.calls], ["generate", "edit"])
+        self.assertIsNone(self.api.generate_calls[0].output)
+        edit = self.api.edit_calls[0]
+        self.assertEqual(edit.output.kind, "svg")
+        self.assertEqual(edit.prompt, "redraw this image as a clean vector illustration")
+
+    def test_form_fields_flatten_nested_params(self):
+        out = bot_ross.output_format.OutputFlags(kind=bot_ross.output_format.SVG)
+        fields = dict(bot_ross._form_fields(bot_ross._output_params(out, "1024x1024")))
+        self.assertEqual(fields, {"output_format": "svg", "svg[model]": bot_ross.SVG_MODEL,
+                                  "svg[reasoning][effort]": "low"})
 
     async def test_bad_flag_value_is_explained(self):
         ctx = self.make_ctx()
